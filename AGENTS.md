@@ -90,9 +90,14 @@ FUSE view use the newest member's tree, so deleted files no longer come back
 1024x768/1280x720/1920x1080 and 100/150/200 % without a display. The GUI code
 is split into `actions`, `models`, `callbacks` and `script_runner`.
 
-Still open: the installed-Ubuntu/GNOME acceptance on `192.168.189.144` (blocked
-until `codex` has passwordless sudo or `w0w` key access; never type or pass the
-password in a command), including a real GNOME notification.
+The installed-Ubuntu/GNOME acceptance is done (real GNOME notifications,
+the GUI on GNOME Wayland, the update handoff), the graphical rescue medium
+boots to the GUI with its own daemon under SeaBIOS and Secure Boot, and
+`v0.1.0-alpha.1` is published as a GitHub pre-release. Deferred by the
+maintainer: completing a backup from the GUI inside GNOME (needs an
+administrator at the polkit dialog). The test host `192.168.189.144` has a
+NOPASSWD sudo rule for `codex` (`/etc/sudoers.d/90-codex-test`) for testing
+only.
 
 ## Non-negotiable project rules
 

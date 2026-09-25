@@ -396,6 +396,32 @@ Evidence on this tree:
 
 Not yet covered: a real GNOME session (blocked on access to the Ubuntu host).
 
+## Graphical rescue medium and the 0.1.0-alpha.1 release (2026-09-25)
+
+The mkosi medium could not have worked as a graphical rescue system: the GUI
+talks only to the daemon, and the image carried neither the daemon nor polkit;
+the console menu also called commands that do not exist. `855dc59` stages the
+daemon (socket-activated), `polkitd` with the policy, the group, the GUI and
+the repair tool, and fixes the menu (prepare, show the plan, typed "yes",
+apply). The image was built on the Ubuntu host in a privileged
+`ubuntu:24.04` container (mkosi) and booted locally with KVM and a spare
+8 GiB disk: under SeaBIOS and under OVMF with Secure Boot ("UEFI Secure Boot
+is enabled", Canonical-signed kernel) the serial console reached
+`LINUXREFLECT-RESCUE-READY graphical` and QMP screenshots show the GUI
+listing the medium and the spare disk through the image's own daemon. Those
+boots found three GUI issues (virtio PCI IDs shown as models, floppy and
+optical drives listed as disks, a black strip from reserved decoration space
+in the kiosk); fixed in `e0d5727` and `b775b10` and confirmed by booting the
+rebuilt image (SHA-256 of the raw image `539a675f…`).
+
+Release `v0.1.0-alpha.1` (pre-release, tag on `b01401e`, which adds the
+MIT OR Apache-2.0 licence, D-109) carries the glibc tarball built on Ubuntu
+22.04, the static musl CLI, the rescue image (zstd, decompresses to the
+booted `539a675f…`) and `SHA256SUMS`. The tarball's documented install
+(`sudo BIN=$PWD/bin ./contrib/install-host.sh`) was run on the Ubuntu host:
+the running daemon's executable hash then matched the tarball's binary.
+Downloaded assets verify against `SHA256SUMS`.
+
 ## Installed Ubuntu and the real GNOME session (2026-09-25)
 
 Host `192.168.189.144`, Ubuntu 22.04.5, GNOME Shell 42.9 on Wayland, the
