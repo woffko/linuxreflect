@@ -428,6 +428,12 @@ On GitHub the privileged container job now runs every binary
 (`--no-fail-fast`); `dm_flakey…` failed there because nothing creates
 `/dev/mapper` nodes without udev, so the test now asks `dmsetup mknodes`.
 
+GitHub Actions run `36100772272` on `b3fc812` is green in every job (lint,
+test, deny, audit, root-tests). The container root job is not full
+acceptance: it prints 21 skip messages (no grub-install, nbd-client, NFS
+tools, system D-Bus or polkit in that container), so the complete root
+evidence remains the local run above, which had none.
+
 ## Portability found on Ubuntu 22.04 (`192.168.189.144`, 2026-09-25)
 
 A fresh clone of `47cbd83` built there (7 min 51 s, as `codex`, no sudo), but
@@ -440,7 +446,9 @@ unprivileged tests failed for reasons in the tests, not the product:
   policy denies an inactive SSH session; the smoke tests now pass an absent
   socket so they test the in-process CLI they are about.
 
-All unprivileged tests pass locally under both umask 022 and 002.
+All unprivileged tests pass locally under both umask 022 and 002, and on the
+Ubuntu host at `62cd898`: `cargo test --workspace --no-fail-fast` 488 passed,
+0 failed, 57 ignored.
 
 ## Acceptance checklist
 
