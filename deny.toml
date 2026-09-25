@@ -32,9 +32,8 @@ yanked = "deny"
 [licenses]
 version = 2
 confidence-threshold = 0.9
-# All workspace crates are `publish = false`; the project license is an open
-# product decision (spec §M.1), so private crates are exempt from the license
-# expression requirement while every third-party license is still checked.
+# The workspace crates are MIT OR Apache-2.0 (D-109) and `publish = false`;
+# they are exempt from this check, while every third-party license is checked.
 private = { ignore = true }
 # Only licenses actually present in the dependency graph are allowed, so that
 # adding a dependency with a new license is a deliberate, reviewable change.

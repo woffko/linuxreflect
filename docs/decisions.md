@@ -1209,3 +1209,12 @@ older members only for their hash indices. Found by a GUI chain test (full,
 incremental, differential with a deletion); the engine and FUSE regressions
 fail without the change. The existing tests missed it because none deleted a
 file between members.
+
+## D-109 — LinuxReflect is licensed MIT OR Apache-2.0
+
+The project had no licence (D-090 left it open), which would have made a public
+release "all rights reserved". The product owner chose the Rust ecosystem's
+usual dual licence, MIT OR Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`, and
+`license` in every crate). Third-party licences are unchanged: the GUI binary
+links Slint under its Royalty-Free 2.0 licence, whose attribution the window
+and the README carry (D-090).

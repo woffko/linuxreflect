@@ -202,3 +202,11 @@ is reachable and falls back to running in-process when it is not.
 ## License
 
 Not chosen yet; see open question §M.1 of the specification.
+
+## License
+
+LinuxReflect is licensed under either of the [MIT license](LICENSE-MIT) or the
+[Apache License, Version 2.0](LICENSE-APACHE), at your option. The GUI binary
+uses [Slint](https://slint.dev) under the Slint Royalty-Free 2.0 licence
+(attribution is shown in the window). Unless you state otherwise, any
+contribution you submit is licensed as above, without additional terms.
