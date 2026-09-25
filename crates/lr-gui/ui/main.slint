@@ -65,6 +65,7 @@ export component MainWindow inherits Window {
     in-out property <bool> show-result-details: false;
     in-out property <JobPresentation> backup-job;
     in-out property <JobPresentation> restore-job;
+    in-out property <JobPresentation> verify-job;
     in-out property <[DiskRow]> disks: [];
     in-out property <[DiskCard]> disk-cards: [];
     in-out property <bool> show-system-devices: false;
@@ -109,6 +110,7 @@ export component MainWindow inherits Window {
     callback pick-target-folder();
     callback disk-selected(int);
     callback history-selected(int);
+    callback verify-image(int);
     callback use-last-image();
     callback show-backup-tab();
     callback show-restore-tab();
@@ -778,7 +780,7 @@ export component MainWindow inherits Window {
                             title: "Activity";
                             subtitle: "The backup and restore jobs started in this window.";
                         }
-                        if root.backup-job.stage == JobStage.idle && root.restore-job.stage == JobStage.idle: Banner {
+                        if root.backup-job.stage == JobStage.idle && root.restore-job.stage == JobStage.idle && root.verify-job.stage == JobStage.idle: Banner {
                             text: "No jobs yet.";
                         }
                         if root.backup-job.stage != JobStage.idle: Banner {
@@ -786,6 +788,10 @@ export component MainWindow inherits Window {
                             error: root.backup-job.stage == JobStage.failed;
                             action: "Open";
                             act => { root.current-tab = 1; root.backup-step = 3; }
+                        }
+                        if root.verify-job.stage != JobStage.idle: Banner {
+                            text: root.job-title("Verification", root.verify-job.stage) + "\n" + root.verify-job.detail;
+                            error: root.verify-job.stage == JobStage.failed;
                         }
                         if root.restore-job.stage != JobStage.idle: Banner {
                             text: root.job-title("Restore", root.restore-job.stage) + "\n" + root.restore-job.detail;
@@ -805,7 +811,7 @@ export component MainWindow inherits Window {
                     padding-left: 12px;
                     spacing: 10px;
                     Text {
-                        text: root.has-job ? (root.job-operation == "restore" ? "Restore" : "Backup") : root.phase;
+                        text: root.has-job ? (root.job-operation == "restore" ? "Restore" : root.job-operation == "verify" ? "Verify" : "Backup") : root.phase;
                         font-weight: 700;
                         color: Theme.text;
                         vertical-alignment: center;

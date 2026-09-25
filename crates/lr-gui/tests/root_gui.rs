@@ -729,3 +729,105 @@ fn block_backup_and_stale_target_refusal_through_the_gui_on_x11() {
         expected
     );
 }
+
+/// "Verify" in the library passes on a fresh backup and, after the test
+/// corrupts the image, fails with `E_CORRUPT` (spec §K S11a through the GUI).
+#[test]
+#[ignore = "needs root and Xvfb; verifies an image and detects corruption through the GUI"]
+fn verify_detects_a_corrupted_image_through_the_gui_on_x11() {
+    if !root_tests_enabled() {
+        return;
+    }
+    assert!(have("Xvfb"), "Xvfb is required");
+    let dir = private_test_dir();
+    let Some(daemon) = Daemon::start(dir.path()) else {
+        panic!("the daemon binary is not built next to the GUI");
+    };
+    let source = dir.path().join("source");
+    write_tree(&source, "verify marker\n");
+    let backups = dir.path().join("backups");
+    let verified = dir.path().join("verified");
+    let corrupted = dir.path().join("corrupted");
+    let script = dir.path().join("verify-script.txt");
+    std::fs::write(
+        &script,
+        format!(
+            "source {source}\n\
+             dest {backups}\n\
+             set gui-verify\n\
+             mode file\n\
+             probe\n\
+             backup\n\
+             history\n\
+             verify 0\n\
+             signal {verified}\n\
+             wait-for-file {corrupted}\n\
+             expect-verify-failure 0 E_CORRUPT\n\
+             quit\n",
+            source = source.display(),
+            backups = backups.display(),
+            verified = verified.display(),
+            corrupted = corrupted.display(),
+        ),
+    )
+    .expect("script");
+    let mut reaper = Reaper(Vec::new());
+    let display = start_xvfb(&mut reaper);
+    let gui = Command::new(GUI)
+        .env("DISPLAY", &display)
+        .env_remove("WAYLAND_DISPLAY")
+        .env("SLINT_BACKEND", "winit-software")
+        .arg("--socket")
+        .arg(&daemon.socket)
+        .arg("--script")
+        .arg(&script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("GUI run");
+
+    let started = Instant::now();
+    while !verified.exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "the GUI never verified the fresh image"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Flip bytes in the middle of the image, where chunk data lives.
+    let image = find_image(&backups.join("gui-verify")).expect("the backup image");
+    let mut bytes = std::fs::read(&image).expect("read image");
+    let middle = bytes.len() / 2;
+    for byte in &mut bytes[middle..middle + 64] {
+        *byte ^= 0xa5;
+    }
+    std::fs::write(&image, &bytes).expect("corrupt image");
+    std::fs::write(&corrupted, b"").expect("signal corruption");
+
+    let output = gui.wait_with_output().expect("GUI exit");
+    let log = text(&output);
+    assert!(output.status.success(), "{log}");
+    assert!(log.contains("verify ok"), "{log}");
+    assert!(
+        log.contains("expected verification failure: E_CORRUPT"),
+        "{log}"
+    );
+}
+
+/// The first `.lrimg` below `dir`.
+fn find_image(dir: &Path) -> Option<PathBuf> {
+    for entry in std::fs::read_dir(dir).ok()? {
+        let path = entry.ok()?.path();
+        if path.is_dir() {
+            if let Some(found) = find_image(&path) {
+                return Some(found);
+            }
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "lrimg")
+        {
+            return Some(path);
+        }
+    }
+    None
+}

@@ -151,24 +151,42 @@ impl Client {
             .sets)
     }
 
-    /// `VerifyImage`, returning the finished summary.
+    /// `VerifyImage` of a whole chain, reporting every progress step.
     ///
     /// # Errors
-    /// Propagates gRPC errors.
-    pub async fn verify(&self, image: &str) -> anyhow::Result<String> {
+    /// Propagates gRPC errors and the job's failure code (for example the
+    /// corrupted chunk it names).
+    pub async fn verify(
+        &self,
+        image: &str,
+        passphrase_file: &str,
+        mut on_progress: impl FnMut(&Progress) + Send,
+    ) -> anyhow::Result<String> {
         let mut stream = self
             .service()
             .verify_image(VerifySpec {
                 image: image.to_owned(),
+                chain: true,
+                passphrase_file: passphrase_file.to_owned(),
                 ..VerifySpec::default()
             })
             .await?
             .into_inner();
-        let mut last = String::new();
+        let mut summary = None;
         while let Some(progress) = stream.message().await? {
-            last = summary_of(&progress).unwrap_or(last);
+            on_progress(&progress);
+            if let Some(finished) = summary_of(&progress) {
+                summary = Some(finished);
+            }
+            if let Some(lr_proto::v1::progress::Step::Failure(failure)) = &progress.step {
+                return Err(JobFailure {
+                    code: failure.code.clone(),
+                    message: failure.message.clone(),
+                }
+                .into());
+            }
         }
-        Ok(last)
+        require_finished(summary)
     }
 
     /// `ExportImage`; returns the export state as JSON.

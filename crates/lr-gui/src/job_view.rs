@@ -6,12 +6,14 @@ pub(crate) fn update(ui: &MainWindow, operation: &str, change: impl FnOnce(&mut 
     let mut view = match operation {
         "backup" => ui.get_backup_job(),
         "restore" => ui.get_restore_job(),
+        "verify" => ui.get_verify_job(),
         _ => return,
     };
     change(&mut view);
     match operation {
         "backup" => ui.set_backup_job(view),
         "restore" => ui.set_restore_job(view),
+        "verify" => ui.set_verify_job(view),
         _ => unreachable!(),
     }
 }

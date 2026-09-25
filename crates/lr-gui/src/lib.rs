@@ -102,7 +102,7 @@ impl Actions {
             ui.set_status(format!("{label}…").into());
             ui.set_phase(label.into());
             ui.set_busy(true);
-            if matches!(label, "backup" | "restore") {
+            if matches!(label, "backup" | "restore" | "verify") {
                 ui.set_result_text("".into());
                 ui.set_show_result_details(false);
             }
@@ -419,6 +419,40 @@ impl Actions {
             match outcome {
                 Ok(summary) => actions.finish(&weak, "backup", &summary),
                 Err(error) => actions.fail(&weak, "backup", &error),
+            }
+        });
+    }
+
+    /// Verify an image and its chain (`VerifyImage`), as a job the strip and
+    /// the Activity page follow.
+    fn verify_image(&self, ui: slint::Weak<MainWindow>, image: String, passphrase: String) {
+        if !self.start(&ui, "verify") {
+            return;
+        }
+        if let Some(ui) = ui.upgrade() {
+            job_view::start(&ui, "verify");
+            ui.set_job_operation("verify".into());
+            ui.set_progress(0.0);
+            ui.set_progress_text(format!("Verifying {image}…").into());
+        }
+        let socket = self.socket.clone();
+        let actions = self.clone_handle();
+        let weak = ui.clone();
+        self.runtime.spawn(async move {
+            let progress_ui = weak.clone();
+            let progress_actions = actions.clone();
+            let outcome = async {
+                Client::connect(&socket)
+                    .await?
+                    .verify(&image, &passphrase, move |progress| {
+                        report_progress(&progress_actions, &progress_ui, progress);
+                    })
+                    .await
+            }
+            .await;
+            match outcome {
+                Ok(summary) => actions.finish(&weak, "verify", &summary),
+                Err(error) => actions.fail(&weak, "verify", &error),
             }
         });
     }
@@ -845,7 +879,10 @@ impl ActionsHandle {
                     return;
                 }
                 *shared.failure.lock().expect("failure lock") = Some(text.clone());
-                if matches!(label.as_str(), "backup" | "restore") && ui.get_has_job() && !terminal {
+                if matches!(label.as_str(), "backup" | "restore" | "verify")
+                    && ui.get_has_job()
+                    && !terminal
+                {
                     shared.busy.store(true, Ordering::SeqCst);
                     ui.set_busy(true);
                     ui.set_phase("connection lost".into());
@@ -1552,6 +1589,23 @@ fn connect_callbacks(ui: &MainWindow, actions: &Arc<Actions>) {
         });
     }
     {
+        let weak = ui.as_weak();
+        let actions = Arc::clone(actions);
+        ui.on_verify_image(move |idx| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let Some(row) = ui.get_history().row_data(idx.max(0) as usize) else {
+                return;
+            };
+            if row.path.is_empty() {
+                return;
+            }
+            let passphrase = ui.get_restore_passphrase_file().to_string();
+            actions.verify_image(weak.clone(), row.path.to_string(), passphrase);
+        });
+    }
+    {
         let ui = ui.as_weak();
         ui.upgrade().expect("ui").on_use_last_image(move || {
             let Some(strong) = ui.upgrade() else {
@@ -1819,6 +1873,30 @@ fn run_script(weak: &slint::Weak<MainWindow>, steps: &[Step]) -> Result<ScriptOu
                     return Err("the refused restore left the window busy".to_owned());
                 }
                 log.push(format!("expected restore failure: {expected}"));
+                // The failure was the expected outcome, not a script failure.
+                set(weak, |ui| {
+                    ui.set_status("expected restore failure confirmed".into())
+                })?;
+            }
+            Step::Verify(index) => {
+                let index = i32::try_from(*index).map_err(|error| error.to_string())?;
+                invoke(weak, move |ui| ui.invoke_verify_image(index))?;
+                wait_for_idle(weak, Duration::from_secs(300))?;
+                log.push("verify ok".to_owned());
+            }
+            Step::ExpectVerifyFailure(index, expected) => {
+                let index = i32::try_from(*index).map_err(|error| error.to_string())?;
+                invoke(weak, move |ui| ui.invoke_verify_image(index))?;
+                let error = wait_for_idle(weak, Duration::from_secs(300))
+                    .err()
+                    .ok_or_else(|| "verification unexpectedly passed".to_owned())?;
+                if !error.contains(expected.as_str()) {
+                    return Err(format!("unexpected verification failure: {error}"));
+                }
+                log.push(format!("expected verification failure: {expected}"));
+                set(weak, |ui| {
+                    ui.set_status("expected verification failure confirmed".into());
+                })?;
             }
             Step::Signal(path) => {
                 std::fs::write(path, b"")

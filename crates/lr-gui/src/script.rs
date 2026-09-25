@@ -51,6 +51,10 @@ pub enum Step {
     /// Require the restore to be refused with the expected diagnostic and the
     /// job released for a new review.
     ExpectRestoreFailure(String),
+    /// Verify the library row with this index ("Verify" in the library).
+    Verify(usize),
+    /// Require verifying the library row to fail with the expected text.
+    ExpectVerifyFailure(usize, String),
     /// Create a marker file so a test can act at this point of the script.
     Signal(PathBuf),
     /// Wait (at most a minute) until a test creates this marker file.
@@ -112,6 +116,19 @@ pub fn parse(text: &str) -> Result<Vec<Step>, Error> {
             "expect-prepare-failure" => Step::ExpectPrepareFailure(need(argument)?),
             "restore" => Step::Restore,
             "expect-restore-failure" => Step::ExpectRestoreFailure(need(argument)?),
+            "verify" => Step::Verify(parse_index(&need(argument)?, number)?),
+            "expect-verify-failure" => {
+                let mut parts = argument.splitn(2, char::is_whitespace);
+                let index = parse_index(parts.next().unwrap_or_default(), number)?;
+                let needle = parts.next().unwrap_or_default().trim().to_owned();
+                if needle.is_empty() {
+                    return Err(Error::corrupt(format!(
+                        "line {}: expect-verify-failure needs an index and a string",
+                        number + 1
+                    )));
+                }
+                Step::ExpectVerifyFailure(index, needle)
+            }
             "signal" => Step::Signal(PathBuf::from(need(argument)?)),
             "wait-for-file" => Step::WaitForFile(PathBuf::from(need(argument)?)),
             "expect-file" => Step::ExpectFile(PathBuf::from(need(argument)?)),
@@ -204,6 +221,13 @@ pub fn load(path: &std::path::Path) -> Result<Vec<Step>, Error> {
         .with_context(|| format!("reading {}", path.display()))
         .map_err(|error| Error::unsupported(error.to_string()))?;
     parse(&text)
+}
+
+/// A library row index for `verify`.
+fn parse_index(text: &str, line: usize) -> Result<usize, Error> {
+    text.trim()
+        .parse()
+        .map_err(|_| Error::corrupt(format!("line {}: `{text}` is not a row index", line + 1)))
 }
 
 #[cfg(test)]

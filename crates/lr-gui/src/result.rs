@@ -39,6 +39,7 @@ pub(crate) fn describe(operation: &str, raw: &str) -> String {
     let mut text = match operation {
         "backup" => "Backup completed.".to_owned(),
         "restore" => "Restore completed.".to_owned(),
+        "verify" => "Verification passed: every chunk matched its checksum.".to_owned(),
         _ => "Operation completed.".to_owned(),
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
@@ -62,6 +63,7 @@ pub(crate) fn describe(operation: &str, raw: &str) -> String {
         ("Image size", "image_bytes"),
         ("Restored data", "restored_bytes"),
         ("Written data", "bytes_written"),
+        ("Verified data", "bytes_checked"),
     ] {
         if let Some(bytes) = value.get(field).and_then(serde_json::Value::as_u64) {
             text.push_str(&format!("\n{label}: {}", crate::human_size(bytes)));

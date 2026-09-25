@@ -364,6 +364,15 @@ Evidence on this tree:
   the disks and restore-summary pages were inspected, and the step-number
   contrast was fixed after that inspection.
 
+- Library "Verify" (VerifyImage of the whole chain, run as a job the strip
+  and Activity follow): root test
+  `verify_detects_a_corrupted_image_through_the_gui_on_x11` (3.68 s) verifies
+  a fresh GUI backup, then flips 64 bytes in the middle of the image; the
+  GUI's second verification fails with `E_CORRUPT` naming the image member.
+  Expected-failure script steps now record a confirmed status, so a script
+  that ends on an expected failure is not reported as failed.
+- `cargo xtask ci`: exit 0, 483 passed, 0 failed, 56 ignored.
+
 Not yet covered: the native file dialogs on the new layout (no portal is
 running in this environment) and a GNOME session.
 
