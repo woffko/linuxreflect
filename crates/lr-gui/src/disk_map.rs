@@ -227,7 +227,11 @@ fn is_extended_container(mbr_type: u8) -> bool {
 }
 
 fn disk_title(number: usize, disk: &Device, model: Option<&str>) -> String {
-    match model.map(str::trim).filter(|model| !model.is_empty()) {
+    // Virtio disks report a PCI vendor ID (`0x1af4`) rather than a model.
+    match model
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && !model.starts_with("0x"))
+    {
         Some(model) => format!("Disk {number} · {model}"),
         None => format!("Disk {number} · {}", disk.name),
     }
@@ -433,6 +437,16 @@ mod tests {
         for pair in panel.segments.windows(2) {
             assert!((pair[0].start + pair[0].extent - pair[1].start).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn a_vendor_id_is_not_shown_as_a_model() {
+        let disk = device("vda", 1, None, None);
+        assert_eq!(disk_title(2, &disk, Some("0x1af4")), "Disk 2 · vda");
+        assert_eq!(
+            disk_title(1, &disk, Some(" Samsung SSD ")),
+            "Disk 1 · Samsung SSD"
+        );
     }
 
     #[test]

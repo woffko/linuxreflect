@@ -54,8 +54,9 @@ pub(crate) fn ordered(entries: &[Device], show_service: bool) -> Vec<&Device> {
             entry.partition.is_none()
                 && (show_service
                     || (entry.size_bytes > 0
-                        && !entry.name.starts_with("loop")
-                        && !entry.name.starts_with("ram")))
+                        && !["loop", "ram", "fd", "sr", "zram"]
+                            .iter()
+                            .any(|prefix| entry.name.starts_with(prefix))))
         })
         .collect();
     disks.sort_by(|a, b| a.name.cmp(&b.name));
@@ -126,13 +127,28 @@ mod tests {
     fn capacity_readonly_holders_and_filter_are_explicit() {
         let mut empty = disk("nbd0");
         empty.size_bytes = 0;
-        let mut readonly = disk("sr0");
+        let mut readonly = disk("sdc");
         readonly.read_only = true;
         let mut held = disk("sdb");
         held.holders.push("dm-0".into());
-        let entries = [empty, readonly, held, disk("loop0")];
-        assert_eq!(ordered(&entries, false).len(), 2);
-        assert_eq!(ordered(&entries, true).len(), 4);
+        let entries = [
+            empty,
+            readonly,
+            held,
+            disk("loop0"),
+            disk("fd0"),
+            disk("sr1"),
+        ];
+        // Zero-sized, loop, floppy and optical devices are service devices; a
+        // read-only disk is still listed (it can be backed up, not restored to).
+        assert_eq!(
+            ordered(&entries, false)
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>(),
+            ["sdb", "sdc"]
+        );
+        assert_eq!(ordered(&entries, true).len(), 6);
         for entry in &entries[..3] {
             assert!(!entry.restore_unavailable(&entries).is_empty());
         }

@@ -213,7 +213,14 @@ pub fn run(options: GuiOptions) -> anyhow::Result<ScriptOutcome> {
         // Let the desktop choose an initial size within its usable work area,
         // including decorations and display scaling, rather than placing a
         // preferred-size window partly off-screen on small rescue displays.
-        ui.window().set_maximized(true);
+        // A kiosk compositor (`cage` on the rescue medium) draws no window
+        // decorations: fill the output instead of maximising, or the space
+        // reserved for client-side decorations stays black.
+        if std::env::var("LINUXREFLECT_KIOSK").is_ok_and(|value| value == "1") {
+            ui.window().set_fullscreen(true);
+        } else {
+            ui.window().set_maximized(true);
+        }
         let weak = ui.as_weak();
         slint::invoke_from_event_loop(move || {
             if let Some(ui) = weak.upgrade() {

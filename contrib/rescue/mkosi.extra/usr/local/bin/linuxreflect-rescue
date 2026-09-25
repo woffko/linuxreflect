@@ -31,6 +31,8 @@ if command -v cage >/dev/null 2>&1 && [ -x /usr/local/bin/linuxreflect-gui ]; th
     export WLR_LIBINPUT_NO_DEVICES=1
     export WLR_RENDERER=pixman
     export WLR_RENDERER_ALLOW_SOFTWARE=1
+    # Fill the screen without decorations (cage draws none).
+    export LINUXREFLECT_KIOSK=1
     # Keep the compositor's diagnostics on the serial console so a failure is
     # visible instead of a blank screen.
     cage -s -- /usr/local/bin/linuxreflect-gui </dev/tty1 >"$serial" 2>&1 || true
