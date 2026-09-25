@@ -80,7 +80,8 @@ jobs:
           apt-get install -y --no-install-recommends \
             build-essential ca-certificates curl git protobuf-compiler musl-tools pkg-config libfontconfig-dev \
             util-linux e2fsprogs xfsprogs lvm2 gdisk btrfs-progs dosfstools \
-            qemu-system-x86 ovmf
+            qemu-system-x86 ovmf \
+            xvfb xauth xdotool weston linux-image-amd64
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -92,4 +93,6 @@ jobs:
           LR_ROOT_TESTS: "1"
         run: |
           . "$HOME/.cargo/env"
-          cargo test --workspace --no-fail-fast -- --ignored --nocapture --test-threads=1
+          # The GUI lifecycle test needs a display; the GUI root tests start
+          # their own Xvfb. The whole-disk boot tests need a kernel in /boot.
+          xvfb-run -a cargo test --workspace --no-fail-fast -- --ignored --nocapture --test-threads=1
