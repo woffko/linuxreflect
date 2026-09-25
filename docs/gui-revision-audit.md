@@ -396,6 +396,42 @@ Evidence on this tree:
 
 Not yet covered: a real GNOME session (blocked on access to the Ubuntu host).
 
+## Installed Ubuntu and the real GNOME session (2026-09-25)
+
+Host `192.168.189.144`, Ubuntu 22.04.5, GNOME Shell 42.9 on Wayland, the
+local active session of `w0w` (member of `linuxreflect`). `codex` got a
+NOPASSWD sudo rule for this test host with the maintainer's approval.
+
+- Release binaries of `51205cb` built there (15 min 43 s) and installed with
+  `contrib/install-host.sh`. The update handoff (D-107) worked: the old daemon
+  (PID 2715) exited, the next request started PID 167130, and the SHA-256 of
+  `/proc/167130/exe` equals `/usr/local/bin/linuxreflect-daemon` and the fresh
+  build. The installed unit carries `TimeoutStopSec=infinity`.
+- Notifications: the per-user `linuxreflect-session` (running the installed
+  binary) sent `Notify` for "Job started" and "Job finished" (with the image
+  path) of a backup made through the daemon; `org.freedesktop.Notifications`
+  was owned by `/usr/share/gnome-shell/org.gnome.Shell.Notifications`
+  (gjs, running in the session for two days), which returned IDs 3 and 4.
+  This is the real GNOME notification service, not a mock.
+- GUI: the installed `linuxreflect-gui`, started in `w0w`'s user manager the
+  way GNOME starts applications (`systemd-run --user`, `WAYLAND_DISPLAY`),
+  ran as a native Wayland client, maximised, and showed the real disk map
+  (screenshots with `gnome-screenshot`): "System disk · 162.7 GiB · MBR ·
+  /dev/sda" with the ESP at `/boot/efi`, the ext4 root at `/` and the CD
+  drive. Started from an SSH session instead, polkit refused `disk.read`
+  (inactive session) and the GUI showed that as an error banner with Retry;
+  that refusal is correct.
+- That real MBR layout exposed a disk-map bug: the extended partition was
+  drawn beside the logical root inside it. Fixed in `3e8e8df` (a regression
+  test uses the captured layout); rebuilt, reinstalled (GUI SHA-256 prefix
+  `f2f1b66680ddf310` in the build and in `/usr/local/bin`) and re-shot: ESP,
+  root and 41.4 GiB unallocated.
+
+Not done in GNOME: mouse and keyboard input (no input injection for Wayland
+on that host) and completing a backup from the GUI there, which needs an
+administrator to answer the polkit `auth_admin` dialog. Those flows are
+covered by the X11/Wayland root tests and the physical X11 runs above.
+
 ## Accumulated root suites on `47cbd83` (2026-09-25)
 
 Every root test binary of the workspace was rebuilt at `47cbd83` and run as
