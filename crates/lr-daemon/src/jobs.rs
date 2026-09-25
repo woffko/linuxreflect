@@ -114,6 +114,8 @@ struct Entry {
 pub struct Jobs {
     entries: Mutex<HashMap<String, Entry>>,
     events: broadcast::Sender<JobEvent>,
+    /// Set when the daemon is stopping: no new job is admitted (D-107).
+    draining: AtomicBool,
 }
 
 impl std::fmt::Debug for Jobs {
@@ -138,6 +140,36 @@ impl Jobs {
         Self {
             entries: Mutex::new(HashMap::new()),
             events,
+            draining: AtomicBool::new(false),
+        }
+    }
+
+    /// Stop admitting jobs; running ones continue (D-107).
+    pub fn begin_drain(&self) {
+        self.draining.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether [`Jobs::begin_drain`] was called.
+    #[must_use]
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
+    }
+
+    /// Jobs that are pending or running.
+    #[must_use]
+    pub fn active(&self) -> usize {
+        self.lock()
+            .values()
+            .filter(|entry| matches!(entry.state, JobState::Pending | JobState::Running))
+            .count()
+    }
+
+    /// Ask every pending or running job to stop.
+    pub fn cancel_all(&self) {
+        for entry in self.lock().values_mut() {
+            if matches!(entry.state, JobState::Pending | JobState::Running) {
+                entry.cancel.store(true, Ordering::SeqCst);
+            }
         }
     }
 
@@ -166,6 +198,13 @@ impl Jobs {
     /// or when another job holds the set.
     pub fn register(&self, job_id: &str, set: &str) -> Result<(Sink, Arc<AtomicBool>)> {
         let mut entries = self.lock();
+        // Checked under the lock, so a job is either refused or counted by
+        // `active` before the drain can conclude that nothing runs.
+        if self.is_draining() {
+            return Err(Error::TargetBusy {
+                holder: "the daemon is stopping; start the job again once it is back".to_owned(),
+            });
+        }
         if let Some(existing) = entries.get(job_id)
             && matches!(existing.state, JobState::Pending | JobState::Running)
         {
@@ -411,6 +450,24 @@ mod tests {
         }
         assert_eq!(seen.len(), 3, "started, phase, finished");
         assert_eq!(jobs.list().expect("list").len(), 1);
+    }
+
+    #[test]
+    fn a_draining_registry_refuses_new_jobs_and_cancels_on_request() {
+        let jobs = Jobs::new();
+        let (_sink, cancel) = jobs.register("running", "set-a").expect("register");
+        assert_eq!(jobs.active(), 1);
+        jobs.begin_drain();
+        assert!(jobs.is_draining());
+        let refused = jobs.register("late", "set-b").expect_err("draining");
+        assert!(format!("{refused}").contains("stopping"), "{refused}");
+        assert_eq!(jobs.active(), 1, "the running job is not interrupted");
+        assert!(!cancel.load(std::sync::atomic::Ordering::SeqCst));
+        jobs.cancel_all();
+        assert!(cancel.load(std::sync::atomic::Ordering::SeqCst));
+        jobs.finish("running", Err(Error::Cancelled))
+            .expect("finish");
+        assert_eq!(jobs.active(), 0);
     }
 
     #[test]

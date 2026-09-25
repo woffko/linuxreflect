@@ -549,7 +549,14 @@ fn block_backup_and_stale_target_refusal_through_the_gui_on_x11() {
     if !root_tests_enabled() {
         return;
     }
-    for tool in ["Xvfb", "losetup", "sgdisk", "blockdev", "mkfs.ext4", "mount"] {
+    for tool in [
+        "Xvfb",
+        "losetup",
+        "sgdisk",
+        "blockdev",
+        "mkfs.ext4",
+        "mount",
+    ] {
         assert!(have(tool), "{tool} is required");
     }
     let dir = private_test_dir();

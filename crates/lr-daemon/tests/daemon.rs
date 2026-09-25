@@ -564,3 +564,159 @@ async fn disconnected_backup_can_be_cancelled_and_the_set_reused() {
     }
     assert_eq!(file.read(&mut actual[..1]).expect("source EOF"), 0);
 }
+
+/// A file-mode source with `mib` MiB of allocated data, so a backup of it
+/// is still running when the test acts.
+fn large_source(dir: &Path, mib: usize) -> PathBuf {
+    use std::io::Write;
+    let source = dir.join("large-source");
+    std::fs::create_dir(&source).expect("source directory");
+    let block = vec![0x5a; 1024 * 1024];
+    let mut file = std::fs::File::create(source.join("data.bin")).expect("source file");
+    for _ in 0..mib {
+        file.write_all(&block).expect("populate source");
+    }
+    source
+}
+
+fn slow_spec(source: &Path, dest: &Path, set: &str) -> BackupSpec {
+    BackupSpec {
+        source: source.display().to_string(),
+        dest: dest.display().to_string(),
+        set: set.into(),
+        mode: "file".into(),
+        member_type: "full".into(),
+        compress: "none".into(),
+        no_encrypt: true,
+        chunk_size: "1MiB".into(),
+        on_bad_sector: "abort".into(),
+        ..BackupSpec::default()
+    }
+}
+
+fn signal_daemon(daemon: &Daemon, signal: &str) {
+    let status = Command::new("kill")
+        .args([signal, &daemon.child.id().to_string()])
+        .status()
+        .expect("kill");
+    assert!(status.success(), "kill {signal}");
+}
+
+/// Start a slow backup and return its stream once it is copying.
+async fn copying(
+    client: &mut LinuxReflectClient<Channel>,
+    spec: BackupSpec,
+) -> tonic::Streaming<Progress> {
+    let mut stream = client
+        .create_backup(spec)
+        .await
+        .expect("start backup")
+        .into_inner();
+    loop {
+        let progress = stream
+            .message()
+            .await
+            .expect("progress transport")
+            .expect("progress before EOF");
+        match progress.step {
+            Some(Step::Bytes(bytes)) if bytes.done > 0 => return stream,
+            Some(Step::Finished(_) | Step::Failure(_)) => {
+                panic!("job terminated before the test acted: {progress:?}")
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn rest_of(stream: &mut tonic::Streaming<Progress>) -> Vec<Progress> {
+    let mut progress = Vec::new();
+    while let Some(step) = stream.message().await.expect("progress stream") {
+        progress.push(step);
+    }
+    progress
+}
+
+fn wait_for_exit(daemon: &mut Daemon) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(status) = daemon.child.try_wait().expect("daemon status") {
+            return status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon did not exit after its jobs finished"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// SIGTERM stops admission but lets the running job finish; then the daemon
+/// exits cleanly (D-107).
+#[tokio::test]
+async fn sigterm_waits_for_the_running_job_and_refuses_new_ones() {
+    let mut daemon = Daemon::start(&format!("static:{}", uid()));
+    let work = tempfile::tempdir().expect("workdir");
+    let source = large_source(work.path(), 1024);
+    let dest = work.path().join("out");
+    let mut client = daemon.client().await;
+    let mut stream = copying(&mut client, slow_spec(&source, &dest, "drain-a")).await;
+
+    signal_daemon(&daemon, "-TERM");
+    // Admission closes as soon as the signal is handled.
+    let small = work.path().join("small");
+    std::fs::create_dir(&small).expect("small source");
+    std::fs::write(small.join("a.txt"), b"a").expect("small file");
+    let refused = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match client
+                .create_backup(slow_spec(&small, &dest, "drain-b"))
+                .await
+            {
+                Err(status) if status.message().contains("stopping") => return status,
+                Err(status) => panic!("unexpected refusal: {status:?}"),
+                Ok(response) => {
+                    // Admitted before the signal was handled; let it finish.
+                    rest_of(&mut response.into_inner()).await;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+    })
+    .await
+    .expect("the stopping daemon refuses new jobs");
+    assert!(refused.message().contains("stopping"), "{refused:?}");
+    assert!(
+        daemon.child.try_wait().expect("status").is_none(),
+        "the daemon must not exit while a job runs"
+    );
+
+    let progress = rest_of(&mut stream).await;
+    assert!(
+        finished_summary(&progress).is_some(),
+        "the running job completes: {progress:?}"
+    );
+    drop(client);
+    let status = wait_for_exit(&mut daemon);
+    assert!(status.success(), "{status:?}");
+}
+
+/// A second signal cancels the running job instead of waiting for it.
+#[tokio::test]
+async fn a_second_sigterm_cancels_the_running_job() {
+    let mut daemon = Daemon::start(&format!("static:{}", uid()));
+    let work = tempfile::tempdir().expect("workdir");
+    let source = large_source(work.path(), 1024);
+    let dest = work.path().join("out");
+    let mut client = daemon.client().await;
+    let mut stream = copying(&mut client, slow_spec(&source, &dest, "drain-c")).await;
+
+    signal_daemon(&daemon, "-TERM");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(daemon.child.try_wait().expect("status").is_none());
+    signal_daemon(&daemon, "-TERM");
+    let progress = rest_of(&mut stream).await;
+    assert_eq!(failure_code(&progress), Some("E_CANCELLED"), "{progress:?}");
+    drop(client);
+    let status = wait_for_exit(&mut daemon);
+    assert!(status.success(), "{status:?}");
+}

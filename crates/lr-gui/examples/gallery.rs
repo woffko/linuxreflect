@@ -13,8 +13,9 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use lr_gui::ui::{
-    DiskCard, DiskRow, HistoryRow, JobPresentation, JobStage, MainWindow, PartitionTile,
+    DiskCard, DiskRow, HistoryRow, JobPresentation, JobStage, MainWindow, Palette, PartitionTile,
 };
+use slint::language::ColorScheme;
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
 use slint::platform::{Platform, PlatformError, WindowAdapter, WindowEvent};
 use slint::{ComponentHandle, ModelRc, PhysicalSize, Rgb8Pixel, SharedString, VecModel};
@@ -351,6 +352,8 @@ fn main() {
     let out = PathBuf::from(args.next().expect("usage: gallery OUT_DIR [SCENE] [SIZE]"));
     let scene_filter = args.next().unwrap_or_default();
     let size_filter = args.next().unwrap_or_default();
+    // `LR_GALLERY_DARK=1` renders the dark colour scheme.
+    let dark = std::env::var("LR_GALLERY_DARK").is_ok_and(|value| value == "1");
     std::fs::create_dir_all(&out).expect("output directory");
     slint::platform::set_platform(Box::new(Offscreen)).expect("platform");
     let window = WINDOW.with(Clone::clone);
@@ -369,10 +372,15 @@ fn main() {
             });
             window.set_size(PhysicalSize::new(width, height));
             let ui = MainWindow::new().expect("window");
+            if dark {
+                ui.global::<Palette<'_>>()
+                    .set_color_scheme(ColorScheme::Dark);
+            }
             example_disks(&ui);
             apply(&ui);
             ui.show().expect("show");
-            let path = out.join(format!("{name}-{label}.png"));
+            let scheme = if dark { "-dark" } else { "" };
+            let path = out.join(format!("{name}-{label}{scheme}.png"));
             render(&ui, &window, width, height, &path);
             ui.hide().expect("hide");
             println!("{}", path.display());

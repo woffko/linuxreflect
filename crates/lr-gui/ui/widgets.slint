@@ -216,7 +216,7 @@ export component DiskPanel inherits Rectangle {
             select(row) => { root.select(row); }
         }
         Text {
-            text: bar.hover-text != "" ? bar.hover-text : "Point at a partition for details; click to select it.";
+            text: bar.hover-text != "" ? bar.hover-text : "Point at a tile for details; click it to select it.";
             color: Theme.muted;
             font-size: Theme.small-size;
             overflow: elide;
@@ -272,7 +272,7 @@ export component StepList inherits VerticalLayout {
                 : index == root.current ? Theme.accent : Theme.free-space;
             Text {
                 text: index < root.current ? "✓" : index + 1;
-                color: index <= root.current ? #ffffff : Theme.muted;
+                color: index <= root.current ? (Theme.dark ? #101418 : #ffffff) : Theme.muted;
                 font-weight: 700;
                 horizontal-alignment: center;
                 vertical-alignment: center;

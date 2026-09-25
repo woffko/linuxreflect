@@ -9,12 +9,14 @@
 // This file is compiled with Slint under the Royalty-Free 2.0 licence; the
 // attribution the licence asks for is shown in the navigation (see D-090).
 
-import { ScrollView, ListView, Button, ComboBox, CheckBox, LineEdit, ProgressIndicator } from "std-widgets.slint";
+import { ScrollView, ListView, Button, ComboBox, CheckBox, LineEdit, ProgressIndicator, Palette } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { DiskRow, HistoryRow, PartitionTile, DiskCard, JobStage, JobPresentation } from "types.slint";
 import { NavItem, DiskPanel, StepList, Banner, PageHeader } from "widgets.slint";
 
 export { DiskRow, HistoryRow, PartitionTile, DiskCard, JobStage, JobPresentation }
+// Exported so tooling can render the dark scheme (examples/gallery.rs).
+export { Palette }
 
 export component MainWindow inherits Window {
     title: "LinuxReflect — backup and restore";

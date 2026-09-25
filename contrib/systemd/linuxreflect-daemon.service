@@ -9,6 +9,10 @@ ExecStart=/usr/local/bin/linuxreflect-daemon --socket /run/linuxreflect/daemon.s
 WatchdogSec=60
 Restart=on-failure
 RestartSec=2
+# SIGTERM makes the daemon refuse new jobs and exit once the running ones are
+# done (D-107): a stop, an update or a shutdown never cuts a restore in half.
+# A job can still be cancelled from the GUI or `linuxreflect job cancel`.
+TimeoutStopSec=infinity
 
 [Install]
 WantedBy=multi-user.target

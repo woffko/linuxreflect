@@ -75,9 +75,12 @@ systemctl enable --now linuxreflect-daemon.socket
 
 echo "LinuxReflect installed."
 if systemctl is-active --quiet linuxreflect-daemon.service; then
-    echo "  The running daemon was preserved to avoid interrupting jobs."
-    echo "  New binaries are installed; daemon activation is pending."
-    echo "  Activate during a maintenance window after all jobs finish and clients/schedules are quiesced."
+    # Stopping drains (D-107): the old daemon refuses new jobs, finishes the
+    # running ones and exits; the socket stays open, so the next request
+    # starts the new binary. --no-block keeps the installer from waiting.
+    systemctl --no-block stop linuxreflect-daemon.service
+    echo "  The running daemon finishes its current jobs, then exits."
+    echo "  The next request starts the new version."
 fi
 echo "  CLI:        linuxreflect --help"
 echo "  GUI:        linuxreflect-gui (or the menu entry)"

@@ -168,15 +168,74 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let incoming = UnixListenerStream::new(listener);
-        Server::builder()
+        let stopped = Arc::new(tokio::sync::Notify::new());
+        let server = Server::builder()
             .add_service(LinuxReflectServer::with_interceptor(
                 service,
                 PeerInterceptor,
             ))
-            .serve_with_incoming(incoming)
-            .await?;
+            .serve_with_incoming_shutdown(
+                incoming,
+                drain_on_signal(Arc::clone(&jobs), Arc::clone(&stopped), args.sd_notify),
+            );
+        // Streams such as `WatchEvents` never end on their own; once every
+        // job is done they get a short grace period, not a veto on exit.
+        tokio::select! {
+            result = server => result?,
+            () = async {
+                stopped.notified().await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            } => tracing::info!("closing the remaining streams"),
+        }
         Ok::<(), Box<dyn std::error::Error>>(())
     })
+}
+
+/// Resolve on SIGTERM or SIGINT once no job is running (D-107).
+///
+/// The first signal stops admitting jobs and waits for the running ones, so a
+/// `systemctl stop`, an update or a reboot never cuts a restore in half. A
+/// second signal cancels the running jobs through the same cancellation the
+/// `CancelJob` call uses. systemd keeps the socket open meanwhile, so new
+/// clients wait for the next daemon instead of being lost.
+async fn drain_on_signal(jobs: Arc<Jobs>, stopped: Arc<tokio::sync::Notify>, sd_notify: bool) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (Ok(mut terminate), Ok(mut interrupt)) = (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    ) else {
+        tracing::warn!("cannot install signal handlers; the daemon stops only when killed");
+        std::future::pending::<()>().await;
+        return;
+    };
+    tokio::select! {
+        _ = terminate.recv() => {}
+        _ = interrupt.recv() => {}
+    }
+    jobs.begin_drain();
+    let mut cancelled = false;
+    loop {
+        let active = jobs.active();
+        if active == 0 {
+            break;
+        }
+        tracing::info!(active, cancelled, "stopping: waiting for running jobs");
+        if sd_notify {
+            let _ = notify::send(&format!(
+                "STOPPING=1\nSTATUS=stopping; waiting for {active} running job(s)"
+            ));
+        }
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_millis(500)) => {}
+            _ = terminate.recv() => { jobs.cancel_all(); cancelled = true; }
+            _ = interrupt.recv() => { jobs.cancel_all(); cancelled = true; }
+        }
+    }
+    if sd_notify {
+        let _ = notify::send("STOPPING=1\nSTATUS=stopping");
+    }
+    tracing::info!("stopping: no job is running");
+    stopped.notify_one();
 }
 
 /// Send `WATCHDOG=1` at half the interval systemd asked for.

@@ -1178,3 +1178,21 @@ root that hold at least one `.lrimg`, sorted. It never opens or creates a set.
 `Destination::list_set_names` implements it for local (and mounted) and SFTP
 destinations; symlinks are not followed locally. A named `ListSets` is
 unchanged. The field is additive, so older clients are unaffected.
+
+## D-107 — Stopping the daemon drains its jobs
+
+The daemon used to have no signal handling: SIGTERM from `systemctl stop`,
+an update or a shutdown ended the process at once, cutting a restore in half
+and leaving the target unusable. Now the first SIGTERM or SIGINT stops
+admission (a new job gets `E_TARGET_BUSY`, "the daemon is stopping"), waits
+for the running jobs, reports `STOPPING=1` with the number still running, and
+exits 0. A second signal cancels the running jobs through the same flag
+`CancelJob` sets. Streams that never end on their own (`WatchEvents`) get five
+seconds once no job runs.
+
+The unit sets `TimeoutStopSec=infinity`, so systemd does not SIGKILL the daemon
+mid-restore; an operator who wants it gone sooner cancels the job. Because
+stopping is now safe, the installer requests it with `systemctl --no-block
+stop` when the daemon is active: the old process finishes its jobs and exits,
+the socket unit keeps the listening socket, and the next request starts the
+new binary. This replaces "activation is pending until a maintenance window".

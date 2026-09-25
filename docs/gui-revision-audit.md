@@ -348,8 +348,24 @@ Evidence on this tree:
   together in 18.5 s. The script gained `signal`, `wait-for-file` and
   `expect-restore-failure` so a test can act between review and restore.
 
-Not yet covered: physical mouse and keyboard runs on the new layout (the old
-coordinate-based harness invocations no longer apply) and a GNOME session.
+- Physical input on the new layout (private Xvfb 1280x720, unprivileged
+  dev-mode daemon on a private socket, real `xdotool` pointer and key
+  events, every step inspected from a `scrot` capture): the daemon's real
+  disk maps for the four WSL disks were shown ("Virtual Disk", read-only,
+  no partition table; filesystems unknown because an unprivileged daemon
+  cannot read the devices); a click on the Disk 2 tile selected `/dev/sdb`
+  and showed its details; "Image this disk…" opened the backup wizard at
+  Source with `/dev/sdb` selected; Next went to Destination with Next
+  disabled until a folder exists; after focusing the window, Tab moved the
+  focus ring from "Back up" to "Restore" and Space opened the library.
+  Keys sent with `xdotool key --window` are synthetic and ignored by winit;
+  only real key events count here.
+- Dark scheme: `LR_GALLERY_DARK=1` renders the pages with the dark palette;
+  the disks and restore-summary pages were inspected, and the step-number
+  contrast was fixed after that inspection.
+
+Not yet covered: the native file dialogs on the new layout (no portal is
+running in this environment) and a GNOME session.
 
 ## Acceptance checklist
 
@@ -1056,7 +1072,24 @@ and explicitly select X11 or Wayland software rendering. This test-harness
 update postdates the successful CI run and still needs compilation/execution.
 Its script-driven round trip will not replace physical mouse/dialog acceptance.
 
-## Installer/update findings still open
+## Daemon stop drains jobs; installer activation (D-107, 2026-09-25)
+
+The daemon now handles SIGTERM/SIGINT: admission closes, running jobs finish,
+and the process exits 0; a second signal cancels the jobs. The unit sets
+`TimeoutStopSec=infinity`, and `install-host.sh` requests
+`systemctl --no-block stop` on an active daemon so the next request starts
+the new binary through the socket unit.
+
+Evidence: `jobs::tests::a_draining_registry_refuses_new_jobs_and_cancels_on_request`,
+and two real-process tests in `lr-daemon/tests/daemon.rs`:
+`sigterm_waits_for_the_running_job_and_refuses_new_ones` (a 1 GiB file
+backup is copying when SIGTERM arrives; a new backup is refused with
+"stopping"; the daemon stays alive, the running job finishes, then the daemon
+exits 0) and `a_second_sigterm_cancels_the_running_job` (`E_CANCELLED`, exit
+0). `cargo xtask ci`: exit 0, 483 passed, 0 failed, 55 ignored. Not yet run
+under real systemd on the Ubuntu host (no passwordless sudo there).
+
+## Installer/update findings (historical; activation resolved by D-107)
 
 Inspection of `contrib/install-host.sh` confirms that it replaces the daemon
 binary and enables the socket, but does not restart an already running daemon.
