@@ -3,9 +3,48 @@
 #
 # The graphical session is preferred; this menu is what the console shows when
 # `cage` or the GUI binary is unavailable (or the user picked the TUI). It uses
-# the static `linuxreflect` rescue CLI for the actual work.
-set -eu
+# the static `linuxreflect` CLI and the `linuxreflect-repair` tool (the
+# `linuxreflect-rescue` binary, renamed here because the session launcher owns
+# that name). Every write is previewed first and needs a typed `yes`.
+set -u
 CLI=/usr/local/bin/linuxreflect
+REPAIR=/usr/local/bin/linuxreflect-repair
+# `prepare` and `apply` are separate processes and share the token secret here.
+export LR_TOKEN_SECRET_FILE=/run/linuxreflect-rescue/token.key
+mkdir -p /run/linuxreflect-rescue
+chmod 0700 /run/linuxreflect-rescue
+
+confirmed() {
+    printf '  type yes to write to %s: ' "$1"
+    read -r answer || answer=
+    [ "$answer" = "yes" ]
+}
+
+restore() {
+    printf '  image path (.lrimg): '; read -r image || return
+    printf '  target disk or partition: '; read -r target || return
+    plan=$("$CLI" restore prepare --image "$image" --target "$target") || return
+    printf '%s\n' "$plan" | grep -v '^token: '
+    token=$(printf '%s\n' "$plan" | sed -n 's/^token: //p' | head -1)
+    [ -n "$token" ] || { printf '  no restore token was issued\n'; return; }
+    confirmed "$target" || { printf '  nothing was written\n'; return; }
+    "$CLI" restore apply --token "$token" --confirm
+}
+
+boot_repair() {
+    printf '  disk to repair (for example /dev/sda): '; read -r disk || return
+    printf '  firmware (uefi or bios): '; read -r firmware || return
+    set -- boot-repair --disk "$disk" --firmware "$firmware"
+    if [ "$firmware" = "uefi" ]; then
+        printf '  ESP partition number: '; read -r esp || return
+        set -- "$@" --esp-partition "$esp"
+    else
+        set -- "$@" --layout-changed
+    fi
+    "$REPAIR" --dry-run "$@" || return
+    confirmed "$disk" || { printf '  nothing was written\n'; return; }
+    "$REPAIR" --confirm "$@"
+}
 
 menu() {
     printf '\n'
@@ -23,18 +62,9 @@ while :; do
     menu
     read -r choice || choice=q
     case "$choice" in
-        1)
-            printf '  image path: '; read -r image
-            printf '  target disk: '; read -r target
-            "$CLI" restore apply --image "$image" --target "$target" --confirm || true
-            ;;
-        2)
-            printf '  target disk: '; read -r target
-            "$CLI" rescue boot-repair --target "$target" --apply || true
-            ;;
-        3)
-            "$CLI" disk list || true
-            ;;
+        1) restore || true ;;
+        2) boot_repair || true ;;
+        3) "$CLI" disk list || true ;;
         4) exec /bin/sh -l ;;
         q|Q) exec poweroff -f ;;
         *) printf '  unknown choice\n' ;;
