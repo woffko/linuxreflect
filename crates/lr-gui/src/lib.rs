@@ -217,6 +217,7 @@ pub fn run(options: GuiOptions) -> anyhow::Result<ScriptOutcome> {
         // decorations: fill the output instead of maximising, or the space
         // reserved for client-side decorations stays black.
         if std::env::var("LINUXREFLECT_KIOSK").is_ok_and(|value| value == "1") {
+            ui.set_kiosk(true);
             ui.window().set_fullscreen(true);
         } else {
             ui.window().set_maximized(true);

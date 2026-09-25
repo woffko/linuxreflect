@@ -25,6 +25,10 @@ export component MainWindow inherits Window {
     min-width: 480px;
     min-height: 360px;
     background: Theme.window;
+    // Set for a kiosk compositor (the rescue medium): no window frame at all,
+    // so no space is reserved for decorations nobody draws.
+    in property <bool> kiosk: false;
+    no-frame: root.kiosk;
 
     in-out property <string> status: "ready";
     in-out property <string> socket: "";
