@@ -1,0 +1,6 @@
+blocksize = 4096
+agblocks = 32768
+agcount = 4
+dblocks = 131072
+logstart = 65543
+rblocks = 0

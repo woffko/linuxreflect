@@ -1,0 +1,22 @@
+[package]
+name = "lr-fuse"
+description = "Read-only FUSE view of file-mode images (spec §B, Slice S12)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+fuser.workspace = true
+lr-core.workspace = true
+lr-engine.workspace = true
+lr-format.workspace = true
+lr-store.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+
+tempfile.workspace = true
+
+[lints]
+workspace = true

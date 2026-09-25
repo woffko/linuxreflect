@@ -1,0 +1,16 @@
+[package]
+name = "lr-unsafe"
+description = "All unsafe Linux syscall/ioctl plumbing for LinuxReflect; the only crate allowed to contain unsafe code."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

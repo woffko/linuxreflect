@@ -1,0 +1,64 @@
+#!/bin/sh
+# Non-interactive bare-metal restore for the rescue medium (spec §K S16).
+#
+# The acceptance run boots the medium with a backup image and a target disk and
+# wants the restore to happen without a human at the console. Parameters come
+# from the kernel command line:
+#
+#   linuxreflect.autorun=1
+#   linuxreflect.image=<path to the .lrimg on the backup device>
+#   linuxreflect.target=<target block device>
+#   linuxreflect.backup=<device holding the image>   (optional; mounted first)
+#   linuxreflect.merge=1                             (optional, file mode)
+#   linuxreflect.mode=disk|file                      (default: disk)
+#
+# Every step announces itself on the serial console so a headless run is
+# auditable, and the machine powers off when it is done.
+set -u
+serial=/dev/ttyS0
+announce() {
+    printf '%s\n' "$1"
+    [ -w "$serial" ] && printf '%s\n' "$1" >"$serial" || true
+}
+param() {
+    value=$(tr ' ' '\n' < /proc/cmdline 2>/dev/null | sed -n "s/^$1=//p" | head -1)
+    printf '%s' "$value"
+}
+
+CLI=/usr/local/bin/linuxreflect
+# `prepare` and `apply` are separate processes and share the token secret here.
+export LR_TOKEN_SECRET_FILE=/run/linuxreflect-autorun/token.key
+mkdir -p /run/linuxreflect-autorun
+chmod 0700 /run/linuxreflect-autorun
+image=$(param linuxreflect.image)
+target=$(param linuxreflect.target)
+backup=$(param linuxreflect.backup)
+mode=$(param linuxreflect.mode)
+mode=${mode:-disk}
+
+announce "LINUXREFLECT-AUTORUN image=$image target=$target mode=$mode"
+
+if [ -n "$backup" ]; then
+    mkdir -p /mnt/backup
+    if ! mount "$backup" /mnt/backup >>"$serial" 2>&1; then
+        announce "LINUXREFLECT-AUTORUN backup-mount-failed"
+    fi
+fi
+
+prepare_args="restore prepare --image $image --target $target"
+[ "$mode" = "file" ] && prepare_args="$prepare_args --merge"
+
+token=$($CLI $prepare_args 2>>"$serial" | sed -n 's/^token: //p' | head -1)
+if [ -z "$token" ]; then
+    announce "LINUXREFLECT-AUTORUN no-token"
+else
+    if $CLI restore apply --token "$token" --confirm >>"$serial" 2>&1; then
+        announce "LINUXREFLECT-AUTORUN-RESTORED"
+    else
+        announce "LINUXREFLECT-AUTORUN-FAILED"
+    fi
+fi
+
+sync
+announce "LINUXREFLECT-AUTORUN-DONE"
+poweroff -f

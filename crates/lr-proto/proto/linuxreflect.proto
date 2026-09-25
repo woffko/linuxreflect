@@ -1,0 +1,284 @@
+// LinuxReflect daemon IPC (spec §I, Slice S11).
+//
+// Methods that belong to later slices are declared here so the schema stays
+// stable; the daemon answers them with UNIMPLEMENTED and the slice number.
+syntax = "proto3";
+
+package linuxreflect.v1;
+
+// ── Version and progress ────────────────────────────────────────────────────
+
+// Version and capability report for `daemon status`.
+message Version {
+  uint32 format_major = 1;
+  string daemon = 2;
+  bool dev_mode = 3;
+}
+
+// One step of any streaming method.
+message Progress {
+  oneof step {
+    Started started = 1;
+    Phase phase = 2;
+    Bytes bytes = 3;
+    Finished finished = 4;
+    Failure failure = 5;
+  }
+}
+
+message Started {
+  string job_id = 1;
+}
+
+message Phase {
+  string name = 1;
+}
+
+message Bytes {
+  uint64 done = 1;
+  uint64 total = 2;
+}
+
+message Finished {
+  string summary_json = 1;
+}
+
+message Failure {
+  string code = 1;
+  string message = 2;
+}
+
+// ── Disk and source inspection ──────────────────────────────────────────────
+
+message Request {
+  // Empty for methods that take no argument.
+  string unused = 1;
+}
+
+message SourceRef {
+  string source = 1;
+}
+
+message DiskList {
+  string json = 1;
+}
+
+// The plan `probe` computed for a source (spec §E).
+message Plan {
+  string provider = 1;
+  string image_kind = 2;
+  string consistency = 3;
+  uint64 estimated_bytes = 4;
+  repeated string warnings = 5;
+}
+
+// ── Backup ──────────────────────────────────────────────────────────────────
+
+message BackupSpec {
+  string source = 1;
+  string dest = 2;
+  string set = 3;
+  // full | incremental | differential
+  string member_type = 4;
+  // latest | <uuid>, empty for a full.
+  string parent = 5;
+  string mode = 6;
+  string snapshot = 7;
+  string compress = 8;
+  bool no_encrypt = 9;
+  string passphrase_file = 10;
+  string on_bad_sector = 11;
+  string chunk_size = 12;
+  string parent_job = 13;
+  bool allow_freeze = 14;
+  bool allow_inconsistent = 15;
+  string lvm_cow_size = 16;
+  string identity = 17;
+  string known_hosts = 18;
+  bool insecure_ignore_host_key = 19;
+  // Client-supplied id; repeating it returns the same job (spec §I).
+  string job_id = 20;
+  // Start a new chain after this many incrementals (spec §J.3).
+  uint64 max_incrementals = 21;
+}
+
+message MemberInfo {
+  string image_uuid = 1;
+  string parent_uuid = 2;
+  string kind = 3;
+  uint32 seq_in_chain = 4;
+  string image_kind = 5;
+  string consistency = 6;
+  uint64 created_unix = 7;
+  uint64 size_bytes = 8;
+  string file_name = 9;
+}
+
+message ChainInfo {
+  string chain_id = 1;
+  uint64 created_unix = 2;
+  bool complete = 3;
+  repeated MemberInfo members = 4;
+}
+
+message SetInfo {
+  string set = 1;
+  repeated ChainInfo chains = 2;
+  repeated string warnings = 3;
+}
+
+message SetRef {
+  string dest = 1;
+  string set = 2;
+  string identity = 3;
+  string known_hosts = 4;
+  bool insecure_ignore_host_key = 5;
+}
+
+// ── Verification ────────────────────────────────────────────────────────────
+
+message VerifySpec {
+  string image = 1;
+  bool chain = 2;
+  string passphrase_file = 3;
+  string identity = 4;
+  string known_hosts = 5;
+  bool insecure_ignore_host_key = 6;
+}
+
+message VerifyOutcome {
+  string image_uri = 1;
+  string image_kind = 2;
+  uint64 members = 3;
+  uint64 pages = 4;
+  uint64 chunks = 5;
+  uint64 bytes_checked = 6;
+}
+
+// ── Restore ─────────────────────────────────────────────────────────────────
+
+message ScheduleSpec {
+  string config = 1;
+  string systemd_dir = 2;
+  bool dry_run = 3;
+  string remove = 4;
+}
+
+message RetentionSpec {
+  string dest = 1;
+  string set = 2;
+  uint32 keep_chains = 3;
+  bool dry_run = 4;
+}
+
+message ExportSpec {
+  string image = 1;
+  string at = 2;
+  // nbd | ublk
+  string kind = 3;
+  string passphrase_file = 4;
+  string identity = 5;
+  string known_hosts = 6;
+  bool insecure_ignore_host_key = 7;
+}
+
+message UnexportSpec {
+  string at = 1;
+}
+
+message RestoreSpec {
+  string image = 1;
+  string target = 2;
+  string passphrase_file = 3;
+  string identity = 4;
+  string known_hosts = 5;
+  bool insecure_ignore_host_key = 6;
+  uint64 ttl_secs = 7;
+  // File mode: allow restoring into a non-empty directory (spec §K S12).
+  bool merge = 8;
+}
+
+message RestorePlanInfo {
+  string dest = 1;
+  string set = 2;
+  string image = 3;
+  repeated string members = 4;
+  string image_uuid = 5;
+  string consistency = 6;
+  string image_kind = 7;
+  uint64 source_size_bytes = 8;
+  uint64 chunk_size = 9;
+  string target = 10;
+  uint64 target_size_bytes = 11;
+  bool encrypted = 12;
+  repeated string warnings = 13;
+  string token = 14;
+}
+
+message RestoreToken {
+  string token = 1;
+  bool confirm = 2;
+  bool accept_inconsistent = 3;
+  string passphrase_file = 4;
+  string job_id = 5;
+}
+
+// ── Jobs and events ─────────────────────────────────────────────────────────
+
+message JobRef {
+  string job_id = 1;
+}
+
+message JobState {
+  string job_id = 1;
+  string set = 2;
+  // pending | running | finished | failed | cancelled
+  string state = 3;
+  Progress progress = 4;
+}
+
+message Event {
+  uint64 event_id = 1;
+  string kind = 2;
+  string message = 3;
+  Progress progress = 4;
+}
+
+service LinuxReflect {
+  // Version and mode; unauthenticated because it reveals nothing else.
+  rpc GetVersion(Request) returns (Version);
+
+  // disk.read
+  rpc ListDisks(Request) returns (DiskList);
+  // A CLI affordance beyond spec §I's list: the full layout of one device.
+  rpc DiskMap(SourceRef) returns (DiskList);
+  rpc ProbeSource(SourceRef) returns (Plan);
+  rpc ListSets(SetRef) returns (SetInfo);
+  rpc ListChains(SetRef) returns (SetInfo);
+
+  // backup.create
+  rpc CreateBackup(BackupSpec) returns (stream Progress);
+
+  // disk.read
+  rpc VerifyImage(VerifySpec) returns (stream Progress);
+
+  // restore.prepare
+  rpc PrepareRestore(RestoreSpec) returns (RestorePlanInfo);
+
+  // restore.apply
+  rpc RestoreImage(RestoreToken) returns (stream Progress);
+
+  // backup.create
+  rpc RebuildCatalog(SetRef) returns (Progress);
+
+  rpc GetJob(JobRef) returns (JobState);
+  rpc CancelJob(JobRef) returns (JobState);
+  rpc WatchEvents(Request) returns (stream Event);
+
+  // Declared for schema stability; each answers UNIMPLEMENTED with its slice.
+  rpc ExportImage(ExportSpec) returns (Progress);
+  rpc UnexportImage(UnexportSpec) returns (Progress);
+  rpc GetSchedule(ScheduleSpec) returns (Progress);
+  rpc SetSchedule(ScheduleSpec) returns (Progress);
+  rpc ApplyRetention(RetentionSpec) returns (Progress);
+}

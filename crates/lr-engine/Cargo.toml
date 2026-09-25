@@ -1,0 +1,39 @@
+[package]
+name = "lr-engine"
+description = "Backup/restore/verify orchestration, chains, scan-and-diff, whole-disk and stream modes (spec §D, §K S6-S9)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+fastcdc.workspace = true
+libc.workspace = true
+lr-core.workspace = true
+lr-unsafe.workspace = true
+lr-blocksource.workspace = true
+lr-crypto.workspace = true
+lr-format.workspace = true
+lr-fsmap.workspace = true
+lr-snapshot.workspace = true
+lr-store.workspace = true
+gpt.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+hex.workspace = true
+zeroize.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+libc.workspace = true
+lr-fsmap.workspace = true
+lr-snapshot.workspace = true
+lr-core.workspace = true
+lr-blocksource.workspace = true
+lr-store.workspace = true
+
+[lints]
+workspace = true

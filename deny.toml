@@ -1,0 +1,91 @@
+# cargo-deny configuration (spec §L.4, §L.5).
+
+[graph]
+all-features = false
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "x86_64-unknown-linux-musl" },
+]
+
+[advisories]
+version = 2
+db-urls = ["https://github.com/rustsec/advisory-db"]
+ignore = [
+    # mbrman (spec §B) depends on bincode 2.0.1. RUSTSEC-2025-0141 is an
+    # "unmaintained" advisory, not a vulnerability: no unsafe/incorrect
+    # behaviour is reported. mbrman is the mandated MBR reader and bincode is
+    # used only to (de)serialize the primary partition table it already parsed.
+    # Revisit when mbrman changes its serializer.
+    { id = "RUSTSEC-2025-0141", reason = "unmaintained-only advisory from a mandated parser dependency (mbrman -> bincode)" },
+    # RUSTSEC-2026-0192 (`ttf-parser` unmaintained) reaches the graph through
+    # the GUI's windowing stack (winit -> sctk-adwaita -> ab_glyph ->
+    # owned_ttf_parser). It is an unmaintained-only advisory with no reported
+    # vulnerability and no safe upgrade; winit is what Slint's Linux backend is
+    # built on (spec §B, §M.1 chose Slint). Revisit when winit drops ab_glyph.
+    { id = "RUSTSEC-2026-0192", reason = "unmaintained-only advisory from the GUI's mandated windowing stack (winit -> sctk-adwaita -> ab_glyph)" },
+    # RUSTSEC-2026-0278 (zbus_polkit PID-reuse bypass, CVSS 7.3) is fixed in
+    # 5.1.0, which is the pinned version. Nothing else is ignored on purpose:
+    # if any other advisory appears the build must fail.
+]
+yanked = "deny"
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+# All workspace crates are `publish = false`; the project license is an open
+# product decision (spec §M.1), so private crates are exempt from the license
+# expression requirement while every third-party license is still checked.
+private = { ignore = true }
+# Only licenses actually present in the dependency graph are allowed, so that
+# adding a dependency with a new license is a deliberate, reviewable change.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "MIT",
+    "MIT-0",
+    # `ring` (Apache-2.0 AND ISC) and its `untrusted` helper are the russh
+    # crypto backend chosen for the static musl rescue CLI. ISC is a
+    # permissive, OSI-approved license.
+    "ISC",
+    # `arrayref` (BSD-2-Clause) reaches the graph through the GUI's Slint
+    # dependencies (Slice S15); BSD-2-Clause is permissive and OSI-approved.
+    # `foldhash` (Zlib) reaches the graph through the gRPC/serde dependencies
+    # of Slice S11. Zlib is permissive and OSI-approved.
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    # The GUI (Slice S15) uses Slint under its Royalty-Free 2.0 option, chosen
+    # by the product owner (D-090). Slint offers `GPL-3.0-only OR
+    # LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0`; only
+    # the royalty-free option is allowed here, and the clarifying file below
+    # records its terms so the choice is auditable. The attribution the licence
+    # asks for is displayed in the GUI (ui/main.slint) and in README.md.
+    "LicenseRef-Slint-Royalty-free-2.0",
+]
+
+[[licenses.clarify]]
+# Slint's license expression contains non-SPDX `LicenseRef`s. Slint ships the
+# royalty-free terms in its crate; clarifying them here makes the allowance
+# explicit and pins the text we reviewed with a hash.
+name = "slint"
+expression = "GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0"
+license-files = [
+    { path = "LICENSES/LicenseRef-Slint-Royalty-free-2.0.md", hash = 0 },
+]
+
+[bans]
+multiple-versions = "warn"
+# Internal crates are path dependencies without a registry version, which
+# cargo-deny would otherwise report as wildcards. They are never published
+# (`publish = false`) and every third-party version is pinned exactly in
+# `[workspace.dependencies]`, so wildcards are allowed here.
+wildcards = "allow"
+
+[[bans.deny]]
+name = "zbus_polkit"
+version = "< 5.1.0"
+deny-multiple-versions = false
+reason = "RUSTSEC-2026-0278: PID-reuse authorization bypass, fixed in 5.1.0"

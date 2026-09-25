@@ -1,0 +1,44 @@
+#!/bin/sh
+# LinuxReflect rescue session entry point (spec §K S16).
+#
+# The graphical session is `cage` (a Wayland kiosk compositor) running the
+# Slint client; when no GUI binary or compositor is present the console TUI is
+# the fallback. The readiness line goes to the serial console so the acceptance
+# test can see that the medium reached the rescue session.
+set -eu
+
+serial=/dev/ttyS0
+announce() {
+    [ -w "$serial" ] && printf 'LINUXREFLECT-RESCUE-READY %s\n' "$1" >"$serial" || true
+}
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export XDG_RUNTIME_DIR="/run/linuxreflect-rescue"
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 0700 "$XDG_RUNTIME_DIR"
+
+# A non-interactive bare-metal restore is requested over the kernel command
+# line: do it and power off instead of opening a session.
+if grep -q 'linuxreflect.autorun=' /proc/cmdline 2>/dev/null &&
+    [ -x /usr/local/bin/linuxreflect-autorun ]; then
+    exec /usr/local/bin/linuxreflect-autorun
+fi
+
+if command -v cage >/dev/null 2>&1 && [ -x /usr/local/bin/linuxreflect-gui ]; then
+    announce graphical
+    # A rescue medium may boot on hardware (or a VM) with no input devices and
+    # no GPU; allow the software renderer and an input-less seat.
+    export WLR_LIBINPUT_NO_DEVICES=1
+    export WLR_RENDERER=pixman
+    export WLR_RENDERER_ALLOW_SOFTWARE=1
+    # Keep the compositor's diagnostics on the serial console so a failure is
+    # visible instead of a blank screen.
+    cage -s -- /usr/local/bin/linuxreflect-gui </dev/tty1 >"$serial" 2>&1 || true
+    announce gui-exited
+fi
+
+announce tui
+if [ -x /usr/local/bin/linuxreflect ]; then
+    exec /usr/local/bin/linuxreflect-rescue-tui
+fi
+exec /bin/sh -l

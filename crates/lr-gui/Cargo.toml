@@ -1,0 +1,40 @@
+[package]
+name = "lr-gui"
+description = "Slint GUI: disk map, backup and restore wizards, progress and history (spec §K S15)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "linuxreflect-gui"
+path = "src/main.rs"
+
+[dependencies]
+lr-core.workspace = true
+lr-proto.workspace = true
+slint.workspace = true
+tonic.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+serde.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# Native open/save dialogs through the xdg desktop portal (no GTK build dep):
+# the wizards pick disks, folders and images with the mouse.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+
+[build-dependencies]
+slint-build.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+lr-engine.workspace = true
+lr-store.workspace = true
+
+[lints]
+workspace = true

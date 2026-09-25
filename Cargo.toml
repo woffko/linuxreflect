@@ -1,0 +1,132 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/lr-core",
+    "crates/lr-unsafe",
+    "crates/lr-crypto",
+    "crates/lr-format",
+    "crates/lr-fsmap",
+    "crates/lr-snapshot",
+    "crates/lr-blocksource",
+    "crates/lr-store",
+    "crates/lr-engine",
+    "crates/lr-fuse",
+    "crates/lr-export",
+    "crates/lr-session",
+    "crates/lr-gui",
+    "crates/lr-rescue",
+    "crates/lr-proto",
+    "crates/lr-daemon",
+    "crates/lr-cli",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[workspace.dependencies]
+# GUI (spec §B, Slice S15): Royalty-Free 2.0 with attribution, see D-090.
+slint = { version = "=1.18.0", default-features = false, features = ["std", "compat-1-2", "backend-winit", "backend-winit-wayland", "backend-winit-x11", "renderer-software", "renderer-winit-software"] }
+slint-build = "=1.18.0"
+# FUSE plumbing for file-mode images (spec §B, Slice S12).
+fuser = { version = "=0.18.0", default-features = false }
+# CLI / errors / logging / config (spec §B)
+clap = { version = "=4.6.7", features = ["derive", "env"] }
+thiserror = "=2.0.20"
+anyhow = "=1.0.104"
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "json"] }
+tracing-journald = "=0.3.2"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
+toml = "=1.1.6"
+
+# Async
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "process", "signal", "sync", "time"] }
+
+# Crypto / hashing / compression (spec §B)
+zstd = "=0.14.0"
+aes-gcm = "=0.11.1"
+chacha20poly1305 = "=0.11.0"
+argon2 = "=0.6.0"
+hkdf = "=0.13.0"
+hmac = "=0.13.0"
+sha1 = "=0.11.0"
+sha2 = "=0.11.0"
+blake3 = "=1.8.7"
+zeroize = { version = "=1.9.0", features = ["derive"] }
+fastcdc = "=5.0.0"
+rand = "=0.10.2"
+
+# Partition tables / syscalls (spec §B)
+gpt = "=4.1.0"
+mbrman = "=0.6.1"
+nix = { version = "=0.31.3", features = ["ioctl", "fs", "mount", "dir", "user"] }
+libc = "=0.2.189"
+
+# IPC (spec §B) - used from S11. tonic 0.14 split the prost codec out, so the
+# runtime half is `tonic-prost` and the code generator `tonic-prost-build`.
+tonic = "=0.14.6"
+tonic-prost = "=0.14.6"
+tonic-prost-build = "=0.14.6"
+prost = "=0.14.4"
+prost-build = "=0.14.4"
+tonic-build = "=0.14.6"
+tokio-stream = { version = "=0.1.19", features = ["sync", "net"] }
+enumflags2 = "=0.7.12"
+zbus = "=5.19.0"
+zbus_polkit = "=5.1.0"
+
+# Remote destinations (spec §B) - used from S10.
+# No default features: the default `aws-lc-rs` backend needs cmake/bindgen and
+# does not build for the static musl rescue CLI. Members opt in to `ring`.
+russh = { version = "=0.63.3", default-features = false }
+russh-sftp = "=3.0.0"
+
+# Test / dev
+proptest = "=1.11.0"
+tempfile = "=3.27.0"
+hex = "=0.4.3"
+
+# Internal crates
+lr-core = { path = "crates/lr-core" }
+lr-unsafe = { path = "crates/lr-unsafe" }
+lr-crypto = { path = "crates/lr-crypto" }
+lr-format = { path = "crates/lr-format" }
+lr-fsmap = { path = "crates/lr-fsmap" }
+lr-snapshot = { path = "crates/lr-snapshot" }
+lr-blocksource = { path = "crates/lr-blocksource" }
+lr-store = { path = "crates/lr-store" }
+lr-engine = { path = "crates/lr-engine" }
+lr-fuse = { path = "crates/lr-fuse" }
+lr-export = { path = "crates/lr-export" }
+lr-session = { path = "crates/lr-session" }
+lr-gui = { path = "crates/lr-gui" }
+lr-rescue = { path = "crates/lr-rescue" }
+lr-proto = { path = "crates/lr-proto" }
+lr-daemon = { path = "crates/lr-daemon" }
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev.package."*"]
+opt-level = 1

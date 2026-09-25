@@ -1,0 +1,759 @@
+// LinuxReflect GUI (spec §K S15).
+//
+// A Macrium-style layout: a toolbar, a clickable disk/partition map, wizard
+// tabs whose every path is picked with the mouse (dialogs or lists), live
+// progress with cancel, and a history that feeds the restore tab. Every action
+// goes through the daemon; the GUI never opens a device (spec §B).
+//
+// This file is compiled with Slint under the Royalty-Free 2.0 licence; the
+// attribution the licence asks for is the footer below (see D-090).
+
+import { VerticalBox, HorizontalBox, GridBox, ScrollView, ListView, Button, ComboBox, CheckBox, LineEdit, TextEdit, ProgressIndicator } from "std-widgets.slint";
+
+export struct DiskRow {
+    name: string,
+    kind: string,
+    size: string,
+    path: string,
+    is-disk: bool,
+    restore-unavailable: string,
+}
+
+export struct HistoryRow {
+    name: string,
+    detail: string,
+    path: string,
+}
+
+export struct DiskCard {
+    disk-index: int,
+    partition-indices: [int],
+}
+
+export struct PartitionTile {
+    label: string,
+    path: string,
+    start: float,
+    extent: float,
+}
+
+export enum JobStage { idle, starting, running, cancelling, disconnected, succeeded, failed, cancelled }
+export struct JobPresentation {
+    stage: JobStage,
+    detail: string,
+    report: string,
+}
+
+export component MainWindow inherits Window {
+    title: "LinuxReflect — backup and restore";
+    preferred-width: 1120px;
+    preferred-height: 740px;
+
+    in-out property <string> status: "ready";
+    in-out property <string> socket: "";
+    in-out property <string> source: "";
+    in-out property <string> destination: "";
+    in-out property <string> backup-set: "default";
+    in-out property <string> mode: "auto";
+    in-out property <string> member-type: "full";
+    in-out property <string> snapshot: "auto";
+    in-out property <bool> allow-freeze: false;
+    in-out property <bool> allow-inconsistent: false;
+    in-out property <string> compress: "zstd:9";
+    in-out property <string> bad-sector: "abort";
+    in-out property <bool> encrypt: false;
+    in-out property <string> passphrase-file: "";
+    in-out property <string> plan: "(no plan yet — press «Show plan»)";
+    in-out property <string> image: "";
+    in-out property <string> target: "";
+    in-out property <string> restore-passphrase-file: "";
+    in-out property <string> restore-plan: "(no plan yet — press «Show token plan»)";
+    in-out property <string> restore-summary: "";
+    in-out property <bool> show-restore-details: false;
+    in-out property <string> token: "";
+    in-out property <string> planned-image: "";
+    in-out property <string> planned-target: "";
+    in-out property <bool> restore-confirmed: false;
+    out property <bool> restore-plan-current: root.token != "" && root.image == root.planned-image && root.target == root.planned-target;
+    in-out property <string> phase: "idle";
+    in-out property <string> job-id: "";
+    in-out property <string> job-operation: "";
+    in-out property <bool> has-job: false;
+    in-out property <string> last-image: "";
+    // True while an action runs; the automation script waits on it.
+    in-out property <bool> busy: false;
+    in-out property <float> progress: 0;
+    in-out property <string> progress-text: "";
+    in-out property <string> result-text: "";
+    in-out property <bool> show-result-details: false;
+    in-out property <JobPresentation> backup-job;
+    in-out property <JobPresentation> restore-job;
+    in-out property <[DiskRow]> disks: [];
+    in-out property <[DiskCard]> disk-cards: [];
+    in-out property <bool> show-system-devices: false;
+    in-out property <string> disk-status: "Refresh to load disks.";
+    in-out property <string> layout-title: "Select a disk to inspect its partitions.";
+    in-out property <[PartitionTile]> partition-tiles: [];
+    in-out property <[HistoryRow]> history: [];
+    in-out property <int> selected-disk: -1;
+    in-out property <int> current-tab: 0;
+    in-out property <bool> choosing-restore-target: false;
+    in-out property <int> backup-step: 0;
+    in-out property <int> restore-step: 0;
+    in-out property <bool> advanced-backup: false;
+    in-out property <bool> show-source-details: false;
+
+    // Actions; the Rust side binds them to the daemon.
+    callback refresh-disks();
+    callback refresh-history();
+    callback probe-source();
+    callback start-backup();
+    callback prepare-restore();
+    callback restore-inputs-changed();
+    callback start-restore();
+    callback cancel-job();
+    callback check-job();
+    callback pick-source-folder();
+    callback pick-destination();
+    callback pick-image();
+    callback pick-passphrase();
+    callback pick-restore-passphrase();
+    callback pick-target-folder();
+    callback disk-selected(int);
+    callback partition-selected(int);
+    callback history-selected(int);
+    callback use-last-image();
+    callback show-backup-tab();
+    callback show-restore-tab();
+
+    // The running job is cancellable only while it streams.
+    function cancel-enabled() -> bool {
+        root.busy && root.has-job && root.job-id != ""
+    }
+
+    function job-terminal(stage: JobStage) -> bool {
+        stage == JobStage.succeeded || stage == JobStage.failed || stage == JobStage.cancelled
+    }
+
+    function job-title(operation: string, stage: JobStage) -> string {
+        operation + (stage == JobStage.starting ? " starting…"
+            : stage == JobStage.running ? " in progress"
+            : stage == JobStage.cancelling ? " cancellation requested"
+            : stage == JobStage.disconnected ? " — connection lost; check job status"
+            : stage == JobStage.succeeded ? " completed"
+            : stage == JobStage.failed ? " failed"
+            : stage == JobStage.cancelled ? " cancelled" : " not started")
+    }
+
+    VerticalBox {
+        padding: 10px;
+        spacing: 8px;
+
+        // ── Toolbar ────────────────────────────────────────────────────────
+        HorizontalBox {
+            vertical-stretch: 0;
+            spacing: 8px;
+            Button { text: "Refresh"; enabled: !root.busy; clicked => { root.refresh-disks(); } }
+            Button {
+                text: "Back up folder…";
+                enabled: !root.busy;
+                clicked => { root.show-backup-tab(); root.pick-source-folder(); }
+            }
+            Button { text: "Restore…"; clicked => { root.show-restore-tab(); } }
+            Rectangle { horizontal-stretch: 1; }
+        }
+
+        VerticalBox {
+            padding: 0px;
+            vertical-stretch: 1;
+            min-width: 0px;
+            min-height: 0px;
+
+            // Only the active page participates in layout. Hidden wizard and
+            // history forms must not impose their minimum width on every page.
+            HorizontalBox {
+                vertical-stretch: 0;
+                padding: 0px;
+                spacing: 4px;
+                Button { text: "Disks"; primary: root.current-tab == 0; clicked => { root.current-tab = 0; } }
+                Button { text: "Backup"; primary: root.current-tab == 1; clicked => { root.current-tab = 1; } }
+                Button { text: "Restore"; primary: root.current-tab == 2; clicked => { root.current-tab = 2; } }
+                Button { text: "History"; primary: root.current-tab == 3; clicked => { root.current-tab = 3; } }
+            }
+
+            // ── Disks: pick a source with the mouse ────────────────────────
+            if root.current-tab == 0: Rectangle {
+                vertical-stretch: 1;
+                VerticalBox {
+                    padding: 0px;
+                    spacing: 8px;
+
+                    ScrollView {
+                        min-height: 0px;
+                        vertical-stretch: 1;
+                        content-width: self.width;
+                        VerticalBox {
+                            alignment: start;
+                            padding: 0px;
+                            spacing: 8px;
+
+                    HorizontalBox {
+                        spacing: 8px;
+                        Text {
+                            text: root.choosing-restore-target
+                                ? "RESTORE DESTINATION — choose the disk or partition that will receive the backup."
+                                : "Choose a disk or partition to back up.";
+                            color: #444444;
+                            horizontal-stretch: 1;
+                            min-width: 0px;
+                            wrap: word-wrap;
+                        }
+                        Button {
+                            text: root.show-system-devices ? "Hide service devices" : "Service devices";
+                            enabled: !root.busy;
+                            clicked => { root.show-system-devices = !root.show-system-devices; root.refresh-disks(); }
+                        }
+                    }
+
+                    Text { text: root.disk-status; wrap: word-wrap; }
+
+                    VerticalBox {
+                        padding: 0px;
+                        spacing: 12px;
+                        for card in root.disk-cards: Rectangle {
+                            background: #f6f8fa;
+                            border-color: #aab6c4;
+                            border-width: 1px;
+                            border-radius: 6px;
+                            VerticalBox {
+                                padding: 8px;
+                                spacing: 6px;
+                                Button {
+                                    text: root.disks[card.disk-index].name + " · " + root.disks[card.disk-index].size;
+                                    primary: root.source == root.disks[card.disk-index].path;
+                                    enabled: !root.busy && (!root.choosing-restore-target || root.disks[card.disk-index].restore-unavailable == "");
+                                    clicked => { root.disk-selected(card.disk-index); }
+                                }
+                                Text { text: root.disks[card.disk-index].path + " · " + root.disks[card.disk-index].kind; wrap: word-wrap; }
+                                if root.choosing-restore-target && root.disks[card.disk-index].restore-unavailable != "": Text {
+                                    text: root.disks[card.disk-index].restore-unavailable;
+                                    color: #9b3200;
+                                    wrap: word-wrap;
+                                }
+                                for idx in card.partition-indices: VerticalBox {
+                                    padding: 0px;
+                                    spacing: 2px;
+                                    Button {
+                                        text: root.disks[idx].name + " · " + root.disks[idx].size;
+                                        primary: root.source == root.disks[idx].path;
+                                        enabled: !root.busy && (!root.choosing-restore-target || root.disks[idx].restore-unavailable == "");
+                                        clicked => { root.disk-selected(idx); }
+                                    }
+                                    Text { text: root.disks[idx].kind; wrap: word-wrap; }
+                                    if root.choosing-restore-target && root.disks[idx].restore-unavailable != "": Text {
+                                        text: root.disks[idx].restore-unavailable;
+                                        color: #9b3200;
+                                        wrap: word-wrap;
+                                    }
+                                }
+                                if !root.choosing-restore-target: Button {
+                                    text: "Back up this disk…";
+                                    enabled: !root.busy;
+                                    clicked => {
+                                        root.backup-step = 0;
+                                        root.disk-selected(card.disk-index);
+                                        root.show-backup-tab();
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Text { text: root.layout-title; wrap: word-wrap; font-weight: 700; }
+                    if root.partition-tiles.length > 0: Rectangle {
+                        height: 44px;
+                        background: #e4e7eb;
+                        for tile[idx] in root.partition-tiles: Rectangle {
+                            x: tile.start * parent.width;
+                            width: tile.extent * parent.width;
+                            height: parent.height;
+                            background: tile.path != "" && tile.path == root.source ? #217a44 : (Math.mod(idx, 2) == 0 ? #4684c4 : #3168a0);
+                            border-color: #ffffff;
+                            border-width: 1px;
+                            Text { text: tile.path; color: white; overflow: elide; }
+                            TouchArea { clicked => { root.partition-selected(idx); } }
+                        }
+                    }
+                    if root.partition-tiles.length > 0: VerticalBox {
+                        padding: 0px;
+                        for tile[idx] in root.partition-tiles: Button {
+                            text: (tile.path != "" && tile.path == root.source ? "Selected · " : "") + tile.label;
+                            enabled: tile.path != "" && !root.busy;
+                            clicked => { root.partition-selected(idx); }
+                        }
+                    }
+
+                        }
+                    }
+
+                    HorizontalBox {
+                        vertical-stretch: 0;
+                        padding: 0px;
+                        spacing: 8px;
+                        Text { text: root.choosing-restore-target ? "Destination:" : "Source:"; color: #444444; }
+                        Text { text: root.choosing-restore-target ? root.target : (root.source == "" ? "Not selected" : root.source); font-weight: 700; min-width: 0px; horizontal-stretch: 1; overflow: elide; }
+                        if !root.choosing-restore-target: Button {
+                            text: "Back up…";
+                            enabled: root.source != "" && !root.busy;
+                            clicked => { root.show-backup-tab(); }
+                        }
+                        if root.choosing-restore-target: Button {
+                            text: "Cancel selection";
+                            clicked => { root.choosing-restore-target = false; root.current-tab = 2; }
+                        }
+                    }
+                }
+            }
+
+            // ── Backup ──────────────────────────────────────────────────────
+            if root.current-tab == 1: Rectangle {
+                vertical-stretch: 1;
+                VerticalBox {
+                    padding: 0px;
+                    spacing: 8px;
+
+                    Text {
+                        text: root.backup-step == 0 ? "1 of 4 · What would you like to back up?"
+                            : root.backup-step == 1 ? "2 of 4 · Where should the backup be saved?"
+                            : root.backup-step == 2 ? "3 of 4 · Review your backup"
+                            : "4 of 4 · " + root.job-title("Backup", root.backup-job.stage);
+                        font-size: 20px;
+                        font-weight: 700;
+                        wrap: word-wrap;
+                    }
+
+                    ScrollView {
+                        min-height: 0px;
+                        content-width: self.width;
+                        vertical-stretch: 1;
+                        VerticalBox {
+                            padding: 0px;
+                            spacing: 12px;
+                            alignment: start;
+
+                    if root.backup-step == 0: VerticalBox {
+                        alignment: start;
+                        vertical-stretch: 0;
+                        spacing: 4px;
+                        Text { text: "What to back up"; font-weight: 700; }
+                        Text { text: "Select a disk or partition, or choose a folder. The source is read-only during backup."; wrap: word-wrap; }
+                        HorizontalBox {
+                            Button {
+                                text: "Choose disk or partition…";
+                                enabled: !root.busy;
+                                clicked => { root.choosing-restore-target = false; root.current-tab = 0; root.refresh-disks(); }
+                            }
+                            Button { text: "Choose folder…"; enabled: !root.busy; clicked => { root.pick-source-folder(); } }
+                        }
+                        GridBox {
+                            spacing: 6px;
+                            Row {
+                                Text { text: "Source"; vertical-alignment: center; }
+                                LineEdit { text <=> root.source; placeholder-text: "/dev/sdX, /dev/mapper/… or a folder"; }
+                                Button { text: "Folder…"; clicked => { root.pick-source-folder(); } }
+                            }
+                        }
+                    }
+
+                    if root.backup-step == 1: VerticalBox {
+                        alignment: start;
+                        vertical-stretch: 0;
+                        spacing: 4px;
+                        Text { text: "Where to store it"; font-weight: 700; }
+                        GridBox {
+                            spacing: 6px;
+                            Row {
+                                Text { text: "Destination"; vertical-alignment: center; }
+                                LineEdit { text <=> root.destination; placeholder-text: "/mnt/backups or sftp://user@host/path"; }
+                                Button { text: "Browse…"; clicked => { root.pick-destination(); } }
+                            }
+                            Row {
+                                Text { text: "Set name"; vertical-alignment: center; }
+                                LineEdit { text <=> root.backup-set; }
+                                Rectangle {}
+                            }
+                        }
+                        CheckBox { text: "Additional settings"; checked <=> root.advanced-backup; }
+                        Text { text: "Defaults: a full backup, automatic consistency method and Zstandard compression. Encryption is off unless enabled below."; wrap: word-wrap; }
+                    }
+
+                    if root.backup-step == 1 && root.advanced-backup: VerticalBox {
+                        alignment: start;
+                        vertical-stretch: 0;
+                        spacing: 4px;
+                        Text { text: "Options"; font-weight: 700; }
+                        if root.snapshot == "freeze": VerticalBox {
+                            Text { text: "Freezing pauses writes to the source filesystem while it is copied. Applications using it may pause."; wrap: word-wrap; }
+                            CheckBox { text: "Allow a temporary filesystem freeze"; checked <=> root.allow-freeze; }
+                        }
+                        if root.snapshot == "none": VerticalBox {
+                            Text { text: "Without a snapshot or freeze, files may change during backup. The resulting copy may be inconsistent."; wrap: word-wrap; }
+                            CheckBox { text: "Allow a potentially inconsistent backup"; checked <=> root.allow-inconsistent; }
+                        }
+                        GridBox {
+                            spacing: 6px;
+                            Row {
+                                Text { text: "Backup method"; vertical-alignment: center; }
+                                ComboBox { model: ["auto", "block", "stream", "file"]; current-value <=> root.mode; }
+                            }
+                            Row {
+                                Text { text: "Backup type"; vertical-alignment: center; }
+                                ComboBox {
+                                    model: ["full", "incremental", "differential"];
+                                    current-value <=> root.member-type;
+                                }
+                            }
+                            Row {
+                                Text { text: "Snapshot"; vertical-alignment: center; }
+                                ComboBox {
+                                    model: ["auto", "offline", "btrfs", "lvm", "freeze", "none"];
+                                    current-value <=> root.snapshot;
+                                }
+                            }
+                            Row {
+                                Text { text: "Compression"; vertical-alignment: center; }
+                                ComboBox {
+                                    model: ["zstd:9", "zstd:3", "none"];
+                                    current-value <=> root.compress;
+                                }
+                            }
+                            Row {
+                                Text { text: "Bad sectors"; vertical-alignment: center; }
+                                ComboBox {
+                                    model: ["abort", "record"];
+                                    current-value <=> root.bad-sector;
+                                }
+                            }
+                        }
+                                CheckBox {
+                                    text: "Encrypt (passphrase file)";
+                                    checked <=> root.encrypt;
+                                }
+                        HorizontalBox {
+                                LineEdit {
+                                    min-width: 0px;
+                                    text <=> root.passphrase-file;
+                                    placeholder-text: "path to the passphrase file";
+                                    enabled: root.encrypt;
+                                }
+                                Button {
+                                    text: "Browse…";
+                                    enabled: root.encrypt;
+                                    clicked => { root.pick-passphrase(); }
+                                }
+                        }
+                    }
+
+                    if root.backup-step == 2: VerticalBox {
+                        alignment: start;
+                        vertical-stretch: 0;
+                        Text { text: "Source: " + root.source; wrap: word-wrap; }
+                        Text { text: "Save to: " + root.destination; wrap: word-wrap; }
+                        Text { text: "Backup name: " + root.backup-set; wrap: word-wrap; }
+                        Text { text: "Type: " + root.member-type + " · Compression: " + root.compress; wrap: word-wrap; }
+                        Text { text: root.encrypt ? "Encryption: enabled" : "Encryption: off"; }
+                        Text { text: root.snapshot == "freeze" ? "Temporary filesystem freeze requested. Applications may pause."
+                            : root.snapshot == "none" ? "Live copy without a snapshot: source changes may make the backup inconsistent."
+                            : "The selected consistency method will be checked before copying."; wrap: word-wrap; }
+                        CheckBox { text: "Technical source inspection details"; checked <=> root.show-source-details; }
+                        if root.show-source-details: Text { text: root.plan; wrap: word-wrap; }
+                        Text { text: "The daemon rechecks the source and the selected options when the backup starts."; wrap: word-wrap; }
+                    }
+
+                    if root.backup-step == 3: VerticalBox {
+                        alignment: start;
+                        vertical-stretch: 0;
+                        Text { text: root.backup-job.detail; wrap: word-wrap; }
+                        if root.backup-job.report != "": CheckBox { text: "Technical report"; checked <=> root.show-result-details; }
+                        if root.backup-job.report != "" && root.show-result-details: Text { text: root.backup-job.report; wrap: word-wrap; }
+                    }
+                        }
+                    }
+
+                    HorizontalBox {
+                        spacing: 8px;
+                        padding: 0px;
+                        vertical-stretch: 0;
+                        Button {
+                            text: root.backup-step == 3 ? "Review settings" : "Back";
+                            enabled: root.backup-step > 0 && !root.busy;
+                            // A completed attempt has consumed its review; retry must probe again.
+                            clicked => { root.backup-step = root.backup-step == 3 ? 1 : root.backup-step - 1; }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        if root.backup-step == 0: Button {
+                            text: "Next: destination";
+                            enabled: root.source != "" && !root.busy;
+                            clicked => { root.backup-step = 1; }
+                        }
+                        if root.backup-step == 1: Button {
+                            text: "Next: review";
+                            enabled: root.destination != "" && root.backup-set != "" && (!root.encrypt || root.passphrase-file != "")
+                                && (root.snapshot != "freeze" || root.allow-freeze)
+                                && (root.snapshot != "none" || root.allow-inconsistent) && !root.busy;
+                            clicked => { root.probe-source(); }
+                        }
+                        if root.backup-step == 2: Button {
+                            text: "Create backup";
+                            enabled: !root.busy;
+                            clicked => { root.start-backup(); }
+                        }
+                        if root.backup-step == 3 && root.job-terminal(root.backup-job.stage): Button {
+                            text: "Done";
+                            enabled: !root.busy;
+                            clicked => { root.current-tab = 0; root.backup-step = 0; }
+                        }
+                        if root.job-operation == "backup" && root.has-job: Button {
+                            text: "✖ Cancel";
+                            enabled: root.cancel-enabled();
+                            clicked => { root.cancel-job(); }
+                        }
+                    }
+                }
+            }
+
+            // ── Restore ─────────────────────────────────────────────────────
+            if root.current-tab == 2: Rectangle {
+                vertical-stretch: 1;
+                VerticalBox {
+                    padding: 0px;
+                    spacing: 8px;
+
+                    Text {
+                        text: root.restore-step == 0 ? "1 of 4 · Choose a backup to restore"
+                            : root.restore-step == 1 ? "2 of 4 · Choose the destination"
+                            : root.restore-step == 2 ? "3 of 4 · Review and confirm"
+                            : "4 of 4 · " + root.job-title("Restore", root.restore-job.stage);
+                        font-size: 20px;
+                        font-weight: 700;
+                        wrap: word-wrap;
+                    }
+
+                    ScrollView {
+                        min-height: 0px;
+                        content-width: self.width;
+                        vertical-stretch: 1;
+                        VerticalBox {
+                            padding: 0px;
+                            spacing: 12px;
+                            alignment: start;
+
+                    if root.restore-step == 0: VerticalBox {
+                        alignment: start;
+                        vertical-stretch: 0;
+                        spacing: 4px;
+                        Text { text: "What to restore"; font-weight: 700; }
+                        GridBox {
+                            spacing: 6px;
+                            Row {
+                                Text { text: "Image"; vertical-alignment: center; }
+                                LineEdit { text <=> root.image; placeholder-text: "Choose a backup image"; edited => { root.restore-inputs-changed(); } }
+                                Button { text: "Browse…"; clicked => { root.pick-image(); } }
+                            }
+                            Row {
+                                Rectangle {}
+                                Button {
+                                    text: "Use last backup";
+                                    enabled: root.last-image != "" && !root.busy;
+                                    clicked => { root.use-last-image(); }
+                                }
+                                Rectangle {}
+                            }
+                        }
+                        Text { text: "For an encrypted backup, choose its passphrase file. Leave this empty for an unencrypted backup."; wrap: word-wrap; }
+                        HorizontalBox {
+                            LineEdit {
+                                text <=> root.restore-passphrase-file;
+                                placeholder-text: "Passphrase file (optional)";
+                                edited => { root.restore-inputs-changed(); }
+                            }
+                            Button { text: "Choose file…"; enabled: !root.busy; clicked => { root.pick-restore-passphrase(); } }
+                        }
+                    }
+
+                    if root.restore-step == 1: VerticalBox {
+                        alignment: start;
+                        vertical-stretch: 0;
+                        spacing: 4px;
+                        Text { text: "Where to write it"; font-weight: 700; }
+                        Text { text: "A disk image needs a disk or partition. A file backup needs a folder. The review checks whether your destination is suitable."; wrap: word-wrap; }
+                        GridBox {
+                            spacing: 6px;
+                            Row {
+                                Text { text: "Target"; vertical-alignment: center; }
+                                LineEdit { text <=> root.target; placeholder-text: "/dev/sdX for a disk image, a folder for file mode"; edited => { root.restore-inputs-changed(); } }
+                                Button {
+                                    text: "Choose disk…";
+                                    enabled: !root.busy;
+                                    clicked => {
+                                        root.choosing-restore-target = true;
+                                        root.current-tab = 0;
+                                        root.refresh-disks();
+                                    }
+                                }
+                            }
+                            Row {
+                                Rectangle {}
+                                Button {
+                                    text: "Choose folder…";
+                                    enabled: !root.busy;
+                                    clicked => { root.pick-target-folder(); }
+                                }
+                                Rectangle {}
+                            }
+                        }
+                    }
+
+                    if root.restore-step == 2: Text { text: "From backup: " + root.planned-image; wrap: word-wrap; }
+                    if root.restore-step == 2: Text { text: "Write to: " + root.planned-target; font-weight: 700; wrap: word-wrap; }
+                    if root.restore-step == 2: Text { text: "Existing data on this destination may be overwritten. Check the destination carefully before confirming."; wrap: word-wrap; color: #9b3200; }
+                    if root.restore-step == 2: Text { text: root.restore-summary; wrap: word-wrap; }
+                    if root.restore-step == 2: CheckBox { text: "Technical plan"; checked <=> root.show-restore-details; }
+                    if root.restore-step == 2 && root.show-restore-details: Text { text: root.restore-plan; wrap: word-wrap; }
+                    if root.restore-step == 3: VerticalBox {
+                        alignment: start;
+                        vertical-stretch: 0;
+                        Text { text: root.restore-job.detail; wrap: word-wrap; }
+                        if root.restore-job.report != "": CheckBox { text: "Technical report"; checked <=> root.show-result-details; }
+                        if root.restore-job.report != "" && root.show-result-details: Text { text: root.restore-job.report; wrap: word-wrap; }
+                    }
+                        }
+                    }
+
+                    if root.restore-step == 2: CheckBox {
+                        text: "Confirm writing to the reviewed destination";
+                        checked <=> root.restore-confirmed;
+                        enabled: root.restore-plan-current && !root.busy;
+                    }
+
+                    HorizontalBox {
+                        spacing: 8px;
+                        padding: 0px;
+                        vertical-stretch: 0;
+                        Button {
+                            text: "Back";
+                            enabled: root.restore-step > 0 && !root.busy;
+                            clicked => {
+                                root.restore-step = root.restore-step == 3 ? 1 : root.restore-step - 1;
+                                root.restore-inputs-changed();
+                            }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        if root.restore-step == 0: Button {
+                            text: "Next: destination";
+                            enabled: root.image != "" && !root.busy;
+                            clicked => { root.restore-step = 1; }
+                        }
+                        if root.restore-step == 1: Button {
+                            text: "Next: review";
+                            enabled: !root.busy && root.image != "" && root.target != "";
+                            clicked => { root.prepare-restore(); }
+                        }
+                        if root.restore-step == 2: Button {
+                            text: "Restore now";
+                            enabled: root.restore-plan-current && root.restore-confirmed && !root.busy;
+                            clicked => { root.start-restore(); }
+                        }
+                        if root.restore-step == 3 && root.job-terminal(root.restore-job.stage): Button {
+                            text: "Done";
+                            enabled: !root.busy;
+                            clicked => { root.current-tab = 0; root.restore-step = 0; root.restore-inputs-changed(); }
+                        }
+                        if root.job-operation == "restore" && root.has-job: Button {
+                            text: "✖ Cancel";
+                            enabled: root.cancel-enabled();
+                            clicked => { root.cancel-job(); }
+                        }
+                    }
+                }
+            }
+
+            // ── History ─────────────────────────────────────────────────────
+            if root.current-tab == 3: Rectangle {
+                vertical-stretch: 1;
+                VerticalBox {
+                    spacing: 8px;
+
+                    GridBox {
+                        spacing: 6px;
+                        Row {
+                        Text { text: "Destination"; vertical-alignment: center; }
+                        LineEdit { text <=> root.destination; min-width: 0px; horizontal-stretch: 1; }
+                        Button { text: "Browse…"; clicked => { root.pick-destination(); } }
+                        }
+                        Row {
+                        Text { text: "Backup name"; vertical-alignment: center; }
+                        LineEdit { text <=> root.backup-set; min-width: 0px; horizontal-stretch: 1; }
+                        Button { text: "Refresh"; clicked => { root.refresh-history(); } }
+                        }
+                    }
+
+                    Text {
+                        text: "Choose a backup to review where and how to restore it.";
+                        wrap: word-wrap;
+                        color: #444444;
+                    }
+
+                    ListView {
+                        vertical-stretch: 1;
+                        for row[idx] in root.history : Rectangle {
+                            height: history-row.preferred-height;
+                            background: Math.mod(idx, 2) == 0 ? #ffffff : #f6f8fa;
+                            history-row := HorizontalBox {
+                                padding-left: 8px;
+                                padding-right: 8px;
+                                spacing: 12px;
+                                VerticalBox {
+                                    padding: 0px;
+                                    min-width: 0px;
+                                    horizontal-stretch: 1;
+                                    Text { text: row.name; wrap: word-wrap; }
+                                    Text { text: row.detail; wrap: word-wrap; color: #444444; }
+                                }
+                                Button {
+                                    text: "Restore…";
+                                    accessible-label: "Review restore of " + row.name;
+                                    enabled: !root.busy;
+                                    vertical-stretch: 0;
+                                    clicked => { root.history-selected(idx); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Status bar ──────────────────────────────────────────────────────
+        if root.has-job: HorizontalBox {
+            Text { text: root.job-operation; min-width: 0px; horizontal-stretch: 1; overflow: elide; }
+            Button { text: "Check status"; clicked => { root.check-job(); } }
+            Button { text: "Cancel job"; enabled: root.cancel-enabled(); clicked => { root.cancel-job(); } }
+        }
+        if root.busy: HorizontalBox {
+            vertical-stretch: 0;
+            spacing: 8px;
+            Text { text: root.phase; width: 90px; overflow: elide; }
+            ProgressIndicator { progress: root.has-job ? root.progress : 0; horizontal-stretch: 1; }
+        }
+        Text { text: root.status; overflow: elide; }
+
+        // Slint Royalty-Free 2.0 asks for attribution; this line provides it.
+        Text {
+            text: "GUI built with Slint (https://slint.dev) under the Slint Royalty-Free 2.0 licence.";
+            font-size: 11px;
+            wrap: word-wrap;
+            color: #666666;
+        }
+    }
+}

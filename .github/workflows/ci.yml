@@ -1,0 +1,84 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup show && rustc --version
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup show && rustc --version
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests (unprivileged)
+        run: cargo test --workspace
+
+  deny:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
+
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Privileged acceptance tests (losetup, LVM, fsfreeze, xfs, qemu).
+  #
+  # These are not run on every pull request: hosted runners expose loop devices
+  # unreliably even in privileged containers, and the tests call `losetup`,
+  # `partprobe`, `lvm` and `fsfreeze`. Run them on main and on demand, or point
+  # them at the dedicated test host described in AGENTS.md.
+  root-tests:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    container:
+      image: debian:13-slim
+      options: --privileged -v /dev:/dev
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test tooling
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl git \
+            util-linux e2fsprogs xfsprogs lvm2 gdisk btrfs-progs dosfstools \
+            qemu-system-x86 ovmf
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain none
+          . "$HOME/.cargo/env"
+          rustup show
+      - name: Root acceptance tests
+        env:
+          LR_ROOT_TESTS: "1"
+        run: |
+          . "$HOME/.cargo/env"
+          cargo test --workspace -- --ignored --nocapture --test-threads=1

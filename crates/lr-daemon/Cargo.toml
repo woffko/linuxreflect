@@ -1,0 +1,41 @@
+[package]
+name = "lr-daemon"
+description = "Root daemon: systemd units, gRPC-over-UDS server, polkit authorization, restore tokens (spec §I, Slice S11)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+lr-core.workspace = true
+lr-unsafe.workspace = true
+lr-engine.workspace = true
+lr-export.workspace = true
+lr-snapshot.workspace = true
+lr-store.workspace = true
+lr-format.workspace = true
+lr-proto.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-journald.workspace = true
+tracing-subscriber.workspace = true
+zbus.workspace = true
+zbus_polkit.workspace = true
+tokio-stream.workspace = true
+nix.workspace = true
+enumflags2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "linuxreflect-daemon"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+

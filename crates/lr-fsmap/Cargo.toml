@@ -1,0 +1,19 @@
+[package]
+name = "lr-fsmap"
+description = "Used-block map providers: ext4, xfs, raw zero-skip (spec §F, Slice S5)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+lr-core.workspace = true
+lr-unsafe.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

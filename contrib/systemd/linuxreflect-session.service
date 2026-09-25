@@ -1,0 +1,10 @@
+[Unit]
+Description=LinuxReflect session notifications
+After=linuxreflect-daemon.socket
+
+[Service]
+ExecStart=/usr/local/bin/linuxreflect-session
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

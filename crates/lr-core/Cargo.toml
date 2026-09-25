@@ -1,0 +1,22 @@
+[package]
+name = "lr-core"
+description = "Core types for LinuxReflect: errors, ids, geometry, consistency, capability probe, discovery."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+lr-unsafe.workspace = true
+gpt.workspace = true
+mbrman.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

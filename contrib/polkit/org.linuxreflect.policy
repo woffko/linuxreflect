@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  polkit actions for the LinuxReflect daemon (spec §I).
+  Installing it: copy to /usr/share/polkit-1/actions/ and reload polkit.
+  `disk.read` is allowed for active sessions; everything that writes asks for
+  administrator authentication, and `restore.apply` never caches it.
+-->
+<policyconfig>
+  <vendor>LinuxReflect</vendor>
+
+  <action id="org.linuxreflect.disk.read">
+    <description>Inspect disks, partitions and backup sets</description>
+    <message>Authentication is required to read disk information</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.linuxreflect.backup.create">
+    <description>Create a backup image</description>
+    <message>Authentication is required to create a backup</message>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.linuxreflect.restore.prepare">
+    <description>Plan a restore</description>
+    <message>Authentication is required to plan a restore</message>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.linuxreflect.restore.apply">
+    <description>Write a restore target</description>
+    <message>Authentication is required to overwrite the restore target</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.linuxreflect.snapshot.manage">
+    <description>Manage LVM and Btrfs snapshots</description>
+    <message>Authentication is required to manage snapshots</message>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.linuxreflect.schedule.manage">
+    <description>Manage backup schedules and retention</description>
+    <message>Authentication is required to change the schedule</message>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.linuxreflect.destination.configure">
+    <description>Configure backup destinations</description>
+    <message>Authentication is required to change destinations</message>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.linuxreflect.export.manage">
+    <description>Export images over NBD or ublk</description>
+    <message>Authentication is required to export an image</message>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+</policyconfig>

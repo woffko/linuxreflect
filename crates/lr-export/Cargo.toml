@@ -1,0 +1,22 @@
+[package]
+name = "lr-export"
+description = "Read-only block export: a newstyle NBD server and read-only mounts of image filesystems (spec §K S13)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+lr-core.workspace = true
+lr-engine.workspace = true
+lr-format.workspace = true
+lr-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

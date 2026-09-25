@@ -1,0 +1,11 @@
+[Unit]
+Description=LinuxReflect daemon socket
+
+[Socket]
+ListenStream=/run/linuxreflect/daemon.sock
+SocketMode=0660
+SocketGroup=linuxreflect
+DirectoryMode=0750
+
+[Install]
+WantedBy=sockets.target

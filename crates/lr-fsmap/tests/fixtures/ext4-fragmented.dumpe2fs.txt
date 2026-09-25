@@ -1,0 +1,74 @@
+Filesystem volume name:   <none>
+Last mounted on:          <not available>
+Filesystem UUID:          00a0341d-6df7-45c8-9ee3-c3830162b52d
+Filesystem magic number:  0xEF53
+Filesystem revision #:    1 (dynamic)
+Filesystem features:      has_journal ext_attr resize_inode dir_index filetype extent 64bit flex_bg sparse_super large_file huge_file dir_nlink extra_isize metadata_csum
+Filesystem flags:         signed_directory_hash 
+Default mount options:    user_xattr acl
+Filesystem state:         clean
+Errors behavior:          Continue
+Filesystem OS type:       Linux
+Inode count:              65536
+Block count:              65536
+Reserved block count:     3276
+Overhead clusters:        8262
+Free blocks:              56046
+Free inodes:              65325
+First block:              0
+Block size:               4096
+Fragment size:            4096
+Group descriptor size:    64
+Reserved GDT blocks:      31
+Blocks per group:         32768
+Fragments per group:      32768
+Inodes per group:         32768
+Inode blocks per group:   2048
+Flex block group size:    16
+Filesystem created:       Thu Sep 17 21:09:03 2026
+Last mount time:          n/a
+Last write time:          Thu Sep 17 21:09:03 2026
+Mount count:              0
+Maximum mount count:      -1
+Last checked:             Thu Sep 17 21:09:03 2026
+Check interval:           0 (<none>)
+Lifetime writes:          11 MB
+Reserved blocks uid:      0 (user root)
+Reserved blocks gid:      0 (group root)
+First inode:              11
+Inode size:	          256
+Required extra isize:     32
+Desired extra isize:      32
+Journal inode:            8
+Default directory hash:   half_md4
+Directory Hash Seed:      64bb9623-a003-411c-8774-6ce98c3572d3
+Journal backup:           inode blocks
+Checksum type:            crc32c
+Checksum:                 0x9f16d252
+Journal features:         (none)
+Total journal size:       16M
+Total journal blocks:     4096
+Max transaction length:   4096
+Fast commit length:       0
+Journal sequence:         0x00000001
+Journal start:            0
+
+
+Group 0: (Blocks 0-32767) csum 0xaf38 [ITABLE_ZEROED]
+  Primary superblock at 0, Group descriptors at 1-1
+  Reserved GDT blocks at 2-32
+  Block bitmap at 33 (+33), csum 0x31c37b32
+  Inode bitmap at 35 (+35), csum 0x0cb557d7
+  Inode table at 37-2084 (+37)
+  27407 free blocks, 32557 free inodes, 2 directories, 32357 unused inodes
+  Free blocks: 4139-4145, 4150-4157, 4160-4162, 4173-4175, 4183-4184, 4195-4199, 4202-4204, 4213-4220, 4224-4228, 4232-4241, 4250-4251, 4255-4259, 4262-4269, 4272-4276, 4279-4288, 4293-4298, 4307-4310, 4321-4323, 4330-4339, 4344-4346, 4352-4358, 4362-4371, 4375-4376, 4382-4390, 4401-4408, 4416-4424, 4434-4440, 4447-4451, 4456-4460, 4464-4469, 4480-4488, 4496-4504, 4511-4513, 4517-4526, 4535-4538, 4546-4549, 4559-4566, 4569-4571, 4582-4588, 4596-4602, 4612-4620, 4624-4626, 4633-4641, 4645-4646, 4653-4661, 4668-4675, 4683-4684, 4694-4700, 4705-4707, 4717-4718, 4724-4729, 4734-4738, 4747-4754, 4764-4766, 4771-4779, 4788-4797, 4804-4807, 4816-4825, 4832-4839, 4847-4854, 4860-4863, 4867-4870, 4875-4879, 4885-4886, 4896-4899, 4906-4911, 4914-4917, 4926-4935, 4943-4949, 4954-4963, 4966-4974, 4985-4992, 5001-5008, 5017-5019, 5029-5036, 5039-5043, 5047-5051, 5061-5064, 5068-5074, 5077-5079, 5082-5085, 5096-5098, 5106-5107, 5111-5115, 5124-5127, 5134-5140, 5148-5156, 5160-5162, 5172-5180, 5190-5198, 5205-5207, 5212-5214, 5222-5227, 5237-5240, 5251-5252, 5258-5267, 5275-5278, 5289-5290, 5301-5306, 5310-5315, 5326-5332, 5337-5343, 5349-5358, 5369-5378, 5386-5390, 5396-5400, 5409-5413, 5419-5428, 5438-5444, 5447-5448, 5455-5463, 5470-5474, 5482-5490, 5498-5504, 5508-5512, 5516-5520, 5530-5534, 5542-5546, 5556-5557, 5567-5573, 5577-5579, 5588-5592, 5602-5605, 5614-5620, 5624-5631, 5641-5648, 5652-5655, 5660-5663, 5666-5669, 5679-5682, 5692-5698, 5703-5712, 5723-5726, 5729-5730, 5734-5743, 5748-5755, 5761-5765, 5768-5773, 5779-5784, 5795-5799, 5807-5812, 5823-5830, 5835-5836, 5844-5852, 5863-5870, 5881-5884, 5895-5898, 5909-5918, 5921-5929, 5934-5935, 5940-5943, 5948-5956, 5960-5969, 5972-5978, 5989-5998, 6009-6017, 6021-6030, 6033-6037, 6043-6048, 6051-6053, 6064-6072, 6083-6084, 6088-6096, 6104-6113, 6124-6128, 6135-6143, 6154-6163, 6173-6182, 6189-6198, 6205-6214, 6220-6228, 6233-6240, 6244-6251, 6261-6267, 6271-6275, 6284-6286, 6292-6297, 6301-6304, 6312-6315, 6322-6325, 6335-6339, 6343-6350, 6360-6363, 6369-6372, 6381-6390, 6399-6405, 6414-6418, 6426-6432, 6436-6442, 6445-6451, 6462-6470, 6480-6481, 6490-6496, 6507-6512, 6523-6525, 6529-6533, 6537-6539, 6546-6551, 6554-6557, 6564-6567, 6576-32767
+  Free inodes: 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64, 66, 68, 70, 72, 74, 76, 78, 80, 82, 84, 86, 88, 90, 92, 94, 96, 98, 100, 102, 104, 106, 108, 110, 112, 114, 116, 118, 120, 122, 124, 126, 128, 130, 132, 134, 136, 138, 140, 142, 144, 146, 148, 150, 152, 154, 156, 158, 160, 162, 164, 166, 168, 170, 172, 174, 176, 178, 180, 182, 184, 186, 188, 190, 192, 194, 196, 198, 200, 202, 204, 206, 208, 210, 212, 214, 216, 218, 220, 222, 224, 226, 228, 230, 232, 234, 236, 238, 240, 242, 244, 246, 248, 250, 252, 254, 256, 258, 260, 262, 264, 266, 268, 270, 272, 274, 276, 278, 280, 282, 284, 286, 288, 290, 292, 294, 296, 298, 300, 302, 304, 306, 308, 310, 312, 314, 316, 318, 320, 322, 324, 326, 328, 330, 332, 334, 336, 338, 340, 342, 344, 346, 348, 350, 352, 354, 356, 358, 360, 362, 364, 366, 368, 370, 372, 374, 376, 378, 380, 382, 384, 386, 388, 390, 392, 394, 396, 398, 400, 402, 404, 406, 408, 410, 412-32768
+Group 1: (Blocks 32768-65535) csum 0x96d4 [INODE_UNINIT, ITABLE_ZEROED]
+  Backup superblock at 32768, Group descriptors at 32769-32769
+  Reserved GDT blocks at 32770-32800
+  Block bitmap at 34 (bg #0 + 34), csum 0xc55afd98
+  Inode bitmap at 36 (bg #0 + 36), csum 0x00000000
+  Inode table at 2085-4132 (bg #0 + 2085)
+  28639 free blocks, 32768 free inodes, 0 directories, 32768 unused inodes
+  Free blocks: 36897-65535
+  Free inodes: 32769-65536

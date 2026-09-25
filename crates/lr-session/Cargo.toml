@@ -1,0 +1,27 @@
+[package]
+name = "lr-session"
+description = "User-session helper: forwards daemon job events to org.freedesktop.Notifications (spec §K S14)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "linuxreflect-session"
+path = "src/main.rs"
+
+[dependencies]
+lr-core.workspace = true
+lr-proto.workspace = true
+zbus.workspace = true
+tonic.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

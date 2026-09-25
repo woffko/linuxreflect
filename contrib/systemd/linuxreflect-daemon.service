@@ -1,0 +1,14 @@
+[Unit]
+Description=LinuxReflect backup daemon
+Requires=linuxreflect-daemon.socket
+After=linuxreflect-daemon.socket
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/linuxreflect-daemon --socket /run/linuxreflect/daemon.sock --no-create-group
+WatchdogSec=60
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

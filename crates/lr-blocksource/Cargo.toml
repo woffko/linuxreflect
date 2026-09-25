@@ -1,0 +1,20 @@
+[package]
+name = "lr-blocksource"
+description = "O_DIRECT aligned block reading over a device path plus its used-block map (spec §C.1, Slice S6)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+lr-core.workspace = true
+lr-unsafe.workspace = true
+lr-fsmap.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

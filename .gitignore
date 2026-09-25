@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+*.tmp
+*.img
+*.lrimg
+.DS_Store
+/tests/fixtures/generated/
+__pycache__/
+*.pyc
+/.codex/

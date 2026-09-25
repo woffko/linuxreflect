@@ -1,0 +1,17 @@
+[Unit]
+Description=LinuxReflect rescue session
+After=multi-user.target systemd-user-sessions.service
+Wants=multi-user.target
+
+[Service]
+Type=simple
+StandardInput=tty
+StandardOutput=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+ExecStart=/usr/local/bin/linuxreflect-rescue
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

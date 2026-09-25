@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=LinuxReflect
+Comment=Back up and restore disks and filesystems
+Exec=/usr/local/bin/linuxreflect-gui
+Terminal=false
+Categories=System;Utility;
+Keywords=backup;restore;disk;image;

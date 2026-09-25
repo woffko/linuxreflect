@@ -1,0 +1,27 @@
+[package]
+name = "lr-store"
+description = "Destinations (local, mounted, SFTP), set locking and atomic finalize (spec §C.1, §D.3, Slice S10)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+lr-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# `ring` instead of the default `aws-lc-rs`: the rescue CLI is built as a
+# static musl binary, and aws-lc-sys needs cmake/bindgen at build time.
+russh = { workspace = true, features = ["ring"] }
+russh-sftp.workspace = true
+hmac.workspace = true
+sha1.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

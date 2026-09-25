@@ -1,0 +1,74 @@
+Filesystem volume name:   ROOTFS
+Last mounted on:          <not available>
+Filesystem UUID:          b636d066-88f7-44c5-ae6e-18c5dcd9b3b2
+Filesystem magic number:  0xEF53
+Filesystem revision #:    1 (dynamic)
+Filesystem features:      has_journal ext_attr resize_inode dir_index filetype extent 64bit flex_bg sparse_super large_file huge_file dir_nlink extra_isize metadata_csum
+Filesystem flags:         signed_directory_hash 
+Default mount options:    user_xattr acl
+Filesystem state:         clean
+Errors behavior:          Continue
+Filesystem OS type:       Linux
+Inode count:              65536
+Block count:              65536
+Reserved block count:     3276
+Overhead clusters:        8262
+Free blocks:              57268
+Free inodes:              65525
+First block:              0
+Block size:               4096
+Fragment size:            4096
+Group descriptor size:    64
+Reserved GDT blocks:      31
+Blocks per group:         32768
+Fragments per group:      32768
+Inodes per group:         32768
+Inode blocks per group:   2048
+Flex block group size:    16
+Filesystem created:       Thu Sep 17 21:08:41 2026
+Last mount time:          n/a
+Last write time:          Thu Sep 17 21:08:41 2026
+Mount count:              0
+Maximum mount count:      -1
+Last checked:             Thu Sep 17 21:08:41 2026
+Check interval:           0 (<none>)
+Lifetime writes:          145 kB
+Reserved blocks uid:      0 (user root)
+Reserved blocks gid:      0 (group root)
+First inode:              11
+Inode size:	          256
+Required extra isize:     32
+Desired extra isize:      32
+Journal inode:            8
+Default directory hash:   half_md4
+Directory Hash Seed:      1447aea7-8526-4125-a5fe-ed361d5dc482
+Journal backup:           inode blocks
+Checksum type:            crc32c
+Checksum:                 0x7c29eea3
+Journal features:         (none)
+Total journal size:       16M
+Total journal blocks:     4096
+Max transaction length:   4096
+Fast commit length:       0
+Journal sequence:         0x00000001
+Journal start:            0
+
+
+Group 0: (Blocks 0-32767) csum 0xddc5 [ITABLE_ZEROED]
+  Primary superblock at 0, Group descriptors at 1-1
+  Reserved GDT blocks at 2-32
+  Block bitmap at 33 (+33), csum 0x142422fd
+  Inode bitmap at 35 (+35), csum 0xe32c4e32
+  Inode table at 37-2084 (+37)
+  28629 free blocks, 32757 free inodes, 2 directories, 32757 unused inodes
+  Free blocks: 4139-32767
+  Free inodes: 12-32768
+Group 1: (Blocks 32768-65535) csum 0xf36a [INODE_UNINIT, ITABLE_ZEROED]
+  Backup superblock at 32768, Group descriptors at 32769-32769
+  Reserved GDT blocks at 32770-32800
+  Block bitmap at 34 (bg #0 + 34), csum 0x62b623d2
+  Inode bitmap at 36 (bg #0 + 36), csum 0x00000000
+  Inode table at 2085-4132 (bg #0 + 2085)
+  28639 free blocks, 32768 free inodes, 0 directories, 32768 unused inodes
+  Free blocks: 36897-65535
+  Free inodes: 32769-65536

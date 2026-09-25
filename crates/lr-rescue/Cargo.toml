@@ -1,0 +1,26 @@
+[package]
+name = "lr-rescue"
+description = "Rescue mode: boot repair, layout recreation for file-mode restores, and the rescue media builder (spec §H.5, §K S16)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "linuxreflect-rescue"
+path = "src/main.rs"
+
+[dependencies]
+lr-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
