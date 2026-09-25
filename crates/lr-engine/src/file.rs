@@ -714,13 +714,23 @@ pub fn restore_file(request: &FileRestoreRequest) -> Result<FileRestoreReport> {
         ));
     }
 
-    // Merge the manifests: a later member replaces an earlier entry per path.
+    // Every member's manifest lists the whole tree at its backup time, so the
+    // newest member alone is the state being restored; earlier members only
+    // contribute the chunks it references. Merging all manifests would bring
+    // back files deleted before the newest backup (D-108).
+    let newest = members
+        .iter()
+        .map(|member| member.seq_in_chain)
+        .max()
+        .unwrap_or_default();
     let mut final_entries: BTreeMap<Vec<u8>, FileRecord> = BTreeMap::new();
     let mut hash_index: HashMap<[u8; 32], BlockEntry> = HashMap::new();
     for member in &mut members {
-        let bytes = member.stream_bytes(StreamId::Manifest)?;
-        for record in read_manifest(&bytes)? {
-            final_entries.insert(record.entry.path.clone(), record);
+        if member.seq_in_chain == newest {
+            let bytes = member.stream_bytes(StreamId::Manifest)?;
+            for record in read_manifest(&bytes)? {
+                final_entries.insert(record.entry.path.clone(), record);
+            }
         }
         let bytes = member.stream_bytes(StreamId::HashIndex)?;
         let mut cursor = Cursor::new(bytes.as_slice());

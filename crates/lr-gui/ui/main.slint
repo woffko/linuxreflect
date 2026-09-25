@@ -42,6 +42,8 @@ export component MainWindow inherits Window {
     in-out property <string> passphrase-file: "";
     in-out property <string> plan: "(no plan yet)";
     in-out property <string> image: "";
+    // What the chosen image is, in words (set, kind, date), when known.
+    in-out property <string> image-detail: "";
     in-out property <string> target: "";
     in-out property <string> restore-passphrase-file: "";
     in-out property <string> restore-plan: "(no plan yet)";
@@ -546,6 +548,7 @@ export component MainWindow inherits Window {
                                         spacing: 10px;
                                         Banner {
                                             text: root.image == "" ? "No backup chosen. Pick one from your backups or open an image file."
+                                                : root.image-detail != "" ? root.image-detail + "\n" + root.image
                                                 : "Backup: " + root.image;
                                         }
                                         HorizontalLayout {

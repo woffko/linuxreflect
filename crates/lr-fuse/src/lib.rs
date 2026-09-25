@@ -121,14 +121,23 @@ impl ImageView {
             .collect::<Result<Vec<_>>>()?;
         let mut members =
             lr_engine::chain::open_chain(&*destination, &set, &files, &request.encryption)?;
+        // The newest member's manifest is the whole tree at its backup time;
+        // older members only store chunks it references (D-108).
+        let newest = members
+            .iter()
+            .map(|member| member.seq_in_chain)
+            .max()
+            .unwrap_or_default();
         let mut records: BTreeMap<Vec<u8>, (FileEntry, Vec<[u8; 32]>)> = BTreeMap::new();
         let mut hash_index = HashMap::new();
         for member in &mut members {
-            for record in read_records(member)? {
-                records.insert(
-                    record.entry.path.clone(),
-                    (record.entry.clone(), record.entry.chunk_refs_here.clone()),
-                );
+            if member.seq_in_chain == newest {
+                for record in read_records(member)? {
+                    records.insert(
+                        record.entry.path.clone(),
+                        (record.entry.clone(), record.entry.chunk_refs_here.clone()),
+                    );
+                }
             }
             let bytes = member.stream_bytes(StreamId::HashIndex)?;
             let mut cursor = std::io::Cursor::new(bytes.as_slice());

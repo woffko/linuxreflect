@@ -372,6 +372,17 @@ Evidence on this tree:
   Expected-failure script steps now record a confirmed status, so a script
   that ends on an expected failure is not reported as failed.
 - `cargo xtask ci`: exit 0, 483 passed, 0 failed, 56 ignored.
+- Root, `a_backup_chain_made_and_restored_through_the_gui_on_x11` (2.94 s):
+  full, incremental and differential file backups made through the GUI with
+  source changes in between (a file changed, one added, one deleted); the
+  library lists the newest first (ties within a second are ordered by chain
+  position) and restoring it rebuilds the latest state. This test found a
+  real engine bug, D-108: file-mode restores and the FUSE view merged every
+  member's manifest, resurrecting deleted files. Fixed; the new engine test
+  `a_file_deleted_before_a_later_member_stays_deleted` (incremental and
+  differential) and FUSE test `a_mounted_incremental_does_not_show_deleted_files`
+  both fail without the fix and pass with it. `cargo xtask ci`: exit 0,
+  485 passed, 0 failed, 57 ignored.
 
 Not yet covered: the native file dialogs on the new layout (no portal is
 running in this environment) and a GNOME session.

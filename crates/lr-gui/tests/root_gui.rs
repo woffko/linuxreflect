@@ -831,3 +831,122 @@ fn find_image(dir: &Path) -> Option<PathBuf> {
     }
     None
 }
+
+/// Wait for a marker file the GUI script creates with `signal`.
+fn wait_for_marker(path: &Path, started: Instant, what: &str) {
+    while !path.exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(180),
+            "the GUI never {what}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Full, incremental and differential backups made through the GUI appear
+/// in the library newest first, and restoring the newest one rebuilds the
+/// latest state of the source, including a deletion.
+#[test]
+#[ignore = "needs root and Xvfb; a full/incremental/differential chain through the GUI"]
+fn a_backup_chain_made_and_restored_through_the_gui_on_x11() {
+    if !root_tests_enabled() {
+        return;
+    }
+    assert!(have("Xvfb"), "Xvfb is required");
+    let dir = private_test_dir();
+    let Some(daemon) = Daemon::start(dir.path()) else {
+        panic!("the daemon binary is not built next to the GUI");
+    };
+    let source = dir.path().join("source");
+    write_tree(&source, "v1\n");
+    let restore = dir.path().join("restore");
+    std::fs::create_dir(&restore).expect("restore dir");
+    let full_done = dir.path().join("full-done");
+    let first_change = dir.path().join("first-change");
+    let incremental_done = dir.path().join("incremental-done");
+    let second_change = dir.path().join("second-change");
+    let script = dir.path().join("chain-script.txt");
+    std::fs::write(
+        &script,
+        format!(
+            "source {source}\n\
+             dest {backups}\n\
+             set gui-chain\n\
+             mode file\n\
+             type full\n\
+             probe\n\
+             backup\n\
+             signal {full_done}\n\
+             wait-for-file {first_change}\n\
+             type incremental\n\
+             probe\n\
+             backup\n\
+             signal {incremental_done}\n\
+             wait-for-file {second_change}\n\
+             type differential\n\
+             probe\n\
+             backup\n\
+             history\n\
+             pick 0\n\
+             target {restore}\n\
+             prepare\n\
+             restore\n\
+             expect-contains {restore}/hello.txt v3\n\
+             expect-file {restore}/added.txt\n\
+             quit\n",
+            source = source.display(),
+            backups = dir.path().join("backups").display(),
+            full_done = full_done.display(),
+            first_change = first_change.display(),
+            incremental_done = incremental_done.display(),
+            second_change = second_change.display(),
+            restore = restore.display(),
+        ),
+    )
+    .expect("script");
+    let mut reaper = Reaper(Vec::new());
+    let display = start_xvfb(&mut reaper);
+    let gui = Command::new(GUI)
+        .env("DISPLAY", &display)
+        .env_remove("WAYLAND_DISPLAY")
+        .env("SLINT_BACKEND", "winit-software")
+        .arg("--socket")
+        .arg(&daemon.socket)
+        .arg("--script")
+        .arg(&script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("GUI run");
+
+    let started = Instant::now();
+    wait_for_marker(&full_done, started, "finished the full backup");
+    std::fs::write(source.join("hello.txt"), "v2\n").expect("change 1");
+    std::fs::write(source.join("added.txt"), "added after the full backup\n").expect("add");
+    std::fs::write(&first_change, b"").expect("signal change 1");
+    wait_for_marker(
+        &incremental_done,
+        started,
+        "finished the incremental backup",
+    );
+    std::fs::write(source.join("hello.txt"), "v3\n").expect("change 2");
+    std::fs::remove_file(source.join("nested/data.bin")).expect("delete");
+    std::fs::write(&second_change, b"").expect("signal change 2");
+
+    let output = gui.wait_with_output().expect("GUI exit");
+    let log = text(&output);
+    assert!(output.status.success(), "{log}");
+    assert!(log.contains("picked: "), "{log}");
+    assert_eq!(
+        std::fs::read_to_string(restore.join("hello.txt")).expect("restored"),
+        "v3\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(restore.join("added.txt")).expect("restored"),
+        "added after the full backup\n"
+    );
+    assert!(
+        !restore.join("nested/data.bin").exists(),
+        "a file deleted before the newest backup must not come back"
+    );
+}

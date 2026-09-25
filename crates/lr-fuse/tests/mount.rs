@@ -163,3 +163,67 @@ fn a_mounted_image_hashes_like_the_source() {
     }
     eprintln!("warning: the mountpoint is still busy after the session was dropped");
 }
+
+/// The view of an incremental shows the tree at that backup: a file deleted
+/// before it is absent, a file added before it is present (D-108).
+#[test]
+fn a_mounted_incremental_does_not_show_deleted_files() {
+    if !fuse_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = dir.path().join("source");
+    let dest = dir.path().join("backups");
+    let mountpoint = dir.path().join("mnt");
+    std::fs::create_dir_all(&source).expect("source");
+    std::fs::create_dir_all(&mountpoint).expect("mountpoint");
+    build_tree(&source);
+    backup_file(
+        &BackupRequest::new(&source, &dest, "fuse-chain", Encryption::NoEncrypt).expect("request"),
+        &FileBackupOptions::default(),
+    )
+    .expect("full");
+    std::fs::remove_file(source.join("etc/hostname")).expect("delete");
+    std::fs::write(source.join("etc/added"), b"added\n").expect("add");
+    let mut incremental =
+        BackupRequest::new(&source, &dest, "fuse-chain", Encryption::NoEncrypt).expect("request");
+    incremental.member_type = lr_engine::backup::MemberType::Incremental;
+    incremental.parent = Some("latest".to_owned());
+    let report = backup_file(&incremental, &FileBackupOptions::default()).expect("incremental");
+
+    let plan = prepare_restore(&PrepareRequest::from_path(
+        &report.image_path,
+        &mountpoint,
+        Encryption::NoEncrypt,
+    ))
+    .expect("prepare");
+    assert_eq!(plan.members.len(), 2);
+    let session = spawn(&FuseRequest {
+        dest: plan.dest.clone(),
+        set: plan.set.clone(),
+        images: plan.members.clone(),
+        destination_options: lr_store::DestinationOptions {
+            set_name: plan.set.clone(),
+            identity: None,
+            known_hosts: None,
+            insecure_ignore_host_key: false,
+        },
+        encryption: Encryption::NoEncrypt,
+        mountpoint: mountpoint.clone(),
+    })
+    .expect("mount");
+    assert!(
+        !mountpoint.join("etc/hostname").exists(),
+        "a file deleted before the incremental is still visible"
+    );
+    assert_eq!(
+        std::fs::read(mountpoint.join("etc/added")).expect("added file"),
+        b"added\n"
+    );
+    assert_eq!(
+        checksum(&mountpoint.join("etc/nested/big.bin")),
+        checksum(&source.join("etc/nested/big.bin")),
+        "an unchanged file inherited from the full reads correctly"
+    );
+    drop(session);
+}

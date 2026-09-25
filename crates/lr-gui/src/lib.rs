@@ -262,7 +262,7 @@ impl Actions {
                                 .and_then(serde_json::Value::as_u64)
                                 .unwrap_or(0);
                             members.push((
-                                unix,
+                                (unix, seq),
                                 HistoryRow {
                                     name: format!(
                                         "{} · Copy {}",
@@ -278,6 +278,8 @@ impl Actions {
                             ));
                         }
                     }
+                    // Newest first; copies made within the same second are
+                    // ordered by their position in the chain.
                     members.sort_by_key(|member| std::cmp::Reverse(member.0));
                     for (index, (_, mut row)) in members.into_iter().enumerate() {
                         row.first = index == 0;
@@ -964,6 +966,7 @@ impl ActionsHandle {
                     ui.set_last_image(image.clone().into());
                     ui.invoke_restore_inputs_changed();
                     ui.set_image(image.into());
+                    ui.set_image_detail("The backup made in this window".into());
                 }
                 // Admission stays closed until the old identity and UI state
                 // have been cleared together on the event-loop thread.
@@ -1501,6 +1504,7 @@ fn connect_callbacks(ui: &MainWindow, actions: &Arc<Actions>) {
             pick_path(weak, Pick::Image, "Choose a backup image", |ui, path| {
                 ui.invoke_restore_inputs_changed();
                 ui.set_image(path.clone().into());
+                ui.set_image_detail("".into());
                 ui.set_status(format!("image: {path}").into());
             });
         });
@@ -1572,16 +1576,16 @@ fn connect_callbacks(ui: &MainWindow, actions: &Arc<Actions>) {
             let Some(strong) = ui.upgrade() else {
                 return;
             };
-            let path = strong
-                .get_history()
-                .row_data(idx.max(0) as usize)
-                .map(|row| row.path.to_string());
-            if let Some(path) = path {
+            let row = strong.get_history().row_data(idx.max(0) as usize);
+            if let Some(row) = row {
+                let path = row.path.to_string();
                 if path.is_empty() {
                     return;
                 }
+                let created = row.detail.lines().next().unwrap_or_default().to_owned();
                 strong.invoke_restore_inputs_changed();
                 strong.set_image(path.clone().into());
+                strong.set_image_detail(format!("{} · {} · {created}", row.group, row.name).into());
                 strong.set_restore_step(0);
                 strong.set_current_tab(2);
                 strong.set_status(format!("image from history: {path}").into());
@@ -1617,6 +1621,7 @@ fn connect_callbacks(ui: &MainWindow, actions: &Arc<Actions>) {
             } else {
                 strong.invoke_restore_inputs_changed();
                 strong.set_image(last.clone().into());
+                strong.set_image_detail("The backup made in this window".into());
                 strong.set_restore_step(0);
                 strong.set_current_tab(2);
                 strong.set_status(format!("image: {last}").into());
@@ -1768,6 +1773,7 @@ fn run_script(weak: &slint::Weak<MainWindow>, steps: &[Step]) -> Result<ScriptOu
                 set(weak, move |ui| {
                     ui.invoke_restore_inputs_changed();
                     ui.set_image(value.into());
+                    ui.set_image_detail("".into());
                 })?
             }
             Step::Target(value) => {
@@ -1818,6 +1824,7 @@ fn run_script(weak: &slint::Weak<MainWindow>, steps: &[Step]) -> Result<ScriptOu
                 set(weak, move |ui| {
                     ui.invoke_restore_inputs_changed();
                     ui.set_image(image_for_ui.into());
+                    ui.set_image_detail("".into());
                 })?;
                 log.push(format!("image: {image}"));
             }
@@ -1877,6 +1884,19 @@ fn run_script(weak: &slint::Weak<MainWindow>, steps: &[Step]) -> Result<ScriptOu
                 set(weak, |ui| {
                     ui.set_status("expected restore failure confirmed".into())
                 })?;
+            }
+            Step::MemberType(value) => {
+                let value = value.clone();
+                set(weak, move |ui| ui.set_member_type(value.into()))?;
+            }
+            Step::Pick(index) => {
+                let index = i32::try_from(*index).map_err(|error| error.to_string())?;
+                invoke(weak, move |ui| ui.invoke_history_selected(index))?;
+                let image = read(weak, |ui| ui.get_image().to_string())?;
+                if image.is_empty() {
+                    return Err(format!("library row {index} chose no image"));
+                }
+                log.push(format!("picked: {image}"));
             }
             Step::Verify(index) => {
                 let index = i32::try_from(*index).map_err(|error| error.to_string())?;

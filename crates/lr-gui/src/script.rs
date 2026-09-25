@@ -51,6 +51,10 @@ pub enum Step {
     /// Require the restore to be refused with the expected diagnostic and the
     /// job released for a new review.
     ExpectRestoreFailure(String),
+    /// Set the backup type (`full`, `incremental` or `differential`).
+    MemberType(String),
+    /// Choose the library row with this index for restore ("Restore…").
+    Pick(usize),
     /// Verify the library row with this index ("Verify" in the library).
     Verify(usize),
     /// Require verifying the library row to fail with the expected text.
@@ -116,6 +120,8 @@ pub fn parse(text: &str) -> Result<Vec<Step>, Error> {
             "expect-prepare-failure" => Step::ExpectPrepareFailure(need(argument)?),
             "restore" => Step::Restore,
             "expect-restore-failure" => Step::ExpectRestoreFailure(need(argument)?),
+            "type" => Step::MemberType(need(argument)?),
+            "pick" => Step::Pick(parse_index(&need(argument)?, number)?),
             "verify" => Step::Verify(parse_index(&need(argument)?, number)?),
             "expect-verify-failure" => {
                 let mut parts = argument.splitn(2, char::is_whitespace);

@@ -396,3 +396,52 @@ fn a_non_empty_target_needs_merge() {
     assert!(target.join("file").exists());
     assert!(target.join("existing").exists(), "merge keeps extra files");
 }
+
+/// Files deleted before an incremental or a differential stay deleted when
+/// that member is restored: every member's manifest is the whole tree, and
+/// the restore must not merge in entries of older members (D-108).
+#[test]
+fn a_file_deleted_before_a_later_member_stays_deleted() {
+    if !have("rsync") {
+        eprintln!("rsync missing; skipping");
+        return;
+    }
+    for member_type in [MemberType::Incremental, MemberType::Differential] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source");
+        let dest = dir.path().join("backups");
+        let target = dir.path().join("restored");
+        std::fs::create_dir_all(&target).expect("target");
+        build_tree(&source);
+        backup_file(
+            &request(&source, &dest, "deletions"),
+            &FileBackupOptions::default(),
+        )
+        .expect("full");
+
+        std::fs::remove_file(source.join("var/lib/data.bin")).expect("delete a file");
+        std::fs::write(source.join("etc/after.txt"), b"after\n").expect("add a file");
+        let mut later = request(&source, &dest, "deletions");
+        later.member_type = member_type;
+        later.parent = Some("latest".to_owned());
+        let report = backup_file(&later, &FileBackupOptions::default()).expect("later member");
+
+        let plan = prepare_restore(&PrepareRequest::from_path(
+            &report.image_path,
+            &target,
+            Encryption::NoEncrypt,
+        ))
+        .expect("prepare");
+        restore(&plan);
+        assert!(
+            !target.join("var/lib/data.bin").exists(),
+            "{member_type:?}: a deleted file came back"
+        );
+        assert!(target.join("etc/after.txt").exists(), "{member_type:?}");
+        let difference = rsync_difference(&source, &target);
+        assert!(
+            difference.is_empty(),
+            "{member_type:?}: rsync reports differences:\n{difference}"
+        );
+    }
+}

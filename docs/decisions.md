@@ -1196,3 +1196,16 @@ stopping is now safe, the installer requests it with `systemctl --no-block
 stop` when the daemon is active: the old process finishes its jobs and exits,
 the socket unit keeps the listening socket, and the next request starts the
 new binary. This replaces "activation is pending until a maintenance window".
+
+## D-108 — A file-mode restore uses the newest member's tree
+
+Every file-mode member's manifest lists the whole tree at its backup time;
+unchanged files only point at chunks an ancestor stored. The restore and the
+FUSE view used to merge the manifests of every chain member ("a later member
+replaces an earlier entry per path"), so a file deleted before an incremental
+or differential came back when that member was restored or mounted. Both now
+take the tree from the member with the highest `seq_in_chain` and use the
+older members only for their hash indices. Found by a GUI chain test (full,
+incremental, differential with a deletion); the engine and FUSE regressions
+fail without the change. The existing tests missed it because none deleted a
+file between members.
