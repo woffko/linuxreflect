@@ -48,6 +48,13 @@ pub enum Step {
     ExpectPrepareFailure(String),
     /// Invoke "Start restore".
     Restore,
+    /// Require the restore to be refused with the expected diagnostic and the
+    /// job released for a new review.
+    ExpectRestoreFailure(String),
+    /// Create a marker file so a test can act at this point of the script.
+    Signal(PathBuf),
+    /// Wait (at most a minute) until a test creates this marker file.
+    WaitForFile(PathBuf),
     /// Assert a file exists (test convenience).
     ExpectFile(PathBuf),
     /// Assert a destination directory has not received any entries.
@@ -104,6 +111,9 @@ pub fn parse(text: &str) -> Result<Vec<Step>, Error> {
             "prepare" => Step::Prepare,
             "expect-prepare-failure" => Step::ExpectPrepareFailure(need(argument)?),
             "restore" => Step::Restore,
+            "expect-restore-failure" => Step::ExpectRestoreFailure(need(argument)?),
+            "signal" => Step::Signal(PathBuf::from(need(argument)?)),
+            "wait-for-file" => Step::WaitForFile(PathBuf::from(need(argument)?)),
             "expect-file" => Step::ExpectFile(PathBuf::from(need(argument)?)),
             "expect-empty-directory" => Step::ExpectEmptyDirectory(PathBuf::from(need(argument)?)),
             "expect-contains" => {

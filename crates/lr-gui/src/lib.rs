@@ -1803,6 +1803,36 @@ fn run_script(weak: &slint::Weak<MainWindow>, steps: &[Step]) -> Result<ScriptOu
                 wait_for_idle(weak, Duration::from_secs(300))?;
                 log.push("restore finished".to_owned());
             }
+            Step::ExpectRestoreFailure(expected) => {
+                invoke(weak, |ui| {
+                    ui.set_restore_confirmed(true);
+                    ui.invoke_start_restore();
+                })?;
+                let error = wait_for_idle(weak, Duration::from_secs(300))
+                    .err()
+                    .ok_or_else(|| "restore unexpectedly succeeded".to_owned())?;
+                if !error.contains(expected) {
+                    return Err(format!("unexpected restore failure: {error}"));
+                }
+                let released = read(weak, |ui| (!ui.get_busy()).to_string())? == "true";
+                if !released {
+                    return Err("the refused restore left the window busy".to_owned());
+                }
+                log.push(format!("expected restore failure: {expected}"));
+            }
+            Step::Signal(path) => {
+                std::fs::write(path, b"")
+                    .map_err(|error| format!("signal {}: {error}", path.display()))?;
+            }
+            Step::WaitForFile(path) => {
+                let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                while !path.exists() {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(format!("timed out waiting for {}", path.display()));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
             Step::ExpectFile(_) | Step::ExpectContains(..) | Step::ExpectEmptyDirectory(_) => {
                 let message = script::check_expectation(step).map_err(|error| error.to_string())?;
                 if let Some(message) = message {

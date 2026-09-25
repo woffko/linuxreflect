@@ -338,9 +338,18 @@ Evidence on this tree:
   the software renderer; the disks, wizard, library and progress scenes were
   inspected at 1280x720@100, 1280x720@150 and 1024x768@200.
 
+- Root, `block_backup_and_stale_target_refusal_through_the_gui_on_x11`
+  (3.96 s, owned loop devices, detached afterwards): an ext4 partition on a
+  GPT loop disk is imaged through the GUI in block mode; after the restore
+  plan is prepared the test changes the target, the GUI's restore is refused
+  with "target changed" and the target's first MiB is byte-identical before
+  and after the refusal; a fresh review then restores, and the restored
+  device mounts with byte-identical files. All four GUI root tests pass
+  together in 18.5 s. The script gained `signal`, `wait-for-file` and
+  `expect-restore-failure` so a test can act between review and restore.
+
 Not yet covered: physical mouse and keyboard runs on the new layout (the old
-coordinate-based harness invocations no longer apply), a GNOME session, and
-block-device round trips through the GUI on owned loop devices.
+coordinate-based harness invocations no longer apply) and a GNOME session.
 
 ## Acceptance checklist
 

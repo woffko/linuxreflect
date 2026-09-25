@@ -159,6 +159,58 @@ impl Drop for Reaper {
     }
 }
 
+/// Start a private Xvfb (owned by `reaper`) and return its display name.
+fn start_xvfb(reaper: &mut Reaper) -> String {
+    let mut xvfb = Command::new("Xvfb")
+        .args([
+            "-displayfd",
+            "1",
+            "-screen",
+            "0",
+            "1024x768x24",
+            "-nolisten",
+            "tcp",
+            "-nolisten",
+            "unix",
+            "-noreset",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("Xvfb");
+    let stdout = xvfb.stdout.take().expect("Xvfb readiness pipe");
+    reaper.push(xvfb);
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        let mut line = String::new();
+        let result = std::io::BufReader::new(stdout)
+            .read_line(&mut line)
+            .map(|_| line);
+        let _ = send.send(result);
+    });
+    let number = receive
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Xvfb readiness timeout")
+        .expect("Xvfb readiness read");
+    let number: u32 = number.trim().parse().expect("Xvfb display number");
+    let display = format!(":{number}");
+    let mut x11_ready = false;
+    for _ in 0..50 {
+        let probe = Command::new("xdotool")
+            .env("DISPLAY", &display)
+            .arg("getdisplaygeometry")
+            .output();
+        if probe.map(|output| output.status.success()).unwrap_or(false) {
+            x11_ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(x11_ready, "Xvfb did not come up on {display}");
+    display
+}
+
 fn write_tree(root: &Path, marker: &str) {
     std::fs::create_dir_all(root.join("nested")).expect("dirs");
     std::fs::write(root.join("hello.txt"), marker).expect("file");
@@ -228,53 +280,7 @@ fn x11_round_trip(encrypted: bool) {
 
     // A private X server so the GUI and xdotool share one display.
     let mut reaper = Reaper(Vec::new());
-    let mut xvfb = Command::new("Xvfb")
-        .args([
-            "-displayfd",
-            "1",
-            "-screen",
-            "0",
-            "1024x768x24",
-            "-nolisten",
-            "tcp",
-            "-nolisten",
-            "unix",
-            "-noreset",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("Xvfb");
-    let stdout = xvfb.stdout.take().expect("Xvfb readiness pipe");
-    reaper.push(xvfb);
-    let (send, receive) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        use std::io::BufRead as _;
-        let mut line = String::new();
-        let result = std::io::BufReader::new(stdout)
-            .read_line(&mut line)
-            .map(|_| line);
-        let _ = send.send(result);
-    });
-    let number = receive
-        .recv_timeout(Duration::from_secs(5))
-        .expect("Xvfb readiness timeout")
-        .expect("Xvfb readiness read");
-    let number: u32 = number.trim().parse().expect("Xvfb display number");
-    let display = format!(":{number}");
-    let mut x11_ready = false;
-    for _ in 0..50 {
-        let probe = Command::new("xdotool")
-            .env("DISPLAY", &display)
-            .arg("getdisplaygeometry")
-            .output();
-        if probe.map(|output| output.status.success()).unwrap_or(false) {
-            x11_ready = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert!(x11_ready, "Xvfb did not come up on {display}");
+    let display = start_xvfb(&mut reaper);
 
     // 1. The window is really mapped on X11.
     let mut smoke = Command::new(GUI)
@@ -488,4 +494,231 @@ fn create_and_restore_through_the_gui_on_wayland() {
         std::fs::read(source.join("nested/data.bin")).expect("source binary file")
     );
     assert!(text(&output).contains("restore ok"), "{}", text(&output));
+}
+
+/// Attach `image` to a free loop device with partition scanning.
+fn attach_loop(image: &Path) -> String {
+    for _ in 0..20 {
+        let output = Command::new("losetup")
+            .args(["-f", "-P", "--show"])
+            .arg(image)
+            .output()
+            .expect("losetup");
+        if output.status.success() {
+            return String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        }
+        // WSL can briefly report no free loop device right after a detach.
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    panic!("no free loop device for {}", image.display());
+}
+
+fn run_ok(program: &str, args: &[&str]) {
+    let output = Command::new(program).args(args).output().expect(program);
+    assert!(
+        output.status.success(),
+        "{program} {args:?}: {}",
+        text(&output)
+    );
+}
+
+/// Detaches the test's own loop devices and unmounts its own mount point.
+struct Loops {
+    devices: Vec<String>,
+    mountpoint: Option<PathBuf>,
+}
+
+impl Drop for Loops {
+    fn drop(&mut self) {
+        if let Some(mountpoint) = &self.mountpoint {
+            let _ = Command::new("umount").arg(mountpoint).status();
+        }
+        for device in &self.devices {
+            let _ = Command::new("losetup").args(["-d", device]).status();
+        }
+    }
+}
+
+/// A partition image made and restored through the GUI on X11, on loop
+/// devices the test owns. After the restore plan is prepared the target is
+/// changed behind the GUI's back: the restore must be refused with
+/// `E_TARGET_CHANGED` without writing, and a fresh review must then succeed.
+#[test]
+#[ignore = "needs root, loop devices, Xvfb and e2fsprogs; block backup/restore through the GUI"]
+fn block_backup_and_stale_target_refusal_through_the_gui_on_x11() {
+    if !root_tests_enabled() {
+        return;
+    }
+    for tool in ["Xvfb", "losetup", "sgdisk", "blockdev", "mkfs.ext4", "mount"] {
+        assert!(have(tool), "{tool} is required");
+    }
+    let dir = private_test_dir();
+    let Some(daemon) = Daemon::start(dir.path()) else {
+        panic!("the daemon binary is not built next to the GUI");
+    };
+    let mut loops = Loops {
+        devices: Vec::new(),
+        mountpoint: None,
+    };
+
+    // Source: a GPT disk with one ext4 partition holding known files.
+    let source_image = dir.path().join("source.img");
+    let target_image = dir.path().join("target.img");
+    for image in [&source_image, &target_image] {
+        std::fs::File::create(image)
+            .and_then(|file| file.set_len(96 * 1024 * 1024))
+            .expect("sparse image");
+    }
+    let source = attach_loop(&source_image);
+    loops.devices.push(source.clone());
+    run_ok(
+        "sgdisk",
+        &["--clear", "-n", "1:2048:+48M", "-t", "1:8300", &source],
+    );
+    run_ok("blockdev", &["--rereadpt", &source]);
+    let partition = format!("{source}p1");
+    for _ in 0..50 {
+        if Path::new(&partition).exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    run_ok("mkfs.ext4", &["-F", "-q", "-L", "GUIBLOCK", &partition]);
+    let mountpoint = dir.path().join("mnt");
+    std::fs::create_dir(&mountpoint).expect("mountpoint");
+    run_ok("mount", &[&partition, &mountpoint.display().to_string()]);
+    loops.mountpoint = Some(mountpoint.clone());
+    write_tree(&mountpoint, "block marker\n");
+    let expected = std::fs::read(mountpoint.join("nested/data.bin")).expect("source data");
+    run_ok("umount", &[&mountpoint.display().to_string()]);
+    loops.mountpoint = None;
+
+    // Target: a blank device of the same size, owned by this test.
+    let target = attach_loop(&target_image);
+    loops.devices.push(target.clone());
+
+    let mut reaper = Reaper(Vec::new());
+    let display = start_xvfb(&mut reaper);
+    let prepared = dir.path().join("prepared");
+    let tampered = dir.path().join("tampered");
+    let refused = dir.path().join("refused");
+    let checked = dir.path().join("checked");
+    let script = dir.path().join("block-script.txt");
+    std::fs::write(
+        &script,
+        format!(
+            "refresh-disks\n\
+             source {partition}\n\
+             dest {backups}\n\
+             set gui-block\n\
+             mode block\n\
+             probe\n\
+             backup\n\
+             image-from-summary\n\
+             target {target}\n\
+             prepare\n\
+             signal {prepared}\n\
+             wait-for-file {tampered}\n\
+             expect-restore-failure target changed\n\
+             signal {refused}\n\
+             wait-for-file {checked}\n\
+             prepare\n\
+             restore\n\
+             print\n\
+             quit\n",
+            backups = dir.path().join("backups").display(),
+            prepared = prepared.display(),
+            tampered = tampered.display(),
+            refused = refused.display(),
+            checked = checked.display(),
+        ),
+    )
+    .expect("script");
+    let gui = Command::new(GUI)
+        .env("DISPLAY", &display)
+        .env_remove("WAYLAND_DISPLAY")
+        .env("SLINT_BACKEND", "winit-software")
+        .arg("--socket")
+        .arg(&daemon.socket)
+        .arg("--script")
+        .arg(&script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("GUI run");
+
+    // Change the reviewed target after the plan exists: a new first MiB.
+    let started = Instant::now();
+    while !prepared.exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "the GUI never prepared the restore"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    {
+        use std::io::{Seek, SeekFrom};
+        let mut device = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .expect("open the test's own target");
+        device.seek(SeekFrom::Start(4096)).expect("seek");
+        device.write_all(b"changed after review").expect("tamper");
+        device.sync_all().expect("sync");
+    }
+    let mut before_refusal = vec![0_u8; 1024 * 1024];
+    std::fs::File::open(&target)
+        .and_then(|mut file| file.read_exact(&mut before_refusal))
+        .expect("read target");
+    std::fs::write(&tampered, b"").expect("signal tampering");
+
+    // The refused restore must not have written anything.
+    while !refused.exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(180),
+            "the GUI never attempted the stale restore"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut after_refusal = vec![0_u8; 1024 * 1024];
+    std::fs::File::open(&target)
+        .and_then(|mut file| file.read_exact(&mut after_refusal))
+        .expect("read target");
+    assert!(
+        after_refusal == before_refusal,
+        "a refused restore wrote to the target"
+    );
+    std::fs::write(&checked, b"").expect("signal the check");
+
+    let output = gui.wait_with_output().expect("GUI exit");
+    let log = text(&output);
+    assert!(output.status.success(), "{log}");
+    assert!(
+        log.contains("expected restore failure: target changed"),
+        "{log}"
+    );
+    assert!(
+        log.contains("restore ok") || log.contains("restore finished"),
+        "{log}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(300),
+        "the block run took {:?}",
+        started.elapsed()
+    );
+
+    // The restored device carries the source filesystem and its files.
+    run_ok(
+        "mount",
+        &["-o", "ro", &target, &mountpoint.display().to_string()],
+    );
+    loops.mountpoint = Some(mountpoint.clone());
+    assert_eq!(
+        std::fs::read_to_string(mountpoint.join("hello.txt")).expect("restored file"),
+        "block marker\n"
+    );
+    assert_eq!(
+        std::fs::read(mountpoint.join("nested/data.bin")).expect("restored data"),
+        expected
+    );
 }
