@@ -104,7 +104,12 @@ impl Actions {
                             ui.set_disks(slint::ModelRc::new(slint::VecModel::from(rows)));
                             ui.set_selected_disk(-1);
                             ui.set_status(
-                                format!("{disk_count} disks, {partitions} partitions").into(),
+                                format!(
+                                    "{} · {}",
+                                    count_of(disk_count, "disk"),
+                                    count_of(partitions, "partition")
+                                )
+                                .into(),
                             );
                             ui.set_disk_error(false);
                             ui.set_disk_status(if disk_count == 0 {
@@ -992,4 +997,13 @@ pub(crate) fn image_of_summary(summary: &str) -> Option<String> {
         .or_else(|| value.get("image_uri"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
+}
+
+/// "1 disk", "2 disks".
+pub(crate) fn count_of(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
 }
