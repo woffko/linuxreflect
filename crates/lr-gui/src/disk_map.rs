@@ -91,7 +91,13 @@ pub(crate) fn from_layout(
         return panel;
     }
     let mut placed: Vec<Placed> = Vec::new();
-    for partition in &layout.partitions {
+    // An MBR extended partition only contains the logical ones; drawn as a
+    // tile of its own it would sit beside the partitions inside it.
+    for partition in layout
+        .partitions
+        .iter()
+        .filter(|partition| !partition.mbr_type.is_some_and(is_extended_container))
+    {
         let Some((start, extent)) = geometry::relative_extent(
             partition.start_lba,
             facts.logical_block_size,
@@ -213,6 +219,11 @@ pub(crate) fn from_list(
         note: note.to_owned(),
         segments: arrange(placed, disk.size_bytes),
     }
+}
+
+/// MBR partition types of extended partitions (CHS, LBA and Linux).
+fn is_extended_container(mbr_type: u8) -> bool {
+    matches!(mbr_type, 0x05 | 0x0f | 0x85)
 }
 
 fn disk_title(number: usize, disk: &Device, model: Option<&str>) -> String {
@@ -385,6 +396,52 @@ mod tests {
                 .starts_with("System disk")
         );
         assert!(!from_list(2, 2, &rows, "").subtitle.contains("System disk"));
+    }
+
+    /// The layout of an Ubuntu VM installed on MBR: an ESP, an extended
+    /// partition and a logical root inside it (identifiers neutralised).
+    #[test]
+    fn an_mbr_disk_shows_logical_partitions_inside_their_container() {
+        let layout: SourceLayout =
+            serde_json::from_str(include_str!("../tests/fixtures/mbr-extended-sda.json"))
+                .expect("fixture");
+        let mut disk = device("sda", layout.device_facts.size_bytes, None, None);
+        disk.path = "/dev/sda".into();
+        let mut esp = device("sda1", 536_870_912, Some(1), Some("sda"));
+        esp.mountpoints.push("/boot/efi".into());
+        let extended = device("sda2", 1024, Some(2), Some("sda"));
+        let mut root = device("sda5", 129_696_268_288, Some(5), Some("sda"));
+        root.mountpoints.push("/".into());
+        let rows = [&disk, &esp, &extended, &root];
+        let panel = from_layout(1, 0, &rows, &layout);
+        let titles: Vec<_> = panel.segments.iter().map(|s| s.title.as_str()).collect();
+        assert!(
+            !panel.segments.iter().any(|s| s.row == Some(2)),
+            "the extended container is not a tile: {titles:?}"
+        );
+        assert_eq!(
+            panel.segments.iter().filter(|s| s.row == Some(3)).count(),
+            1
+        );
+        assert!(
+            panel.subtitle.starts_with("System disk"),
+            "{}",
+            panel.subtitle
+        );
+        assert!((sum(&panel.segments) - 1.0).abs() < 1e-5);
+        // The tiles never overlap: each starts where the previous one ends.
+        for pair in panel.segments.windows(2) {
+            assert!((pair[0].start + pair[0].extent - pair[1].start).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn extended_containers_are_not_tiles() {
+        assert!(is_extended_container(0x05));
+        assert!(is_extended_container(0x0f));
+        assert!(is_extended_container(0x85));
+        assert!(!is_extended_container(0x83));
+        assert!(!is_extended_container(0x0b));
     }
 
     #[test]

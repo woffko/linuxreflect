@@ -1,0 +1,89 @@
+{
+ "btrfs": null,
+ "device": "/dev/sda",
+ "device_facts": {
+  "dev_id": "8:0",
+  "dev_type": "disk",
+  "logical_block_size": 512,
+  "model": "VMware Virtual S",
+  "name": "sda",
+  "path": "/dev/sda",
+  "physical_block_size": 512,
+  "read_only": false,
+  "removable": false,
+  "serial": null,
+  "size_bytes": 174733918208,
+  "wwid": null
+ },
+ "fs": null,
+ "holders": [],
+ "lvm": null,
+ "mountpoints": [],
+ "partition_table": {
+  "disk_guid": null,
+  "entry_count": 4,
+  "first_usable_lba": null,
+  "has_mbr_signature": true,
+  "kind": "mbr",
+  "last_usable_lba": null,
+  "logical_block_size": 512
+ },
+ "partitions": [
+  {
+   "bootable": true,
+   "fs_label": null,
+   "fs_type": "vfat",
+   "fs_uuid": "00000000-0000-0000-0000-000000000000",
+   "holders": [],
+   "index": 1,
+   "mbr_type": 11,
+   "mountpoints": [
+    "/boot/efi"
+   ],
+   "name": "sda1",
+   "part_uuid": null,
+   "path": "/dev/sda1",
+   "size_bytes": 536870912,
+   "start_lba": 2048,
+   "type_guid": null,
+   "type_name": "FAT32"
+  },
+  {
+   "bootable": false,
+   "fs_label": null,
+   "fs_type": null,
+   "fs_uuid": null,
+   "holders": [],
+   "index": 2,
+   "mbr_type": 5,
+   "mountpoints": [],
+   "name": "sda2",
+   "part_uuid": null,
+   "path": "/dev/sda2",
+   "size_bytes": 161238483968,
+   "start_lba": 1052670,
+   "type_guid": null,
+   "type_name": "Extended"
+  },
+  {
+   "bootable": false,
+   "fs_label": null,
+   "fs_type": "ext4",
+   "fs_uuid": "00000000-0000-0000-0000-000000000002",
+   "holders": [],
+   "index": 5,
+   "mbr_type": 131,
+   "mountpoints": [
+    "/"
+   ],
+   "name": "sda5",
+   "part_uuid": null,
+   "path": "/dev/sda5",
+   "size_bytes": 129696268288,
+   "start_lba": 1052672,
+   "type_guid": null,
+   "type_name": "Linux"
+  }
+ ],
+ "warnings": []
+}
