@@ -401,7 +401,16 @@ fn flakey_over(backing: &Path, sectors: u64) -> Option<String> {
         eprintln!("dm-flakey is unavailable: {}", text(&output));
         return None;
     }
-    Some(format!("/dev/mapper/{name}"))
+    // Without udev (a container) nothing creates the node; ask dmsetup to.
+    let node = format!("/dev/mapper/{name}");
+    for _ in 0..20 {
+        if Path::new(&node).exists() {
+            break;
+        }
+        let _ = run("dmsetup", &["mknodes", &name]);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Some(node)
 }
 
 #[test]

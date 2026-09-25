@@ -353,13 +353,16 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("dir");
         let target = dir.join("target");
         std::fs::write(&target, b"secret").expect("write");
+        // An explicit mode: what `write` creates depends on the umask.
+        std::fs::set_permissions(&target, std::os::unix::fs::PermissionsExt::from_mode(0o640))
+            .expect("chmod");
         let link = dir.join("link");
         std::os::unix::fs::symlink(&target, &link).expect("symlink");
 
         let direct = super::open_readonly_nofollow(&target).expect("open regular file");
         assert!(super::fd_is_regular_file(&direct).expect("fstat"));
         let mode = super::fd_mode(&direct).expect("fstat") & 0o777;
-        assert!(mode == 0o644 || mode == 0o600, "unexpected mode {mode:o}");
+        assert_eq!(mode, 0o640, "unexpected mode {mode:o}");
 
         let error = super::open_readonly_nofollow(&link).expect_err("symlink must be refused");
         assert_eq!(error.raw_os_error(), Some(libc::ELOOP));

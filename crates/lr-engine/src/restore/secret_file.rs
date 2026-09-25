@@ -127,12 +127,22 @@ pub(super) fn load(path: &Path) -> Result<[u8; 32]> {
 
 #[cfg(test)]
 mod tests {
+    /// A 0700 directory whatever the umask: under umask 002 a plain temporary
+    /// directory is group-writable, which the loader rightly refuses.
+    fn private_dir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap()
+    }
+
     use super::*;
     use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
 
     #[test]
     fn preserves_socket_directory_and_existing_key() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
         let socket =
             std::os::unix::net::UnixListener::bind(dir.path().join("daemon.sock")).unwrap();
@@ -147,7 +157,7 @@ mod tests {
 
     #[test]
     fn concurrent_creators_share_one_complete_key() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let path = dir.path().join("token.key");
         let barrier = std::sync::Barrier::new(12);
         std::thread::scope(|scope| {
@@ -170,7 +180,7 @@ mod tests {
 
     #[test]
     fn rejects_symlinks_and_does_not_touch_probe() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let original = dir.path().join("original");
         load(&original).unwrap();
         let before = std::fs::read(&original).unwrap();
@@ -186,7 +196,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_modes_sizes_and_directory_without_replacing_them() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let path = dir.path().join("token.key");
         load(&path).unwrap();
         for mode in [0o644, 0o660, 0o400] {
@@ -207,7 +217,7 @@ mod tests {
 
     #[test]
     fn rejects_writable_parent_without_chmod() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o770)).unwrap();
         assert!(load(&dir.path().join("token.key")).is_err());
         assert_eq!(dir.path().metadata().unwrap().mode() & 0o777, 0o770);
@@ -216,7 +226,7 @@ mod tests {
 
     #[test]
     fn rejects_fifo_without_waiting_for_a_writer() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let path = dir.path().join("token.key");
         assert!(
             std::process::Command::new("mkfifo")
@@ -231,8 +241,11 @@ mod tests {
 
     #[test]
     fn owned_sticky_ancestor_is_safe_but_plain_writable_ancestor_is_not() {
-        let ancestor = tempfile::tempdir().unwrap();
-        let private = tempfile::tempdir_in(ancestor.path()).unwrap();
+        let ancestor = private_dir();
+        let private = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(ancestor.path())
+            .unwrap();
         std::fs::set_permissions(ancestor.path(), std::fs::Permissions::from_mode(0o1777)).unwrap();
         let path = private.path().join("token.key");
         load(&path).unwrap();

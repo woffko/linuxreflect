@@ -384,8 +384,63 @@ Evidence on this tree:
   both fail without the fix and pass with it. `cargo xtask ci`: exit 0,
   485 passed, 0 failed, 57 ignored.
 
-Not yet covered: the native file dialogs on the new layout (no portal is
-running in this environment) and a GNOME session.
+- Native folder dialog on the new layout: `xdg-desktop-portal` 1.18.4 and
+  `xdg-desktop-portal-gtk` 1.15.1 unpacked from the Ubuntu archive into the
+  scratchpad (nothing installed on the host), a private session bus from
+  `dbus-run-session`, Xvfb 1280x720 and a dev-mode daemon. A real click on
+  "Back up a folder…" opened the GUI's backup wizard and the GTK "Choose a
+  folder to back up" dialog; the folder chosen in that dialog arrived in the
+  GUI ("Selected: …", status "source: …", Next enabled). Without a window
+  manager the dialog had to be resized and moved with `xdotool` to reach its
+  buttons; that is a harness limitation, not GUI behaviour.
+
+Not yet covered: a real GNOME session (blocked on access to the Ubuntu host).
+
+## Accumulated root suites on `47cbd83` (2026-09-25)
+
+Every root test binary of the workspace was rebuilt at `47cbd83` and run as
+root (WSL interop) one at a time with `--ignored --test-threads=1`, together
+with the static musl CLI built from the same tree (static-pie, `--version`
+runs). All 13 binaries passed, 56 tests, no failures:
+
+| binary | tests | time |
+|---|---|---|
+| root_daemon | 3 | 3.5 s |
+| root_export (ext4/xfs over NBD, daemon export) | 3 | 12.5 s |
+| root_file | 3 | 0.6 s |
+| root_gui | 6 | 19.6 s |
+| root_hardening (16 TB, dm-flakey, NFS/SMB, filesystems, boots) | 7 | 946.7 s |
+| root_loop (lr-core, lr-engine) | 6 + 2 | 47.2 s + 1.1 s |
+| root_rescue (media on SeaBIOS/OVMF SB, boot repair, bare metal, layout) | 5 | 371.0 s |
+| root_schedule | 3 | 15.9 s |
+| root_sftp | 2 | 6.2 s |
+| root_snapshot | 10 | 20.5 s |
+| root_stream | 1 | 0.9 s |
+| root_whole_disk | 3 | 51.9 s |
+
+The logs were searched for every early-return message the root tests print
+(`skipping`, `unavailable`, `unproven`, `not available`, `never …`,
+`could not be started`, `did not register`): none occurred. The earlier run
+of `root_export` failed only because the `nbd` module was not loaded after a
+WSL restart; loading it (`modprobe nbd`) is environment preparation.
+
+On GitHub the privileged container job now runs every binary
+(`--no-fail-fast`); `dm_flakey…` failed there because nothing creates
+`/dev/mapper` nodes without udev, so the test now asks `dmsetup mknodes`.
+
+## Portability found on Ubuntu 22.04 (`192.168.189.144`, 2026-09-25)
+
+A fresh clone of `47cbd83` built there (7 min 51 s, as `codex`, no sudo), but
+unprivileged tests failed for reasons in the tests, not the product:
+
+- umask 002 made `tempfile::tempdir()` group-writable, which the token-key
+  loader rightly refuses (D-104); the key-file tests now create 0700
+  directories, and the `lr-unsafe` open test sets the file mode it asserts.
+- `cli_smoke` talked to the daemon installed on that host, whose polkit
+  policy denies an inactive SSH session; the smoke tests now pass an absent
+  socket so they test the in-process CLI they are about.
+
+All unprivileged tests pass locally under both umask 022 and 002.
 
 ## Acceptance checklist
 

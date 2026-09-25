@@ -76,6 +76,11 @@ const SCENES: &[Scene] = &[
             "/media/backup-drive/LinuxReflect/workstation/a-rather-long-folder-name".into(),
         );
         ui.set_backup_set("workstation-root".into());
+        ui.set_recent_destinations(model(vec![
+            "/media/backup-drive/LinuxReflect/workstation/a-rather-long-folder-name".into(),
+            "/media/usb-stick/backups".into(),
+            "sftp://backup@nas.local/srv/backups".into(),
+        ]));
         ui.set_advanced_backup(true);
         ui.set_encrypt(true);
     }),
@@ -242,7 +247,7 @@ fn example_disks(ui: &MainWindow) {
         DiskCard {
             disk_index: 0,
             title: "Disk 1 · Samsung SSD 980 PRO 1TB".into(),
-            subtitle: "953.9 GiB · GPT · /dev/nvme0n1".into(),
+            subtitle: "System disk · 953.9 GiB · GPT · /dev/nvme0n1".into(),
             note: SharedString::new(),
             tiles: model(vec![
                 tile(

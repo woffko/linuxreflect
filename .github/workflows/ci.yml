@@ -92,4 +92,4 @@ jobs:
           LR_ROOT_TESTS: "1"
         run: |
           . "$HOME/.cargo/env"
-          cargo test --workspace -- --ignored --nocapture --test-threads=1
+          cargo test --workspace --no-fail-fast -- --ignored --nocapture --test-threads=1

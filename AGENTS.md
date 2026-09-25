@@ -75,10 +75,24 @@ fixed on the way (D-096, D-097). The final gate is green (437 passed, 0 failed)
 and every accumulated root suite passes with **zero skip markers** on this tree.
 **The objective remains open.**
 Earlier slice completion statements are historical reports, not a substitute for
-a final requirement-to-evidence audit. In particular, S14 still needs an actual
-Wayland desktop notification (only a session-bus mock is verified), and S16
-needs the complete rescue workflow. Final accumulated root-suite results and the
-musl build must be established for the final source tree.
+a final requirement-to-evidence audit (`docs/gui-revision-audit.md`).
+
+Work since the GUI revision started (see the audit and D-105..D-108): the GUI
+is reorganised like Macrium Reflect (navigation sidebar, every disk with a
+clickable partition map, wizards with step lists that pick devices in place,
+a backup library of every set with Restore and Verify, an Activity page and a
+job strip; `docs/gui-redesign.md`); rescue writes need `--confirm` and a
+re-checked target, with per-formatter `mkfs` flags (D-105); `ListSets` without
+a set name lists the sets (D-106); stopping the daemon drains its jobs and the
+installer activates updates through that (D-107); file-mode restores and the
+FUSE view use the newest member's tree, so deleted files no longer come back
+(D-108). `cargo run -p lr-gui --example gallery -- DIR` renders every page at
+1024x768/1280x720/1920x1080 and 100/150/200 % without a display. The GUI code
+is split into `actions`, `models`, `callbacks` and `script_runner`.
+
+Still open: the installed-Ubuntu/GNOME acceptance on `192.168.189.144` (blocked
+until `codex` has passwordless sudo or `w0w` key access; never type or pass the
+password in a command), including a real GNOME notification.
 
 ## Non-negotiable project rules
 

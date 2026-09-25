@@ -2,8 +2,12 @@
 
 use std::process::Command;
 
+/// The CLI in its in-process mode: an absent socket keeps these tests
+/// independent of a daemon installed on the machine running them.
 fn binary() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_linuxreflect"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_linuxreflect"));
+    command.args(["--socket", "/nonexistent/linuxreflect-test.sock"]);
+    command
 }
 
 #[test]

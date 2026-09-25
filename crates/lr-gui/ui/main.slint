@@ -30,6 +30,8 @@ export component MainWindow inherits Window {
     in-out property <string> socket: "";
     in-out property <string> source: "";
     in-out property <string> destination: "";
+    // Backup folders used recently, newest first (remembered per user).
+    in-out property <[string]> recent-destinations: [];
     in-out property <string> backup-set: "default";
     in-out property <string> mode: "auto";
     in-out property <string> member-type: "full";
@@ -354,6 +356,24 @@ export component MainWindow inherits Window {
                                                 min-width: 0px;
                                             }
                                             Button { text: "Choose folder…"; enabled: !root.busy; clicked => { root.pick-destination(); } }
+                                        }
+                                        if root.recent-destinations.length > 0: Text { text: "Recently used"; color: Theme.muted; }
+                                        for recent in root.recent-destinations: HorizontalLayout {
+                                            spacing: 8px;
+                                            Text {
+                                                text: recent;
+                                                color: Theme.text;
+                                                vertical-alignment: center;
+                                                overflow: elide;
+                                                horizontal-stretch: 1;
+                                                min-width: 0px;
+                                            }
+                                            Button {
+                                                text: root.destination == recent ? "In use" : "Use";
+                                                enabled: !root.busy && root.destination != recent;
+                                                accessible-label: "Use the backup folder " + recent;
+                                                clicked => { root.destination = recent; }
+                                            }
                                         }
                                         Text { text: "Backup name"; font-weight: 700; color: Theme.text; }
                                         LineEdit { text <=> root.backup-set; placeholder-text: "A name for this backup, for example laptop-root"; }

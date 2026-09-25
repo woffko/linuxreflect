@@ -125,9 +125,21 @@ linuxreflect-session --socket /run/linuxreflect/daemon.sock
 Progress chatter is silent; only started, finished and failed jobs notify
 (failed ones with `urgency=critical` and the `E_*` code).
 
-A graphical client (Slice S15) drives the same daemon: a disk map, a backup
-wizard that shows the `probe` plan and the achieved consistency before starting,
-a restore wizard that shows the token plan, live progress and the job history.
+A graphical client (Slice S15) drives the same daemon, organised the way
+Macrium Reflect is on Windows:
+
+- **Back up** shows every disk with a clickable partition map (filesystem,
+  label, size, mount points) and "Image this disk…" / "Image selected
+  partition…", plus "Back up a folder…".
+- The **backup wizard** lists its steps (source, destination and options,
+  summary with the `probe` plan and the consistency that will be achieved,
+  progress); the **restore wizard** picks the destination on the same disk
+  maps, dims disks that cannot be written with the reason, and shows the token
+  plan and an explicit overwrite confirmation.
+- **Restore** is a library of every backup set in a folder, newest first, with
+  Restore… and Verify for each copy.
+- **Activity** and a job strip show progress, percentage and Cancel on every
+  page.
 
 ```sh
 linuxreflect-gui --socket /run/linuxreflect/daemon.sock
@@ -136,25 +148,31 @@ linuxreflect-gui --socket /run/linuxreflect/daemon.sock
 The GUI runs on X11 and Wayland (Slint's winit backend with the software
 renderer). It is built with [Slint](https://slint.dev) under the Slint
 Royalty-Free 2.0 licence; the attribution that licence asks for is shown in the
-window's footer and here.
+window's navigation bar and here. `cargo run -p lr-gui --example gallery -- DIR`
+renders every page at several window sizes and scales without a display.
 
 Rescue mode (Slice S16) boot-repairs a restored machine and recreates a disk
 layout for a file-mode restore, and the same crate builds the rescue medium:
 
 ```sh
 # After a whole-disk restore: make the machine bootable again.
-linuxreflect-rescue boot-repair --disk /dev/sda --firmware uefi --esp-partition 1
-linuxreflect-rescue boot-repair --disk /dev/sda --firmware bios --layout-changed
+linuxreflect-rescue boot-repair --confirm --disk /dev/sda --firmware uefi --esp-partition 1
+linuxreflect-rescue boot-repair --confirm --disk /dev/sda --firmware bios --layout-changed
 
 # Rebuild the partition table and filesystems of a file-mode restore.
-linuxreflect-rescue recreate-layout --disk /dev/sda --dump /backups/sda.sfdisk \
-    --filesystem 1:vfat:1234-ABCD:ESP --filesystem 2:ext4:1111-2222:ROOT
+linuxreflect-rescue recreate-layout --confirm --disk /dev/sda --dump /backups/sda.sfdisk \
+    --filesystem 1:vfat:1234-ABCD:ESP \
+    --filesystem 2:ext4:0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0:ROOT
 
 # Build a bootable rescue USB image (SeaBIOS and UEFI Secure Boot).
 contrib/rescue/build-rescue.sh /tmp/rescue.img
 ```
 
-Both operations plan before they act (`--dry-run` prints the exact commands).
+Both operations plan before they act. Without `--confirm` they print the plan
+and exit non-zero without writing; `--dry-run` prints it and succeeds. A layout
+recreation re-checks the disk against the reviewed plan and refuses a disk that
+is mounted or in use. It creates `ext2`/`ext3`/`ext4`, `xfs`, `btrfs`, `vfat`
+and `swap`, keeping their UUIDs (the FAT volume ID for `vfat`); see D-105.
 `contrib/rescue/mkosi.conf` describes the larger distribution medium that adds
 the graphical rescue session (`cage` + the GUI) with the TUI as console
 fallback; see D-093 for which variant this repository verifies.

@@ -67,7 +67,7 @@ pub(crate) fn from_layout(
     let mut panel = Panel {
         row: disk_row,
         title: disk_title(disk_number, disk, facts.model.as_deref()),
-        subtitle: disk_subtitle(disk, facts.size_bytes, table.as_deref()),
+        subtitle: disk_subtitle(disk, rows, facts.size_bytes, table.as_deref()),
         note: String::new(),
         segments: Vec::new(),
     };
@@ -209,7 +209,7 @@ pub(crate) fn from_list(
     Panel {
         row: disk_row,
         title: disk_title(disk_number, disk, None),
-        subtitle: disk_subtitle(disk, disk.size_bytes, None),
+        subtitle: disk_subtitle(disk, rows, disk.size_bytes, None),
         note: note.to_owned(),
         segments: arrange(placed, disk.size_bytes),
     }
@@ -222,8 +222,27 @@ fn disk_title(number: usize, disk: &Device, model: Option<&str>) -> String {
     }
 }
 
-fn disk_subtitle(disk: &Device, size: u64, table: Option<&str>) -> String {
+/// Whether the running system lives on `disk`: it or one of its partitions
+/// is mounted at `/`, `/boot` or `/boot/efi`.
+fn is_system_disk(disk: &Device, rows: &[&Device]) -> bool {
+    let system = |device: &Device| {
+        device
+            .mountpoints
+            .iter()
+            .any(|mount| matches!(mount.as_str(), "/" | "/boot" | "/boot/efi"))
+    };
+    system(disk)
+        || rows
+            .iter()
+            .filter(|device| device.parent.as_deref() == Some(disk.name.as_str()))
+            .any(|device| system(device))
+}
+
+fn disk_subtitle(disk: &Device, rows: &[&Device], size: u64, table: Option<&str>) -> String {
     let mut parts = vec![human_size(size)];
+    if is_system_disk(disk, rows) {
+        parts.insert(0, "System disk".to_owned());
+    }
     parts.push(table.map_or_else(|| "no partition table".to_owned(), |t| t.to_owned()));
     parts.push(disk.path.clone());
     if disk.removable {
@@ -351,6 +370,21 @@ mod tests {
         assert!((sum(&panel.segments) - 1.0).abs() < 1e-5);
         assert_eq!(panel.note, "Details unavailable");
         assert!(panel.title.contains("sda"));
+    }
+
+    #[test]
+    fn the_disk_holding_the_running_system_is_marked() {
+        let system = device("nvme0n1", 1000, None, None);
+        let mut root = device("nvme0n1p2", 500, Some(2), Some("nvme0n1"));
+        root.mountpoints.push("/".to_owned());
+        let data = device("sdb", 1000, None, None);
+        let rows = [&system, &root, &data];
+        assert!(
+            from_list(1, 0, &rows, "")
+                .subtitle
+                .starts_with("System disk")
+        );
+        assert!(!from_list(2, 2, &rows, "").subtitle.contains("System disk"));
     }
 
     #[test]
