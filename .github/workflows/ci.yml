@@ -81,7 +81,9 @@ jobs:
             build-essential ca-certificates curl git protobuf-compiler musl-tools pkg-config libfontconfig-dev \
             util-linux e2fsprogs xfsprogs lvm2 gdisk btrfs-progs dosfstools \
             qemu-system-x86 ovmf \
-            xvfb xauth xdotool weston linux-image-amd64
+            xvfb xauth xdotool weston linux-image-amd64 \
+            libx11-6 libx11-xcb1 libxcursor1 libxrandr2 libxi6 libxkbcommon0 \
+            libxkbcommon-x11-0 libwayland-client0 libfontconfig1 fonts-dejavu-core
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
