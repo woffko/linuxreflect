@@ -3420,6 +3420,7 @@ dependencies = [
  "lr-engine",
  "lr-proto",
  "lr-store",
+ "png",
  "rfd",
  "serde",
  "serde_json",

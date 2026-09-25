@@ -381,6 +381,28 @@ async fn a_backup_runs_over_the_socket_and_reports_progress() {
         .into_inner();
     assert_eq!(sets.chains.len(), 1, "{sets:?}");
 
+    // Without a set name the daemon lists the sets instead, and browsing the
+    // folder creates nothing.
+    let before: Vec<_> = std::fs::read_dir(&dest)
+        .expect("destination")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    let listing = client
+        .list_sets(SetRef {
+            dest: dest.display().to_string(),
+            ..SetRef::default()
+        })
+        .await
+        .expect("list set names")
+        .into_inner();
+    assert_eq!(listing.sets, ["daemon-set"], "{listing:?}");
+    assert!(listing.chains.is_empty());
+    let after: Vec<_> = std::fs::read_dir(&dest)
+        .expect("destination")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    assert_eq!(before.len(), after.len(), "listing must not create a set");
+
     let image_uri = summary_image_uri(&summary);
     let rebuilt = client
         .rebuild_catalog(SetRef {

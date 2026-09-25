@@ -705,6 +705,56 @@ impl Destination for SftpDestination {
         })
     }
 
+    fn list_set_names(&self) -> Result<Vec<String>> {
+        let root = self.config.root.trim_end_matches('/').to_owned();
+        self.run("list sets", |session| {
+            let root = root.clone();
+            Box::pin(async move {
+                let mut names = Vec::new();
+                let entries = session
+                    .read_dir(&root)
+                    .await
+                    .map_err(|error| sftp_error("read_dir", error))?;
+                for entry in entries {
+                    let name = entry.file_name();
+                    if name == "." || name == ".." || !entry.metadata().is_dir() {
+                        continue;
+                    }
+                    // Depth-first until the first image: a set is a
+                    // directory holding at least one `.lrimg`.
+                    let mut queue = vec![format!("{root}/{name}")];
+                    let mut found = false;
+                    while let Some(directory) = queue.pop() {
+                        let children = session
+                            .read_dir(&directory)
+                            .await
+                            .map_err(|error| sftp_error("read_dir", error))?;
+                        for child in children {
+                            let child_name = child.file_name();
+                            if child_name == "." || child_name == ".." {
+                                continue;
+                            }
+                            if child.metadata().is_dir() {
+                                queue.push(format!("{directory}/{child_name}"));
+                            } else if child_name.ends_with(".lrimg") {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if found {
+                            break;
+                        }
+                    }
+                    if found {
+                        names.push(name);
+                    }
+                }
+                names.sort();
+                Ok(names)
+            })
+        })
+    }
+
     fn delete(&self, set: &SetHandle, name: &str) -> Result<()> {
         let _ = set;
         let path = self.path(name);

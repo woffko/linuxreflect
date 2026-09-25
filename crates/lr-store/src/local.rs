@@ -304,6 +304,33 @@ impl Destination for LocalDestination {
         let path = self.resolve(set, name)?;
         std::fs::remove_file(path).map_err(Error::Io)
     }
+
+    fn list_set_names(&self) -> Result<Vec<String>> {
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(Error::Io(e)),
+        };
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(Error::Io)?;
+            // `file_type` does not follow symlinks: a link is never a set.
+            if !entry.file_type().map_err(Error::Io)?.is_dir() {
+                continue;
+            }
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            let mut files = Vec::new();
+            let dir = entry.path();
+            collect_files(&dir, &dir, &mut files)?;
+            if files.iter().any(|file| file.ends_with(".lrimg")) {
+                names.push(name);
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
 }
 
 fn collect_files(root: &Path, at: &Path, found: &mut Vec<String>) -> Result<()> {
@@ -339,6 +366,30 @@ mod tests {
         let destination = LocalDestination::new(dir.path(), "laptop-root");
         let set_id = SetId::new(Id::from_bytes([0x11; 16]));
         (destination, set_id)
+    }
+
+    #[test]
+    fn set_names_are_listed_without_creating_anything() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("laptop/chain-1")).expect("set");
+        std::fs::write(root.join("laptop/chain-1/000-full-a.lrimg"), b"x").expect("image");
+        std::fs::create_dir_all(root.join("empty")).expect("empty set");
+        std::fs::write(root.join("notes.txt"), b"x").expect("file");
+        std::fs::create_dir_all(root.join("server")).expect("set");
+        std::fs::write(root.join("server/000-full-b.lrimg"), b"x").expect("image");
+        let destination = LocalDestination::new(root, "unused");
+        assert_eq!(
+            destination.list_set_names().expect("list"),
+            ["laptop", "server"]
+        );
+        assert!(
+            !root.join("unused").exists(),
+            "listing must not create a set"
+        );
+        let missing = LocalDestination::new(root.join("absent"), "unused");
+        assert!(missing.list_set_names().expect("missing root").is_empty());
+        assert!(!root.join("absent").exists());
     }
 
     #[test]

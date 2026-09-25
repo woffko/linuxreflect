@@ -135,6 +135,22 @@ impl Client {
         serde_json::to_string_pretty(&info).context("serializing the set info")
     }
 
+    /// `ListSets` without a set name: every set at `dest` that holds an image.
+    ///
+    /// # Errors
+    /// Propagates gRPC errors.
+    pub async fn list_set_names(&self, dest: &str) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .service()
+            .list_sets(SetRef {
+                dest: dest.to_owned(),
+                ..SetRef::default()
+            })
+            .await?
+            .into_inner()
+            .sets)
+    }
+
     /// `VerifyImage`, returning the finished summary.
     ///
     /// # Errors

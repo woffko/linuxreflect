@@ -866,6 +866,15 @@ impl DaemonService {
     fn set_info(&self, spec: &SetRef) -> std::result::Result<SetInfo, Status> {
         let options = lr_store::DestinationOptions::new(&spec.set);
         let destination = lr_store::open(&spec.dest, &options).map_err(status::status_of)?;
+        if spec.set.is_empty() {
+            // No set named: list the sets instead of opening (and creating)
+            // an unnamed one.
+            let sets = destination.list_set_names().map_err(status::status_of)?;
+            return Ok(SetInfo {
+                sets,
+                ..SetInfo::default()
+            });
+        }
         let set = destination
             .open_set(&lr_core::SetId::ZERO)
             .map_err(status::status_of)?;
@@ -905,6 +914,7 @@ impl DaemonService {
             set: spec.set.clone(),
             chains,
             warnings: loaded.warnings,
+            sets: Vec::new(),
         })
     }
 }

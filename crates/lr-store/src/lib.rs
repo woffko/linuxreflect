@@ -279,6 +279,14 @@ pub trait Destination: Send + Sync {
     /// Propagates I/O errors.
     fn list(&self, set: &SetHandle) -> Result<Vec<String>>;
 
+    /// Names of the sets under this destination's root that hold at least
+    /// one image (`*.lrimg`), sorted. Unlike [`Destination::open_set`] this
+    /// never creates anything, so browsing a folder leaves it unchanged.
+    ///
+    /// # Errors
+    /// Propagates I/O errors listing the root; a missing root has no sets.
+    fn list_set_names(&self) -> Result<Vec<String>>;
+
     /// Delete one file from the set.
     ///
     /// # Errors

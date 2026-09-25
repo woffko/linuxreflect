@@ -1,0 +1,52 @@
+// Data exchanged with the Rust side. Field names are part of the automation
+// contract (`script.rs`), so rename them only together with it.
+
+export struct DiskRow {
+    name: string,
+    kind: string,
+    size: string,
+    path: string,
+    is-disk: bool,
+    restore-unavailable: string,
+}
+
+// One backup in the library. `group` is its set; `first` marks the first
+// (newest) member of a set, which carries the set heading.
+export struct HistoryRow {
+    name: string,
+    detail: string,
+    path: string,
+    group: string,
+    first: bool,
+}
+
+// One tile of a disk's partition bar. `row` indexes `MainWindow.disks`, or is
+// -1 for unallocated space. `start` and `extent` are fractions of the bar.
+export struct PartitionTile {
+    row: int,
+    path: string,
+    title: string,
+    detail: string,
+    mounts: string,
+    fs: string,
+    unavailable: string,
+    start: float,
+    extent: float,
+}
+
+// One disk panel: the disk's own row, a heading and its partition bar.
+export struct DiskCard {
+    disk-index: int,
+    title: string,
+    subtitle: string,
+    note: string,
+    tiles: [PartitionTile],
+}
+
+export enum JobStage { idle, starting, running, cancelling, disconnected, succeeded, failed, cancelled }
+
+export struct JobPresentation {
+    stage: JobStage,
+    detail: string,
+    report: string,
+}

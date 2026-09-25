@@ -1,0 +1,334 @@
+// Building blocks shared by the pages: navigation, the partition bar, disk
+// panels, the wizard step list and message banners.
+
+import { Button } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { PartitionTile, DiskCard } from "types.slint";
+
+// A focusable, clickable surface: mouse, Return/Space and screen readers all
+// invoke `activated`.
+component Pressable inherits FocusScope {
+    out property <bool> hovered: touch.has-hover;
+    callback activated();
+    accessible-role: button;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.activated(); } }
+    key-pressed(event) => {
+        if (root.enabled && (event.text == Key.Return || event.text == " ")) {
+            root.activated();
+            return accept;
+        }
+        reject
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.focus(); root.activated(); }
+    }
+}
+
+export component NavItem inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    callback clicked();
+    min-height: 40px;
+    min-width: 88px;
+    border-radius: Theme.radius;
+    background: root.active ? Theme.accent.transparentize(0.82)
+        : area.hovered ? Theme.card-border.transparentize(0.5) : transparent;
+    area := Pressable {
+        accessible-label: root.text;
+        activated => { root.clicked(); }
+    }
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 12px;
+        spacing: 10px;
+        Rectangle {
+            width: 4px;
+            border-radius: 2px;
+            background: root.active ? Theme.accent : transparent;
+        }
+        Text {
+            text: root.text;
+            vertical-alignment: center;
+            font-size: Theme.heading-size;
+            font-weight: root.active ? 700 : 400;
+            color: Theme.text;
+            overflow: elide;
+        }
+    }
+    if area.has-focus: Rectangle {
+        border-width: 2px;
+        border-radius: Theme.radius;
+        border-color: Theme.accent;
+    }
+}
+
+// One partition. Free space is drawn but cannot be selected.
+component TileView inherits Rectangle {
+    in property <PartitionTile> tile;
+    in property <bool> selected;
+    in property <bool> enabled;
+    // Restore destinations must be free; backup sources may be in use.
+    in property <bool> check-eligibility;
+    callback activated();
+    callback hovered(bool);
+    property <bool> blocked: root.check-eligibility && root.tile.unavailable != "";
+    property <bool> selectable: root.enabled && root.tile.row >= 0 && !root.blocked;
+    border-radius: 4px;
+    clip: true;
+    background: root.tile.fs == "free" ? Theme.free-space
+        : root.selected ? Theme.accent.transparentize(0.75)
+        : area.hovered && root.selectable ? Theme.card-border.transparentize(0.3) : Theme.card;
+    border-width: root.selected ? 2px : 1px;
+    border-color: root.selected ? Theme.accent : Theme.card-border;
+    opacity: root.blocked ? 0.55 : 1.0;
+
+    area := Pressable {
+        enabled: root.selectable;
+        changed hovered => { root.hovered(self.hovered); }
+        accessible-label: root.tile.title + ", " + root.tile.detail
+            + (root.tile.mounts != "" ? ", mounted at " + root.tile.mounts : "")
+            + (root.blocked ? ", unavailable: " + root.tile.unavailable : "");
+        accessible-checked: root.selected;
+        activated => { root.activated(); }
+    }
+    Rectangle {
+        y: 0;
+        height: 6px;
+        background: Theme.fs-color(root.tile.fs);
+    }
+    VerticalLayout {
+        padding: 6px;
+        padding-top: 10px;
+        spacing: 1px;
+        alignment: start;
+        Text {
+            text: root.tile.title;
+            font-weight: 700;
+            color: Theme.text;
+            overflow: elide;
+        }
+        Text {
+            text: root.tile.detail;
+            font-size: Theme.small-size;
+            color: Theme.muted;
+            overflow: elide;
+        }
+        Text {
+            text: root.blocked ? root.tile.unavailable : root.tile.mounts;
+            font-size: Theme.small-size;
+            color: root.blocked ? Theme.warning : Theme.muted;
+            overflow: elide;
+        }
+    }
+    if area.has-focus: Rectangle {
+        border-width: 2px;
+        border-radius: 4px;
+        border-color: Theme.accent;
+    }
+}
+
+// The proportional partition bar of one disk.
+export component PartitionBar inherits Rectangle {
+    in property <[PartitionTile]> tiles;
+    in property <string> selected;
+    in property <bool> enabled: true;
+    in property <bool> check-eligibility;
+    // Details of the tile under the mouse, empty when there is none.
+    out property <string> hover-text;
+    callback select(int);
+    height: 78px;
+    for tile in root.tiles: TileView {
+        x: tile.start * root.width + 1px;
+        y: 0;
+        width: max(4px, tile.extent * root.width - 2px);
+        height: root.height;
+        tile: tile;
+        enabled: root.enabled;
+        check-eligibility: root.check-eligibility;
+        selected: tile.path != "" && tile.path == root.selected;
+        activated => { root.select(tile.row); }
+        hovered(inside) => {
+            root.hover-text = inside ? tile.title + " · " + tile.detail
+                + (tile.mounts != "" ? " · mounted at " + tile.mounts : "")
+                + (root.check-eligibility && tile.unavailable != "" ? " · " + tile.unavailable : "") : "";
+        }
+    }
+}
+
+// A disk: heading, partition bar, and the actions that apply to it.
+//
+// `mode` 0 shows the backup actions, 1 is a plain source picker, and 2 picks a
+// restore destination: the disk itself and each partition can be chosen, and
+// ineligible ones are dimmed with the reason.
+export component DiskPanel inherits Rectangle {
+    in property <DiskCard> card;
+    in property <string> selected;
+    in property <bool> enabled: true;
+    in property <int> mode;
+    in property <string> disk-path;
+    in property <string> disk-unavailable;
+    in property <bool> partition-selected;
+    callback select(int);
+    callback image-disk();
+    callback image-selection();
+
+    background: Theme.card;
+    border-width: 1px;
+    border-color: root.selected == root.disk-path ? Theme.accent : Theme.card-border;
+    border-radius: 8px;
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 8px;
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                min-width: 0px;
+                spacing: 2px;
+                Text {
+                    text: root.card.title;
+                    font-size: Theme.heading-size;
+                    font-weight: 700;
+                    color: Theme.text;
+                    overflow: elide;
+                }
+                Text {
+                    text: root.card.subtitle;
+                    color: Theme.muted;
+                    overflow: elide;
+                }
+            }
+        }
+        if root.card.note != "": Text {
+            text: root.card.note;
+            color: Theme.warning;
+            wrap: word-wrap;
+        }
+        bar := PartitionBar {
+            tiles: root.card.tiles;
+            selected: root.selected;
+            enabled: root.enabled;
+            check-eligibility: root.mode == 2;
+            select(row) => { root.select(row); }
+        }
+        Text {
+            text: bar.hover-text != "" ? bar.hover-text : "Point at a partition for details; click to select it.";
+            color: Theme.muted;
+            font-size: Theme.small-size;
+            overflow: elide;
+        }
+        if root.mode == 0: HorizontalLayout {
+            alignment: start;
+            spacing: 8px;
+            Button {
+                text: "Image this disk…";
+                enabled: root.enabled;
+                clicked => { root.image-disk(); }
+            }
+            Button {
+                text: "Image selected partition…";
+                enabled: root.enabled && root.partition-selected;
+                clicked => { root.image-selection(); }
+            }
+        }
+        if root.mode == 2: HorizontalLayout {
+            alignment: start;
+            spacing: 8px;
+            Button {
+                text: root.selected == root.disk-path ? "Whole disk selected" : "Restore to the whole disk";
+                primary: root.selected == root.disk-path;
+                enabled: root.enabled && root.disk-unavailable == "";
+                clicked => { root.select(root.card.disk-index); }
+            }
+            if root.disk-unavailable != "": Text {
+                text: root.disk-unavailable;
+                color: Theme.warning;
+                vertical-alignment: center;
+                overflow: elide;
+                min-width: 0px;
+                horizontal-stretch: 1;
+            }
+        }
+    }
+}
+
+// The steps of a wizard, with the current one highlighted.
+export component StepList inherits VerticalLayout {
+    in property <[string]> steps;
+    in property <int> current;
+    spacing: 4px;
+    alignment: start;
+    for step[index] in root.steps: HorizontalLayout {
+        spacing: 8px;
+        Rectangle {
+            width: 24px;
+            height: 24px;
+            border-radius: 12px;
+            background: index < root.current ? Theme.success
+                : index == root.current ? Theme.accent : Theme.free-space;
+            Text {
+                text: index < root.current ? "✓" : index + 1;
+                color: index <= root.current ? #ffffff : Theme.muted;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+        Text {
+            text: step;
+            vertical-alignment: center;
+            color: index == root.current ? Theme.text : Theme.muted;
+            font-weight: index == root.current ? 700 : 400;
+            overflow: elide;
+        }
+    }
+}
+
+// A message with an optional action, for errors and empty states.
+export component Banner inherits Rectangle {
+    in property <string> text;
+    in property <string> action;
+    in property <bool> error;
+    callback act();
+    background: root.error ? Theme.danger.transparentize(0.88) : Theme.free-space;
+    border-radius: Theme.radius;
+    HorizontalLayout {
+        padding: 10px;
+        spacing: 8px;
+        Text {
+            text: root.text;
+            color: root.error ? Theme.danger : Theme.text;
+            wrap: word-wrap;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            min-width: 0px;
+        }
+        if root.action != "": Button {
+            text: root.action;
+            clicked => { root.act(); }
+        }
+    }
+}
+
+// Title and one line of explanation at the top of a page.
+export component PageHeader inherits VerticalLayout {
+    in property <string> title;
+    in property <string> subtitle;
+    spacing: 2px;
+    Text {
+        text: root.title;
+        font-size: Theme.title-size;
+        font-weight: 700;
+        color: Theme.text;
+        wrap: word-wrap;
+    }
+    if root.subtitle != "": Text {
+        text: root.subtitle;
+        color: Theme.muted;
+        wrap: word-wrap;
+    }
+}

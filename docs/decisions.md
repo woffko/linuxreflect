@@ -1167,3 +1167,14 @@ and `swap`, each with the flags its own formatter documents; the previous
 universal `mkfs.<fs> -F -U -L` form broke `mkfs.fat` and `mkfs.xfs` and let
 an arbitrary string choose the program. Other filesystems are refused rather
 than guessed.
+
+## D-106 — `ListSets` without a set name lists the sets
+
+The GUI library used to need the set name typed in before it showed anything,
+and asking for a set that did not exist created an empty set directory,
+because `open_set` creates it. `ListSets` (spec §I) with an empty `set` now
+returns `SetInfo.sets`: the names of the directories under the destination
+root that hold at least one `.lrimg`, sorted. It never opens or creates a set.
+`Destination::list_set_names` implements it for local (and mounted) and SFTP
+destinations; symlinks are not followed locally. A named `ListSets` is
+unchanged. The field is additive, so older clients are unaffected.

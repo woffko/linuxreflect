@@ -19,6 +19,37 @@ use std::time::{Duration, Instant};
 
 const GUI: &str = env!("CARGO_BIN_EXE_linuxreflect-gui");
 
+/// The GUI command for the Wayland run.
+///
+/// Slint's winit backend deliberately picks X11 whenever it sees WSL
+/// (`/run/WSL` or the `WSLInterop` binfmt entry). On WSL the GUI therefore
+/// runs in a bubblewrap mount namespace where those two paths do not exist,
+/// so it really connects to the headless Weston. Everything the test uses
+/// lives under `/tmp`, which stays shared.
+fn wayland_gui_command() -> Command {
+    let wsl =
+        Path::new("/run/WSL").exists() || Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists();
+    if !wsl {
+        return Command::new(GUI);
+    }
+    assert!(
+        have("bwrap"),
+        "on WSL the Wayland test needs bubblewrap to hide the WSL markers from Slint"
+    );
+    let mut command = Command::new("bwrap");
+    command.args([
+        "--dev-bind",
+        "/",
+        "/",
+        "--tmpfs",
+        "/run",
+        "--tmpfs",
+        "/proc/sys/fs/binfmt_misc",
+        GUI,
+    ]);
+    command
+}
+
 fn private_test_dir() -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix("lr-gui-")
@@ -431,7 +462,7 @@ fn create_and_restore_through_the_gui_on_wayland() {
     write_tree(&source, "wayland marker\n");
     let script = script(dir.path(), &source, &restore, "wayland");
     let started = Instant::now();
-    let output = Command::new(GUI)
+    let output = wayland_gui_command()
         .env_remove("DISPLAY")
         .env("SLINT_BACKEND", "winit-software")
         .env("XDG_RUNTIME_DIR", &runtime)

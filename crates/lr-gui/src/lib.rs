@@ -12,6 +12,7 @@
 mod backup_review;
 pub mod client;
 mod devices;
+mod disk_map;
 mod geometry;
 mod history;
 mod job_view;
@@ -38,6 +39,13 @@ mod generated {
 }
 
 use generated::*;
+
+/// The generated Slint types, for tooling that renders the window without a
+/// display (`examples/gallery.rs`). Not a stable interface.
+#[doc(hidden)]
+pub mod ui {
+    pub use super::generated::*;
+}
 
 /// How the GUI should start.
 #[derive(Debug, Clone)]
@@ -102,7 +110,9 @@ impl Actions {
         true
     }
 
-    /// The disk map: `ListDisks` rendered into rows.
+    /// The disk map: `ListDisks` rendered into rows, and every disk's
+    /// `DiskMap` rendered into a panel. A disk the daemon cannot map still
+    /// gets a panel from the device list, with the reason shown on it.
     fn refresh_disks(&self, ui: slint::Weak<MainWindow>) {
         if !self.start(&ui, "list disks") {
             return;
@@ -110,9 +120,7 @@ impl Actions {
         let show_system = ui.upgrade().is_some_and(|ui| ui.get_show_system_devices());
         if let Some(ui) = ui.upgrade() {
             ui.set_disk_status("Loading disks…".into());
-            ui.set_selected_disk(-1);
-            ui.set_partition_tiles(slint::ModelRc::default());
-            ui.set_layout_title("Select a disk to inspect its partitions.".into());
+            ui.set_disk_error(false);
         }
         let socket = self.socket.clone();
         let actions = self.clone_handle();
@@ -123,41 +131,67 @@ impl Actions {
                 let json = client.list_disks().await?;
                 let entries: Vec<devices::Device> =
                     serde_json::from_str(&json).context("disk list JSON array")?;
-                // Disks first, each followed by its partitions, so the list
-                // reads like a device tree and every row carries the node the
-                // daemon accepts as a source.
-                let rows: Vec<_> = devices::ordered(&entries, show_system).into_iter()
-                    .map(|entry| disk_row(entry, &entries)).collect();
-                Ok::<_, anyhow::Error>(rows)
+                // Disks first, each followed by its partitions, so every row
+                // carries the node the daemon accepts as a source.
+                let ordered = devices::ordered(&entries, show_system);
+                let mut panels = Vec::new();
+                for (disk_row, device) in ordered.iter().enumerate() {
+                    if device.partition.is_some() {
+                        continue;
+                    }
+                    let number = panels.len() + 1;
+                    let panel = match client.disk_map(&device.path).await {
+                        Ok(layout) => disk_map::from_layout(number, disk_row, &ordered, &layout),
+                        Err(error) => disk_map::from_list(
+                            number,
+                            disk_row,
+                            &ordered,
+                            &format!("Details unavailable: {}", first_line(&error)),
+                        ),
+                    };
+                    panels.push(panel);
+                }
+                let rows: Vec<_> = ordered
+                    .iter()
+                    .map(|entry| disk_row(entry, &entries))
+                    .collect();
+                Ok::<_, anyhow::Error>((rows, panels))
             }
             .await;
             match outcome {
-                Ok(rows) => {
+                Ok((rows, panels)) => {
                     let weak = weak.clone();
-                    let count = rows.len();
-                    let disk_count = rows.iter().filter(|row| row.is_disk).count();
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = weak.upgrade() {
-                            ui.set_disk_cards(disk_cards(&rows));
+                            let disk_count = panels.len();
+                            let partitions = rows.len() - disk_count;
+                            ui.set_disk_cards(disk_cards(&panels, &rows));
                             ui.set_disks(slint::ModelRc::new(slint::VecModel::from(rows)));
-                            ui.set_status(format!("{disk_count} disks, {} partitions", count - disk_count).into());
-                            ui.set_disk_status(if count == 0 {
-                                "No devices found. Try Refresh or show service devices.".into()
+                            ui.set_selected_disk(-1);
+                            ui.set_status(
+                                format!("{disk_count} disks, {partitions} partitions").into(),
+                            );
+                            ui.set_disk_error(false);
+                            ui.set_disk_status(if disk_count == 0 {
+                                "No disks found. Refresh, or show service devices.".into()
                             } else {
-                                "Select a disk or partition below to inspect it.".into()
+                                "".into()
                             });
+                            reselect(&ui);
                             ui.set_busy(false);
                             actions.shared.busy.store(false, Ordering::SeqCst);
                         }
                     });
                 }
                 Err(error) => {
+                    let message = format!("Could not load the disks: {}", first_line(&error));
                     actions.fail(&weak, "list disks", &error);
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = weak.upgrade() {
                             ui.set_disks(slint::ModelRc::default());
                             ui.set_disk_cards(slint::ModelRc::default());
-                            ui.set_disk_status("Could not load disks. Check the connection message below, then Refresh.".into());
+                            ui.set_disk_error(true);
+                            ui.set_disk_status(message.into());
                         }
                     });
                 }
@@ -165,105 +199,8 @@ impl Actions {
         });
     }
 
-    fn inspect_disk(&self, ui: slint::Weak<MainWindow>, source: String) {
-        if !self.start(&ui, "inspect disk") {
-            return;
-        }
-        if let Some(ui) = ui.upgrade() {
-            ui.set_layout_title(format!("Inspecting {source}…").into());
-            ui.set_partition_tiles(slint::ModelRc::default());
-        }
-        let socket = self.socket.clone();
-        let actions = self.clone_handle();
-        self.runtime.spawn(async move {
-            let outcome = async { Client::connect(&socket).await?.disk_map(&source).await }.await;
-            match outcome {
-                Ok(layout) => {
-                    let facts = &layout.device_facts;
-                    let mut title = format!(
-                        "{} · {} · {}",
-                        source,
-                        facts.model.as_deref().unwrap_or("Device"),
-                        human_size(facts.size_bytes)
-                    );
-                    let mut tiles = Vec::new();
-                    for partition in &layout.partitions {
-                        let Some((start, extent)) = geometry::relative_extent(
-                            partition.start_lba,
-                            facts.logical_block_size,
-                            partition.size_bytes,
-                            facts.size_bytes,
-                        ) else {
-                            title.push_str(" · Invalid partition geometry; map unavailable");
-                            tiles.clear();
-                            break;
-                        };
-                        let path = partition
-                            .path
-                            .as_ref()
-                            .map(|path| path.display().to_string())
-                            .unwrap_or_default();
-                        let mounts = partition
-                            .mountpoints
-                            .iter()
-                            .map(|path| path.display().to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        tiles.push(PartitionTile {
-                            label: format!(
-                                "Partition {} · {} · {} · {}",
-                                partition.index,
-                                partition.fs_type.as_deref().unwrap_or("unknown filesystem"),
-                                human_size(partition.size_bytes),
-                                mounts
-                            )
-                            .into(),
-                            path: path.into(),
-                            start,
-                            extent,
-                        });
-                    }
-                    if layout.partitions.is_empty() {
-                        title.push_str(&format!(
-                            " · {}",
-                            layout
-                                .fs
-                                .as_ref()
-                                .map_or("No partition table detected", |fs| fs.fs_type.as_str())
-                        ));
-                    }
-                    if !layout.warnings.is_empty() {
-                        title.push_str(&format!(" · {}", layout.warnings.join("; ")));
-                    }
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(ui) = ui.upgrade() {
-                            ui.set_busy(false);
-                            if ui.get_source().as_str() == source.as_str() {
-                                ui.set_partition_tiles(slint::ModelRc::new(slint::VecModel::from(
-                                    tiles,
-                                )));
-                                ui.set_layout_title(title.into());
-                                ui.set_status("Device information loaded.".into());
-                            }
-                            actions.shared.busy.store(false, Ordering::SeqCst);
-                        }
-                    });
-                }
-                Err(error) => {
-                    actions.fail(&ui, "inspect disk", &error);
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(ui) = ui.upgrade() {
-                            ui.set_layout_title(
-                                "Device inspection failed. Select the disk to retry.".into(),
-                            );
-                        }
-                    });
-                }
-            }
-        });
-    }
-
-    /// The history tab: sets, chains and members.
+    /// The backup library: every set at the destination (or only `set` when
+    /// one is named), each with its members, newest first.
     fn refresh_history(&self, ui: slint::Weak<MainWindow>, dest: String, set: String) {
         if !self.start(&ui, "history") {
             return;
@@ -274,54 +211,77 @@ impl Actions {
         self.runtime.spawn(async move {
             let outcome = async {
                 let client = Client::connect(&socket).await?;
-                let json = client.list_sets(&dest, &set).await?;
-                let value: serde_json::Value = serde_json::from_str(&json).context("set JSON")?;
+                let sets = if set.is_empty() {
+                    client.list_set_names(&dest).await?
+                } else {
+                    vec![set.clone()]
+                };
                 let mut rows = Vec::new();
-                for chain in value
-                    .get("chains")
-                    .and_then(serde_json::Value::as_array)
-                    .into_iter()
-                    .flatten()
-                {
-                    for member in chain
-                        .get("members")
+                for set in sets {
+                    let json = client.list_sets(&dest, &set).await?;
+                    let value: serde_json::Value =
+                        serde_json::from_str(&json).context("set JSON")?;
+                    let mut members = Vec::new();
+                    for chain in value
+                        .get("chains")
                         .and_then(serde_json::Value::as_array)
                         .into_iter()
                         .flatten()
                     {
-                        let created = history::created_at(
-                            member
+                        for member in chain
+                            .get("members")
+                            .and_then(serde_json::Value::as_array)
+                            .into_iter()
+                            .flatten()
+                        {
+                            let created = history::created_at(
+                                member
+                                    .get("created_unix")
+                                    .and_then(serde_json::Value::as_u64),
+                            );
+                            let kind = member
+                                .get("kind")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("?");
+                            let seq = member
+                                .get("seq_in_chain")
+                                .and_then(serde_json::Value::as_u64)
+                                .unwrap_or(0);
+                            let size = member
+                                .get("size_bytes")
+                                .and_then(serde_json::Value::as_u64)
+                                .map_or_else(|| "-".to_owned(), human_size);
+                            let file = member
+                                .get("file_name")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("-");
+                            let path = history::image_location(&dest, &set, file)
+                                .context("catalog member has an invalid set-relative image path")?;
+                            let unix = member
                                 .get("created_unix")
-                                .and_then(serde_json::Value::as_u64),
-                        );
-                        let kind = member
-                            .get("kind")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("?");
-                        let seq = member
-                            .get("seq_in_chain")
-                            .and_then(serde_json::Value::as_u64)
-                            .unwrap_or(0);
-                        let size = member
-                            .get("size_bytes")
-                            .and_then(serde_json::Value::as_u64)
-                            .map_or_else(|| "-".to_owned(), human_size);
-                        let file = member
-                            .get("file_name")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("-");
-                        let path = history::image_location(&dest, &set, file)
-                            .context("catalog member has an invalid set-relative image path")?;
-                        rows.push(HistoryRow {
-                            name: format!(
-                                "{} · Copy {}",
-                                history::backup_kind(kind),
-                                seq.saturating_add(1)
-                            )
-                            .into(),
-                            detail: format!("Created: {created} · {size}\n{file}").into(),
-                            path: path.into(),
-                        });
+                                .and_then(serde_json::Value::as_u64)
+                                .unwrap_or(0);
+                            members.push((
+                                unix,
+                                HistoryRow {
+                                    name: format!(
+                                        "{} · Copy {}",
+                                        history::backup_kind(kind),
+                                        seq.saturating_add(1)
+                                    )
+                                    .into(),
+                                    detail: format!("Created: {created} · {size}\n{file}").into(),
+                                    path: path.into(),
+                                    group: set.clone().into(),
+                                    first: false,
+                                },
+                            ));
+                        }
+                    }
+                    members.sort_by_key(|member| std::cmp::Reverse(member.0));
+                    for (index, (_, mut row)) in members.into_iter().enumerate() {
+                        row.first = index == 0;
+                        rows.push(row);
                     }
                 }
                 Ok::<_, anyhow::Error>(rows)
@@ -687,8 +647,16 @@ impl Actions {
 mod lifecycle_tests {
     use super::*;
 
+    /// Both scenarios need a window, and Slint binds its platform to the
+    /// first thread that creates one while libtest gives every test its own
+    /// thread; so they run one after the other inside a single test.
     #[test]
-    #[ignore = "requires a display; run with Xvfb and a single test thread"]
+    #[ignore = "requires a display; run with Xvfb"]
+    fn job_admission_lifecycle() {
+        unavailable_daemon_does_not_release_a_job_after_cancel_or_status();
+        completion_keeps_admission_closed_until_ui_cleanup();
+    }
+
     fn unavailable_daemon_does_not_release_a_job_after_cancel_or_status() {
         let directory = tempfile::tempdir().expect("private socket directory");
         let ui = MainWindow::new().expect("create test UI");
@@ -743,8 +711,6 @@ mod lifecycle_tests {
         assert!(checked.load(Ordering::SeqCst));
     }
 
-    #[test]
-    #[ignore = "requires a display; run with Xvfb and a single test thread"]
     fn completion_keeps_admission_closed_until_ui_cleanup() {
         let ui = MainWindow::new().expect("create test UI");
         let app = App::new(ui, Path::new("/nonexistent/lr-lifecycle-test.sock"))
@@ -1091,26 +1057,70 @@ fn backup_spec(ui: &MainWindow) -> BackupSpec {
     }
 }
 
-/// Group the already disk-first ordered rows without changing callback indices.
-fn disk_cards(rows: &[DiskRow]) -> slint::ModelRc<DiskCard> {
-    let mut cards = Vec::new();
-    let mut start = 0;
-    while start < rows.len() {
-        let end = (start + 1..rows.len())
-            .find(|&index| rows[index].is_disk)
-            .unwrap_or(rows.len());
-        if let Ok(disk_index) = i32::try_from(start) {
-            let partitions: Vec<_> = (start + 1..end)
-                .filter_map(|index| i32::try_from(index).ok())
+/// Slint panels for the disk page; each tile carries the restore eligibility
+/// of the row it selects.
+fn disk_cards(panels: &[disk_map::Panel], rows: &[DiskRow]) -> slint::ModelRc<DiskCard> {
+    let row_index = |row: Option<usize>| row.and_then(|row| i32::try_from(row).ok()).unwrap_or(-1);
+    let cards: Vec<DiskCard> = panels
+        .iter()
+        .map(|panel| {
+            let tiles: Vec<PartitionTile> = panel
+                .segments
+                .iter()
+                .map(|segment| PartitionTile {
+                    row: row_index(segment.row),
+                    path: segment.path.clone().into(),
+                    title: segment.title.clone().into(),
+                    detail: segment.detail.clone().into(),
+                    mounts: segment.mounts.clone().into(),
+                    fs: segment.fs.clone().into(),
+                    unavailable: segment
+                        .row
+                        .and_then(|row| rows.get(row))
+                        .map(|row| row.restore_unavailable.clone())
+                        .unwrap_or_default(),
+                    start: segment.start,
+                    extent: segment.extent,
+                })
                 .collect();
-            cards.push(DiskCard {
-                disk_index,
-                partition_indices: slint::ModelRc::new(slint::VecModel::from(partitions)),
-            });
-        }
-        start = end;
-    }
+            DiskCard {
+                disk_index: row_index(Some(panel.row)),
+                title: panel.title.clone().into(),
+                subtitle: panel.subtitle.clone().into(),
+                note: panel.note.clone().into(),
+                tiles: slint::ModelRc::new(slint::VecModel::from(tiles)),
+            }
+        })
+        .collect();
     slint::ModelRc::new(slint::VecModel::from(cards))
+}
+
+/// The first line of an error chain, for a one-line message in a panel.
+fn first_line(error: &anyhow::Error) -> String {
+    let text = format!("{error:#}");
+    text.lines().next().unwrap_or_default().to_owned()
+}
+
+/// The disk row containing `path`: the disk itself or the parent of a
+/// partition row.
+fn containing_disk(ui: &MainWindow, path: &str) -> i32 {
+    let disks = ui.get_disks();
+    let Some(index) = (0..disks.row_count())
+        .find(|index| disks.row_data(*index).is_some_and(|row| row.path == path))
+    else {
+        return -1;
+    };
+    (0..=index)
+        .rev()
+        .find(|index| disks.row_data(*index).is_some_and(|row| row.is_disk))
+        .and_then(|index| i32::try_from(index).ok())
+        .unwrap_or(-1)
+}
+
+/// Keep the selection highlighted after the disk list was reloaded.
+fn reselect(ui: &MainWindow) {
+    let source = ui.get_source().to_string();
+    ui.set_selected_disk(containing_disk(ui, &source));
 }
 
 /// One row of the disk map: a disk or one of its partitions.
@@ -1301,12 +1311,9 @@ fn connect_callbacks(ui: &MainWindow, actions: &Arc<Actions>) {
                 .upgrade()
                 .map(|ui| ui.get_destination().to_string())
                 .unwrap_or_default();
-            let set = ui
-                .upgrade()
-                .map(|ui| ui.get_backup_set().to_string())
-                .unwrap_or_default();
+            // The library shows every set in the folder.
             let ui = ui.clone();
-            actions.refresh_history(ui, dest, set);
+            actions.refresh_history(ui, dest, String::new());
         });
     }
     {
@@ -1411,6 +1418,10 @@ fn connect_callbacks(ui: &MainWindow, actions: &Arc<Actions>) {
                 |ui, path| {
                     ui.set_destination(path.clone().into());
                     ui.set_status(format!("destination: {path}").into());
+                    // On the library page a new folder means a new list.
+                    if ui.get_current_tab() == 3 {
+                        ui.invoke_refresh_history();
+                    }
                 },
             );
         });
@@ -1487,7 +1498,6 @@ fn connect_callbacks(ui: &MainWindow, actions: &Arc<Actions>) {
     }
     {
         let ui = ui.as_weak();
-        let actions = Arc::clone(actions);
         ui.upgrade().expect("ui").on_disk_selected(move |idx| {
             let Some(strong) = ui.upgrade() else {
                 return;
@@ -1507,51 +1517,15 @@ fn connect_callbacks(ui: &MainWindow, actions: &Arc<Actions>) {
                     }
                     strong.invoke_restore_inputs_changed();
                     strong.set_target(path.clone().into());
-                    strong.set_choosing_restore_target(false);
-                    strong.set_current_tab(2);
                     strong.set_status(
                         format!("Restore destination: {path}. Review before writing.").into(),
                     );
                     return;
                 }
-                strong.set_selected_disk(idx);
                 strong.set_source(path.clone().into());
+                strong.set_selected_disk(containing_disk(&strong, &path));
+                strong.set_source_is_folder(false);
                 strong.set_status(format!("selected source: {path}").into());
-                actions.inspect_disk(ui.clone(), path);
-            }
-        });
-    }
-    {
-        let weak = ui.as_weak();
-        ui.on_partition_selected(move |idx| {
-            let Some(ui) = weak.upgrade() else {
-                return;
-            };
-            if idx < 0 || ui.get_busy() {
-                return;
-            }
-            if let Some(tile) = ui.get_partition_tiles().row_data(idx as usize)
-                && !tile.path.is_empty()
-            {
-                if ui.get_choosing_restore_target() {
-                    let disks = ui.get_disks();
-                    if let Some(index) = (0..disks.row_count())
-                        .find(|index| {
-                            disks
-                                .row_data(*index)
-                                .is_some_and(|row| row.path == tile.path)
-                        })
-                        .and_then(|index| i32::try_from(index).ok())
-                    {
-                        ui.invoke_disk_selected(index);
-                    } else {
-                        ui.set_status("Refresh disks before selecting this destination.".into());
-                    }
-                    return;
-                }
-                ui.set_selected_disk(-1);
-                ui.set_source(tile.path.clone());
-                ui.set_status(format!("Selected partition: {}", tile.path).into());
             }
         });
     }

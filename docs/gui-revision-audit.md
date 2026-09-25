@@ -299,6 +299,49 @@ Installation remains blocked: a fresh `sudo -n true` over the configured
 codex SSH connection still requires a password. No privileged installation
 was performed.
 
+## GUI redesign, stage 1 (2026-09-25)
+
+Plan: `docs/gui-redesign.md`. The window is reorganised around a navigation
+sidebar (Back up, Restore, Activity) that becomes a top bar below 760 px, with
+wizard step lists hidden below 1000 px:
+
+- **Back up** shows every disk as a panel with a proportional, clickable
+  partition bar (filesystem colour, label, size, mounts; tiny partitions are
+  widened so they can be clicked; unallocated space is shown), a hover detail
+  line, and "Image this disk…" / "Image selected partition…". A disk the
+  daemon cannot map still gets a panel from the device list, with the reason.
+  Loading errors are a banner with Retry.
+- **Wizards** list their steps; the source and the restore destination are
+  picked on the same disk maps inside the wizard instead of on another tab.
+  Restore destinations dim ineligible devices with the reason; backup sources
+  do not (a mounted source is valid with a snapshot). Paths are text only
+  behind "Enter a path instead" / "Enter the destination as text (SFTP)".
+- **Restore** is a library of every set in the chosen folder, newest first,
+  grouped by set, refreshed when a folder is chosen (D-106).
+- **Activity** and a **job strip** with progress, percentage and Cancel on
+  every page.
+
+Evidence on this tree:
+
+- `cargo xtask ci`: exit 0, 480 passed, 0 failed, 54 ignored.
+- Root, `root_gui-10365b797d5b46f3`: X11, encrypted X11 and Wayland
+  create/restore round trips passed (15.0 s), restored files compared. On WSL
+  the Wayland run uses bubblewrap to hide `/run/WSL` and the `WSLInterop`
+  binfmt entry, because Slint 1.18's winit backend forces X11 when it sees
+  them; without that the "Wayland" test could not reach Weston at all.
+- `lifecycle_tests::job_admission_lifecycle` passed on Xvfb, three runs in a
+  row. The two scenarios used to be separate tests that could not share a
+  process (Slint binds its platform to the first thread), so running both
+  failed with "The Slint platform was initialized in another thread".
+- `cargo run -p lr-gui --example gallery -- DIR` renders ten scenes at
+  1024x768, 1280x720 and 1920x1080, each at 100/150/200% (90 PNGs, 21 s) with
+  the software renderer; the disks, wizard, library and progress scenes were
+  inspected at 1280x720@100, 1280x720@150 and 1024x768@200.
+
+Not yet covered: physical mouse and keyboard runs on the new layout (the old
+coordinate-based harness invocations no longer apply), a GNOME session, and
+block-device round trips through the GUI on owned loop devices.
+
 ## Acceptance checklist
 
 ### Rescue command-boundary review: resolved (2026-09-25, D-105)

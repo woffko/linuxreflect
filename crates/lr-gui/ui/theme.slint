@@ -1,0 +1,40 @@
+// Spacing, type scale and the colours the standard palette does not provide.
+// Everything follows `Palette`, so the light and dark schemes both work.
+
+import { Palette } from "std-widgets.slint";
+
+export global Theme {
+    out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+    out property <length> gap: 8px;
+    out property <length> page-padding: 16px;
+    out property <length> radius: 6px;
+    out property <length> title-size: 22px;
+    out property <length> heading-size: 15px;
+    out property <length> small-size: 12px;
+
+    out property <brush> window: Palette.background;
+    out property <brush> sidebar: dark ? #202327 : #eef1f5;
+    out property <brush> card: dark ? #2a2e33 : #ffffff;
+    out property <brush> card-border: dark ? #3d434a : #d3d9e0;
+    out property <brush> text: Palette.foreground;
+    out property <brush> muted: dark ? #a9b1ba : #5b6570;
+    out property <brush> accent: Palette.accent-background;
+    out property <brush> warning: dark ? #ffb870 : #9b3200;
+    out property <brush> danger: dark ? #ff8a80 : #b3261e;
+    out property <brush> success: dark ? #7bd88f : #1e7b3c;
+    out property <brush> free-space: dark ? #33383e : #e9edf1;
+
+    // A stable colour per filesystem, used for the strip on each partition tile.
+    public pure function fs-color(fs: string) -> brush {
+        if (fs == "ext4" || fs == "ext3" || fs == "ext2") { return #3b7dd8; }
+        if (fs == "xfs") { return #7a55c7; }
+        if (fs == "btrfs") { return #d9822b; }
+        if (fs == "vfat" || fs == "exfat") { return #2e9e6b; }
+        if (fs == "ntfs") { return #1f6fb2; }
+        if (fs == "swap") { return #7d8590; }
+        if (fs == "LVM2_member") { return #b0476a; }
+        if (fs == "crypto_LUKS") { return #4a5568; }
+        if (fs == "free") { return transparent; }
+        return #9aa3ad;
+    }
+}

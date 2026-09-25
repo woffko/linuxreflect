@@ -19,7 +19,7 @@ jobs:
         run: rustup show && rustc --version
       - uses: Swatinem/rust-cache@v2
       - name: Build dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler pkg-config libfontconfig-dev
       - name: rustfmt
         run: cargo fmt --all -- --check
       - name: clippy
@@ -35,7 +35,7 @@ jobs:
       - name: Build and fixture dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends protobuf-compiler \
+          sudo apt-get install -y --no-install-recommends protobuf-compiler pkg-config libfontconfig-dev \
             gdisk e2fsprogs xfsprogs btrfs-progs dosfstools fuse3
       - name: Tests (unprivileged)
         run: cargo test --workspace
@@ -78,7 +78,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential ca-certificates curl git protobuf-compiler musl-tools \
+            build-essential ca-certificates curl git protobuf-compiler musl-tools pkg-config libfontconfig-dev \
             util-linux e2fsprogs xfsprogs lvm2 gdisk btrfs-progs dosfstools \
             qemu-system-x86 ovmf
       - name: Install Rust

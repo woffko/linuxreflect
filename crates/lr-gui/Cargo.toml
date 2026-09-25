@@ -32,6 +32,8 @@ rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 slint-build.workspace = true
 
 [dev-dependencies]
+# The gallery example encodes its renders; already in the tree via slint-build.
+png = "0.18"
 tempfile.workspace = true
 lr-engine.workspace = true
 lr-store.workspace = true
