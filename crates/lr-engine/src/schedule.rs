@@ -727,7 +727,7 @@ on_calendar = "daily"
 
     #[test]
     fn remove_deletes_both_units_and_tolerates_missing_ones() {
-        let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+        let dir = tempfile::tempdir().expect("tempdir");
         let units = dir.path().join("units");
         std::fs::create_dir_all(&units).expect("units");
         for kind in ["service", "timer"] {
@@ -746,7 +746,7 @@ on_calendar = "daily"
 
     #[test]
     fn materialize_writes_units_into_any_directory() {
-        let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+        let dir = tempfile::tempdir().expect("tempdir");
         let config_path = dir.path().join("config.toml");
         std::fs::write(&config_path, SPEC_EXAMPLE).expect("write config");
         let units_dir = dir.path().join("units");

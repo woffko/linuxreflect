@@ -79,7 +79,7 @@ struct LoopDisk {
 
 impl LoopDisk {
     fn attach(size: u64) -> Option<Self> {
-        let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+        let dir = tempfile::tempdir().expect("tempdir");
         let backing = dir.path().join("disk.img");
         sparse(&backing, size);
         let free = Command::new("losetup").arg("-f").output().ok()?;
@@ -199,7 +199,7 @@ fn btrfs_full_then_incremental_round_trips() {
         return;
     }
 
-    let work = tempfile::tempdir_in("/tmp/opencode").expect("workdir");
+    let work = tempfile::tempdir().expect("workdir");
     let top = Mount::btrfs(&source.device, &work.path().join("top"), None).expect("mount top");
     // The subvolumes must exist before their `subvol=` mounts can be made.
     std::fs::create_dir_all(top.path().join("home")).expect("home dir");

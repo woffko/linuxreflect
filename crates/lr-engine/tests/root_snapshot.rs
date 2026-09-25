@@ -108,7 +108,7 @@ struct LoopDisk {
 
 impl LoopDisk {
     fn attach(size: u64) -> Option<Self> {
-        let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+        let dir = tempfile::tempdir().expect("tempdir");
         let backing = dir.path().join("disk.img");
         sparse(&backing, size);
         let free = Command::new("losetup").arg("-f").output().ok()?;
@@ -280,10 +280,7 @@ fn a_killed_job_leaves_a_snapshot_that_the_sweep_removes() {
     let Some(origin) = classic_origin(&vg) else {
         return;
     };
-    let ready = PathBuf::from(format!(
-        "/tmp/opencode/lr-lvm-child-{}.ready",
-        std::process::id()
-    ));
+    let ready = std::env::temp_dir().join(format!("lr-lvm-child-{}.ready", std::process::id()));
     let _ = std::fs::remove_file(&ready);
 
     // The child creates a snapshot and then hangs until it is killed.
@@ -514,11 +511,11 @@ fn freeze_blocks_writers_and_thaws_on_drop() {
     if !have("fsfreeze") {
         return;
     }
-    let work = tempfile::tempdir_in("/tmp/opencode").expect("workdir");
+    let work = tempfile::tempdir().expect("workdir");
     let Some((mountpoint, _guard, loop_disk)) = mounted_ext4(work.path(), "frz") else {
         return;
     };
-    // The destination is on another filesystem (/tmp/opencode is not the loop).
+    // The destination is on another filesystem (the temporary directory is not the loop).
     assert_ne!(
         std::fs::metadata(&mountpoint).expect("stat").dev(),
         std::fs::metadata(work.path()).expect("stat").dev(),
@@ -573,7 +570,7 @@ fn kill_9_is_recovered_by_the_deadman() {
     if !have("fsfreeze") {
         return;
     }
-    let work = tempfile::tempdir_in("/tmp/opencode").expect("workdir");
+    let work = tempfile::tempdir().expect("workdir");
     let Some((mountpoint, _guard, loop_disk)) = mounted_ext4(work.path(), "dmn") else {
         return;
     };
@@ -661,7 +658,7 @@ fn freeze_refuses_a_destination_on_the_frozen_filesystem() {
     if !root_tests_enabled() {
         return;
     }
-    let work = tempfile::tempdir_in("/tmp/opencode").expect("workdir");
+    let work = tempfile::tempdir().expect("workdir");
     let Some((mountpoint, _guard, loop_disk)) = mounted_ext4(work.path(), "same") else {
         return;
     };
@@ -687,7 +684,7 @@ fn live_none_marks_the_image_inconsistent() {
     if !root_tests_enabled() {
         return;
     }
-    let work = tempfile::tempdir_in("/tmp/opencode").expect("workdir");
+    let work = tempfile::tempdir().expect("workdir");
     let Some((mountpoint, _guard, loop_disk)) = mounted_ext4(work.path(), "live") else {
         return;
     };

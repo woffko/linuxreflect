@@ -467,7 +467,7 @@ fn a_bootable_disk_survives_a_whole_disk_round_trip() {
         eprintln!("qemu or OVMF missing; skipping");
         return;
     }
-    let work = tempfile::tempdir_in("/tmp/opencode").expect("workdir");
+    let work = tempfile::tempdir().expect("workdir");
     let Some(source) = LoopDisk::attach(work.path(), "boot-src.img", SRC_SIZE) else {
         eprintln!("could not attach a loop device");
         return;
@@ -586,7 +586,7 @@ fn an_mbr_disk_round_trips_and_boots() {
         eprintln!("qemu or sfdisk missing; skipping");
         return;
     }
-    let work = tempfile::tempdir_in("/tmp/opencode").expect("workdir");
+    let work = tempfile::tempdir().expect("workdir");
     let Some(source) = LoopDisk::attach(work.path(), "mbr-src.img", SRC_SIZE) else {
         return;
     };

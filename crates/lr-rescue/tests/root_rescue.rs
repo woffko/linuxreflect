@@ -82,11 +82,10 @@ fn kernel() -> Option<PathBuf> {
 
 /// The static rescue CLI: the release, stripped musl build the medium ships.
 fn rescue_cli() -> Option<PathBuf> {
-    for candidate in [
-        "/home/w0w/linuxreflect/target/x86_64-unknown-linux-musl/release/linuxreflect.stripped",
-        "/home/w0w/linuxreflect/target/x86_64-unknown-linux-musl/release/linuxreflect",
-    ] {
-        let path = PathBuf::from(candidate);
+    let release = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/x86_64-unknown-linux-musl/release");
+    for name in ["linuxreflect.stripped", "linuxreflect"] {
+        let path = release.join(name);
         if path.exists() {
             return Some(path);
         }
@@ -186,10 +185,9 @@ fn the_rescue_media_boots_on_seabios_and_with_secure_boot() {
     };
     // A stable directory (not a temporary one) so a failure leaves the images
     // and the serial logs behind for inspection.
-    let work_path = PathBuf::from(format!(
-        "/tmp/opencode/s16/media-test/run-{}",
-        std::process::id()
-    ));
+    let work_path = std::env::temp_dir()
+        .join("linuxreflect-s16-media-test")
+        .join(format!("run-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work_path);
     std::fs::create_dir_all(&work_path).expect("work dir");
     let work = work_path.clone();
@@ -262,7 +260,7 @@ fn a_restored_esp_boots_again_after_boot_repair() {
         eprintln!("no /boot/vmlinuz-* found; skipping");
         return;
     };
-    let work = tempfile::tempdir_in("/tmp/opencode").expect("workdir");
+    let work = tempfile::tempdir().expect("workdir");
 
     // A rescue medium that also serves as the "restored system" for this test:
     // its ESP carries shim/GRUB/kernel, exactly like a restored machine's.
@@ -358,7 +356,7 @@ fn recreating_a_layout_keeps_the_partition_and_filesystem_uuids() {
             return;
         }
     }
-    let work = tempfile::tempdir_in("/tmp/opencode").expect("workdir");
+    let work = tempfile::tempdir().expect("workdir");
     let image = work.path().join("layout.img");
     let file = std::fs::File::create(&image).expect("create");
     file.set_len(256 * 1024 * 1024).expect("size");
@@ -438,7 +436,9 @@ fn recreating_a_layout_keeps_the_partition_and_filesystem_uuids() {
         }],
     )
     .expect("plan the recreation");
-    let report = lr_rescue::apply_layout_recreation(&plan).expect("apply the recreation");
+    let reviewed = lr_rescue::capture_target(Path::new(&loop_device)).expect("target facts");
+    let report =
+        lr_rescue::apply_layout_recreation(&plan, &reviewed).expect("apply the recreation");
     assert!(!report.completed.is_empty(), "{report:?}");
 
     let recreated = String::from_utf8_lossy(
@@ -470,6 +470,95 @@ fn recreating_a_layout_keeps_the_partition_and_filesystem_uuids() {
         );
     }
     let _ = run("losetup", &["-d", &loop_device]);
+}
+
+/// A layout recreation writes nothing when the disk changed after the plan was
+/// reviewed (`E_TARGET_CHANGED`) or when one of its partitions is mounted.
+#[test]
+#[ignore = "requires root and loop devices"]
+fn recreating_a_layout_refuses_a_changed_or_busy_disk() {
+    if !root_tests_enabled() {
+        return;
+    }
+    for tool in ["losetup", "sgdisk", "sfdisk", "mkfs.ext4", "mount"] {
+        assert!(have(tool), "{tool} is required");
+    }
+    let work = tempfile::tempdir().expect("workdir");
+    let image = work.path().join("guarded.img");
+    let file = std::fs::File::create(&image).expect("create");
+    file.set_len(64 * 1024 * 1024).expect("size");
+    drop(file);
+    let loop_device = attach_loop(&image).expect("attach a loop device");
+    assert!(run(
+        "sgdisk",
+        &["--clear", "-n", "1:2048:+16M", "-t", "1:8300", &loop_device]
+    ));
+    let partition = format!("{loop_device}p1");
+    assert!(run("mkfs.ext4", &["-F", "-q", &partition]));
+    let dump = String::from_utf8_lossy(
+        &Command::new("sfdisk")
+            .args(["-d", &loop_device])
+            .output()
+            .expect("sfdisk -d")
+            .stdout,
+    )
+    .into_owned();
+    let plan = plan_layout_recreation(
+        Path::new(&loop_device),
+        &dump,
+        &[FilesystemSpec {
+            partition: 1,
+            fs_type: "ext4".to_owned(),
+            uuid: None,
+            label: None,
+            mount_point: None,
+        }],
+    )
+    .expect("plan");
+    let first_mib = || {
+        let mut bytes = vec![0_u8; 1024 * 1024];
+        use std::io::Read;
+        std::fs::File::open(&loop_device)
+            .expect("open")
+            .read_exact(&mut bytes)
+            .expect("read");
+        bytes
+    };
+
+    // Changed after review: the first megabyte no longer matches.
+    let reviewed = lr_rescue::capture_target(Path::new(&loop_device)).expect("facts");
+    assert!(run(
+        "sgdisk",
+        &["-n", "2:0:+8M", "-t", "2:8300", &loop_device]
+    ));
+    let before = first_mib();
+    let error = lr_rescue::apply_layout_recreation(&plan, &reviewed).expect_err("changed");
+    assert!(
+        matches!(error, lr_core::Error::TargetChanged),
+        "expected E_TARGET_CHANGED, got {error}"
+    );
+    assert_eq!(first_mib(), before, "a refused recreation must not write");
+
+    // Busy: a mounted partition is never reformatted.
+    let mountpoint = work.path().join("mnt");
+    std::fs::create_dir(&mountpoint).expect("mountpoint");
+    assert!(run(
+        "mount",
+        &[&partition, &mountpoint.display().to_string()]
+    ));
+    std::fs::write(mountpoint.join("keep.txt"), b"still here").expect("write");
+    let reviewed = lr_rescue::capture_target(Path::new(&loop_device)).expect("facts");
+    let error = lr_rescue::apply_layout_recreation(&plan, &reviewed).expect_err("busy");
+    assert!(
+        matches!(error, lr_core::Error::TargetBusy { .. }),
+        "expected E_TARGET_BUSY, got {error}"
+    );
+    assert_eq!(
+        std::fs::read(mountpoint.join("keep.txt")).expect("read back"),
+        b"still here"
+    );
+    assert!(run("umount", &[&mountpoint.display().to_string()]));
+    detach_loop(&loop_device);
 }
 
 /// Attach a sparse image to the first free loop device.
@@ -547,7 +636,7 @@ fn a_bare_metal_restore_from_the_medium_boots() {
         eprintln!("the static rescue CLI is not built; skipping");
         return;
     };
-    let work = tempfile::tempdir_in("/tmp/opencode").expect("workdir");
+    let work = tempfile::tempdir().expect("workdir");
     let secret = work.path().join("token.key");
     // A previous run may have left the shared ESP mount behind; that makes the
     // medium build fail, which must not silently turn into a skip.

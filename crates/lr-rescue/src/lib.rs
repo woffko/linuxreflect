@@ -565,28 +565,13 @@ pub fn plan_layout_recreation(
         .push(PlannedCommand::new("sfdisk", [&disk.display().to_string()]));
     for filesystem in filesystems {
         let device = partition_device(disk, filesystem.partition);
-        let program = format!("mkfs.{}", filesystem.fs_type);
-        let mut args = vec!["-F".to_owned(), device.display().to_string()];
-        if let Some(uuid) = &filesystem.uuid {
-            args.push("-U".to_owned());
-            args.push(uuid.clone());
-        }
-        if let Some(label) = &filesystem.label {
-            args.push("-L".to_owned());
-            args.push(label.clone());
-        }
         plan.steps.push(format!(
             "create {} on partition {} ({})",
             filesystem.fs_type,
             filesystem.partition,
             device.display()
         ));
-        plan.commands.push(PlannedCommand::new(program, args));
-        if filesystem.fs_type == "vfat" && filesystem.uuid.is_some() {
-            plan.warnings.push(
-                "vfat filesystems cannot be given a UUID; use the FAT serial instead".to_owned(),
-            );
-        }
+        plan.commands.push(formatter_command(filesystem, &device)?);
     }
     plan.steps
         .push("reinstall the bootloader and run boot repair".to_owned());
@@ -595,11 +580,146 @@ pub fn plan_layout_recreation(
     Ok(plan)
 }
 
-/// Write the `sfdisk` dump into `sfdisk`'s stdin, then run the rest.
+/// Filesystem types a layout recreation can create.
+pub const SUPPORTED_FILESYSTEMS: &[&str] =
+    &["ext2", "ext3", "ext4", "xfs", "btrfs", "vfat", "swap"];
+
+/// The formatter invocation for one filesystem.
+///
+/// Formatters disagree on flags (`mkfs.fat -F` takes the FAT size, `mkfs.xfs`
+/// forces with `-f` and sets the UUID with `-m uuid=`), so each supported type
+/// is spelled out; anything else is refused rather than guessed.
+fn formatter_command(filesystem: &FilesystemSpec, device: &Path) -> Result<PlannedCommand> {
+    let fs_type = filesystem.fs_type.as_str();
+    let uuid = filesystem.uuid.as_deref();
+    let label = filesystem.label.as_deref();
+    if let Some(label) = label {
+        validate_label(label)?;
+    }
+    let mut args: Vec<String> = Vec::new();
+    let program = match fs_type {
+        "ext2" | "ext3" | "ext4" | "btrfs" => {
+            args.extend(
+                if fs_type == "btrfs" {
+                    ["-f", "-q"]
+                } else {
+                    ["-F", "-q"]
+                }
+                .map(String::from),
+            );
+            if let Some(uuid) = uuid {
+                args.extend(["-U".to_owned(), canonical_uuid(uuid)?]);
+            }
+            if let Some(label) = label {
+                args.extend(["-L".to_owned(), label.to_owned()]);
+            }
+            format!("mkfs.{fs_type}")
+        }
+        "xfs" => {
+            args.extend(["-f", "-q"].map(String::from));
+            if let Some(uuid) = uuid {
+                args.extend(["-m".to_owned(), format!("uuid={}", canonical_uuid(uuid)?)]);
+            }
+            if let Some(label) = label {
+                args.extend(["-L".to_owned(), label.to_owned()]);
+            }
+            "mkfs.xfs".to_owned()
+        }
+        "vfat" => {
+            if let Some(uuid) = uuid {
+                args.extend(["-i".to_owned(), fat_volume_id(uuid)?]);
+            }
+            if let Some(label) = label {
+                args.extend(["-n".to_owned(), label.to_owned()]);
+            }
+            "mkfs.fat".to_owned()
+        }
+        "swap" => {
+            if let Some(uuid) = uuid {
+                args.extend(["-U".to_owned(), canonical_uuid(uuid)?]);
+            }
+            if let Some(label) = label {
+                args.extend(["-L".to_owned(), label.to_owned()]);
+            }
+            "mkswap".to_owned()
+        }
+        other => {
+            return Err(Error::unsupported(format!(
+                "cannot recreate a `{other}` filesystem; supported: {}",
+                SUPPORTED_FILESYSTEMS.join(", ")
+            )));
+        }
+    };
+    args.push(device.display().to_string());
+    Ok(PlannedCommand::new(program, args))
+}
+
+/// A standard UUID (`8-4-4-4-12` hex digits), lowercased.
+fn canonical_uuid(text: &str) -> Result<String> {
+    let groups: Vec<&str> = text.split('-').collect();
+    let well_formed = groups.len() == 5
+        && groups
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(group, len)| group.len() == len && group.chars().all(|c| c.is_ascii_hexdigit()));
+    if !well_formed {
+        return Err(Error::unsupported(format!(
+            "`{text}` is not a filesystem UUID"
+        )));
+    }
+    Ok(text.to_ascii_lowercase())
+}
+
+/// A FAT volume ID as `blkid` prints it (`1234-ABCD`) turned into the eight
+/// hex digits `mkfs.fat -i` expects.
+fn fat_volume_id(text: &str) -> Result<String> {
+    let digits: String = text.chars().filter(|c| *c != '-').collect();
+    if digits.len() != 8 || !digits.chars().all(|c| c.is_ascii_hexdigit()) || text.len() > 9 {
+        return Err(Error::unsupported(format!(
+            "`{text}` is not a FAT volume ID (expected XXXX-XXXX)"
+        )));
+    }
+    Ok(digits.to_ascii_uppercase())
+}
+
+/// Labels are passed as a separate argument, but one starting with `-` would
+/// still read as an option to some formatters.
+fn validate_label(label: &str) -> Result<()> {
+    if label.is_empty() || label.starts_with('-') || label.chars().any(char::is_control) {
+        return Err(Error::unsupported(format!(
+            "`{label}` cannot be used as a filesystem label"
+        )));
+    }
+    Ok(())
+}
+
+/// Capture the facts a later [`apply_layout_recreation`] re-checks.
 ///
 /// # Errors
-/// Returns [`Error::Unsupported`] when a command is missing or fails.
-pub fn apply_layout_recreation(plan: &LayoutPlan) -> Result<RepairReport> {
+/// Returns [`Error::Io`] when the disk cannot be inspected.
+pub fn capture_target(disk: &Path) -> Result<lr_engine::restore::TargetFacts> {
+    lr_engine::restore::TargetFacts::read(disk)
+}
+
+/// Write the `sfdisk` dump into `sfdisk`'s stdin, then run the rest.
+///
+/// Immediately before the first write the disk is re-read and compared with
+/// `expected` (the facts the operator reviewed), and it must not be mounted,
+/// held, used as swap or back the running system (spec §H.2, §H.3).
+///
+/// # Errors
+/// Returns [`Error::TargetChanged`] when the disk is not the one reviewed,
+/// [`Error::TargetBusy`] when it is in use, and [`Error::Unsupported`] when a
+/// command is missing or fails.
+pub fn apply_layout_recreation(
+    plan: &LayoutPlan,
+    expected: &lr_engine::restore::TargetFacts,
+) -> Result<RepairReport> {
+    let current = lr_engine::restore::TargetFacts::read(&plan.disk)?;
+    if !current.matches(expected) {
+        return Err(Error::TargetChanged);
+    }
+    lr_engine::target::preflight_target(&plan.disk)?;
     let mut completed = Vec::new();
     let mut output = Vec::new();
     let mut dump_written = false;
@@ -660,7 +780,7 @@ mod tests {
 
     #[test]
     fn a_uefi_repair_installs_the_fallback_loader() {
-        let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+        let dir = tempfile::tempdir().expect("tempdir");
         let esp = dir.path().join("esp");
         std::fs::create_dir_all(&esp).expect("esp");
         let loader = dir.path().join("shim.efi");
@@ -714,7 +834,7 @@ mod tests {
 
     #[test]
     fn uefi_repair_needs_to_know_where_the_esp_is() {
-        let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+        let dir = tempfile::tempdir().expect("tempdir");
         let disk = dir.path().join("disk.img");
         std::fs::write(&disk, b"disk").expect("disk");
         let error = plan_boot_repair(
@@ -730,7 +850,7 @@ mod tests {
 
     #[test]
     fn a_bios_repair_only_reinstalls_when_the_layout_changed() {
-        let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+        let dir = tempfile::tempdir().expect("tempdir");
         let disk = dir.path().join("disk.img");
         std::fs::write(&disk, b"disk").expect("disk");
         let unchanged = plan_boot_repair(
@@ -772,7 +892,7 @@ mod tests {
                 FilesystemSpec {
                     partition: 2,
                     fs_type: "ext4".to_owned(),
-                    uuid: Some("1111-2222".to_owned()),
+                    uuid: Some("11111111-2222-3333-4444-555555555555".to_owned()),
                     label: None,
                     mount_point: Some("/".to_owned()),
                 },
@@ -796,6 +916,61 @@ mod tests {
             mkfs[1].args.iter().any(|arg| arg == "-U"),
             "the UUID is preserved so fstab and the bootloader keep working"
         );
+    }
+
+    fn one_filesystem(fs_type: &str, uuid: Option<&str>, label: Option<&str>) -> FilesystemSpec {
+        FilesystemSpec {
+            partition: 1,
+            fs_type: fs_type.to_owned(),
+            uuid: uuid.map(str::to_owned),
+            label: label.map(str::to_owned),
+            mount_point: None,
+        }
+    }
+
+    fn formatter(spec: FilesystemSpec) -> crate::Result<crate::PlannedCommand> {
+        let dump = "label: gpt\n\n/dev/sda1 : start=2048, size=2048\n";
+        plan_layout_recreation(std::path::Path::new("/dev/sdz"), dump, &[spec])
+            .map(|plan| plan.commands[1].clone())
+    }
+
+    #[test]
+    fn each_formatter_gets_its_own_flags() {
+        let uuid = "0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0";
+        let xfs = formatter(one_filesystem("xfs", Some(uuid), Some("root"))).expect("xfs");
+        assert_eq!(xfs.program, "mkfs.xfs");
+        assert_eq!(
+            xfs.args,
+            [
+                "-f",
+                "-q",
+                "-m",
+                "uuid=0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+                "-L",
+                "root",
+                "/dev/sdz1"
+            ]
+        );
+        let fat = formatter(one_filesystem("vfat", Some("1234-abcd"), Some("ESP"))).expect("vfat");
+        assert_eq!(fat.program, "mkfs.fat");
+        assert_eq!(fat.args, ["-i", "1234ABCD", "-n", "ESP", "/dev/sdz1"]);
+        let btrfs = formatter(one_filesystem("btrfs", None, None)).expect("btrfs");
+        assert_eq!(btrfs.args, ["-f", "-q", "/dev/sdz1"]);
+        let swap = formatter(one_filesystem("swap", Some(uuid), None)).expect("swap");
+        assert_eq!(swap.program, "mkswap");
+        assert_eq!(swap.args.last().map(String::as_str), Some("/dev/sdz1"));
+    }
+
+    #[test]
+    fn unknown_or_malformed_filesystems_are_refused() {
+        for fs_type in ["ntfs", "../../tmp/x", "ext4 ", ""] {
+            let error = formatter(one_filesystem(fs_type, None, None)).expect_err(fs_type);
+            assert!(format!("{error}").contains("supported"), "{error}");
+        }
+        assert!(formatter(one_filesystem("ext4", Some("not-a-uuid"), None)).is_err());
+        assert!(formatter(one_filesystem("vfat", Some("12345-ABCD"), None)).is_err());
+        assert!(formatter(one_filesystem("ext4", None, Some("-O"))).is_err());
+        assert!(formatter(one_filesystem("ext4", None, Some(""))).is_err());
     }
 
     #[test]

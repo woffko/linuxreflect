@@ -89,7 +89,7 @@ fn schedule_list_reads_a_config_and_reports_missing_ones() {
     let stderr = String::from_utf8_lossy(&missing.stderr);
     assert!(stderr.contains("config.toml"), "stderr was: {stderr}");
 
-    let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+    let dir = tempfile::tempdir().expect("tempdir");
     let config = dir.path().join("config.toml");
     std::fs::write(
         &config,

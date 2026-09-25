@@ -348,7 +348,7 @@ mod tests {
 
     #[test]
     fn a_file_backend_reads_its_bytes() {
-        let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+        let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("raw.bin");
         let backend = patterned_file(&path, 64 * 1024).expect("backend");
         assert_eq!(backend.size_bytes(), 64 * 1024);
@@ -362,7 +362,7 @@ mod tests {
 
     #[test]
     fn a_sparse_file_reads_as_zeroes() {
-        let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+        let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("sparse.bin");
         write_sparse(&path, 1024 * 1024).expect("write");
         let backend = FileBackend::open(&path).expect("backend");

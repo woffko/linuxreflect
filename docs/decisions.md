@@ -1150,3 +1150,20 @@ test verifies that a group peer connects but cannot read the key, while the
 directory remains 0750. These are filesystem guarantees; activation, polkit,
 desktop installation and full restore acceptance remain separate gates tracked
 in `gui-revision-audit.md`.
+
+## D-105 — Rescue writes need `--confirm`, a reviewed target and a known formatter
+
+Spec §H.2's token belongs to `RestoreImage`; the rescue tool is a separate,
+local, root-only command, so it does not issue tokens. It keeps the parts of
+the restore boundary that still apply: `boot-repair` and `recreate-layout`
+write only with `--confirm` (without it they print the plan and exit
+non-zero), and a layout recreation re-reads the disk's `TargetFacts` captured
+with the reviewed plan and runs the §H.3 busy checks immediately before the
+first write. Boot repair is not busy-checked because it works on an ESP the
+operator may have mounted on purpose.
+
+Layout recreation accepts only `ext2`, `ext3`, `ext4`, `xfs`, `btrfs`, `vfat`
+and `swap`, each with the flags its own formatter documents; the previous
+universal `mkfs.<fs> -F -U -L` form broke `mkfs.fat` and `mkfs.xfs` and let
+an arbitrary string choose the program. Other filesystems are refused rather
+than guessed.

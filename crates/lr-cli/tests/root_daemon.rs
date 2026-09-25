@@ -352,7 +352,7 @@ impl LoopDisk {
         if !have("losetup") || !have("mkfs.ext4") {
             return None;
         }
-        let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+        let dir = tempfile::tempdir().expect("tempdir");
         let backing = dir.path().join("disk.img");
         let file = std::fs::File::create(&backing).expect("create");
         file.set_len(size_mib * 1024 * 1024).expect("size");
@@ -379,7 +379,7 @@ impl LoopDisk {
             let _ = run("losetup", &["-d", &device.display().to_string()]);
             return None;
         }
-        let mount_dir = tempfile::tempdir_in("/tmp/opencode").expect("mountdir");
+        let mount_dir = tempfile::tempdir().expect("mountdir");
         Some(Self { device, mount_dir })
     }
 
@@ -458,7 +458,7 @@ fn a_loop_device_round_trips_through_the_daemon() {
         "the daemon created the socket group"
     );
 
-    let work = tempfile::tempdir_in("/tmp/opencode").expect("workdir");
+    let work = tempfile::tempdir().expect("workdir");
     let dest = work.path().join("out");
     let created = daemon.cli(&[
         "backup",
@@ -578,7 +578,7 @@ fn polkit_denies_a_non_root_peer_and_allows_root() {
         eprintln!("the daemon did not start; skipping");
         return;
     };
-    let work = tempfile::tempdir_in("/tmp/opencode").expect("workdir");
+    let work = tempfile::tempdir().expect("workdir");
     let source = work.path().join("source.img");
     let file = std::fs::File::create(&source).expect("create");
     file.set_len(64 * 1024 * 1024).expect("size");

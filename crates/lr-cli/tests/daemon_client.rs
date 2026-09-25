@@ -26,7 +26,7 @@ struct Daemon {
 impl Daemon {
     fn start(auth: &str) -> Option<Self> {
         let binary = daemon_binary()?;
-        let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+        let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("daemon.sock");
         let child = Command::new(binary)
             .args([
@@ -128,7 +128,7 @@ fn the_cli_round_trips_through_the_daemon() {
         eprintln!("the daemon binary is not built next to the CLI; skipping");
         return;
     };
-    let work = tempfile::tempdir_in("/tmp/opencode").expect("workdir");
+    let work = tempfile::tempdir().expect("workdir");
     let Some(source) = source_image(work.path()) else {
         return;
     };
@@ -293,7 +293,7 @@ fn the_cli_round_trips_a_file_tree_through_the_daemon() {
         eprintln!("the daemon binary is not built next to the CLI; skipping");
         return;
     };
-    let work = tempfile::tempdir_in("/tmp/opencode").expect("workdir");
+    let work = tempfile::tempdir().expect("workdir");
     let source = work.path().join("tree");
     let dest = work.path().join("out");
     let target = work.path().join("restored");

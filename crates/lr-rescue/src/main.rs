@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use lr_rescue::{
     BootRepairOptions, FilesystemSpec, Firmware, apply_boot_repair, apply_layout_recreation,
-    plan_boot_repair, plan_layout_recreation,
+    capture_target, plan_boot_repair, plan_layout_recreation,
 };
 
 /// Rescue-mode operations.
@@ -22,6 +22,11 @@ struct Cli {
     /// JSON output.
     #[arg(long, global = true)]
     json: bool,
+
+    /// Required to write to a disk (`boot-repair`, `recreate-layout`); without
+    /// it the plan is printed and nothing is written.
+    #[arg(long, global = true)]
+    confirm: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -171,9 +176,9 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
                 layout_changed: *layout_changed,
             };
             let plan = plan_boot_repair(disk, &options)?;
-            if cli.dry_run {
+            if cli.dry_run || !cli.confirm {
                 print_plan(cli.json, &plan)?;
-                return Ok(());
+                return refuse_without_confirm(cli, disk);
             }
             let report = apply_boot_repair(&plan)?;
             if cli.json {
@@ -238,17 +243,23 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
                 .map(|text| parse_filesystem(text))
                 .collect::<anyhow::Result<Vec<_>>>()?;
             let plan = plan_layout_recreation(disk, &dump, &specs)?;
-            if cli.dry_run {
+            // The facts are taken with the plan the operator is shown, and
+            // re-read immediately before the first write.
+            let reviewed = capture_target(disk)?;
+            if cli.dry_run || !cli.confirm {
                 if cli.json {
                     println!("{}", serde_json::to_string_pretty(&plan)?);
                 } else {
                     for step in &plan.steps {
                         println!("would: {step}");
                     }
+                    for command in &plan.commands {
+                        println!("command: {}", command.display());
+                    }
                 }
-                return Ok(());
+                return refuse_without_confirm(cli, disk);
             }
-            let report = apply_layout_recreation(&plan)?;
+            let report = apply_layout_recreation(&plan, &reviewed)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -259,6 +270,19 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// A plan without `--confirm` is a preview: it succeeds under `--dry-run` and
+/// is an error otherwise, so a script that forgot the flag cannot mistake it
+/// for a completed repair.
+fn refuse_without_confirm(cli: &Cli, disk: &std::path::Path) -> anyhow::Result<()> {
+    if cli.dry_run {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "nothing was written to {}; review the plan above and rerun with --confirm",
+        disk.display()
+    )
 }
 
 fn print_plan(json: bool, plan: &lr_rescue::RepairPlan) -> anyhow::Result<()> {

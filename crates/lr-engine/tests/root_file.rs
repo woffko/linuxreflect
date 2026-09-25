@@ -110,7 +110,7 @@ fn device_nodes_ownership_and_xattrs_round_trip() {
             return;
         }
     }
-    let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+    let dir = tempfile::tempdir().expect("tempdir");
     let source = dir.path().join("source");
     let dest = dir.path().join("backups");
     let target = dir.path().join("restored");
@@ -181,7 +181,7 @@ fn one_file_system_does_not_cross_a_mount() {
     if !root_tests_enabled() {
         return;
     }
-    let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+    let dir = tempfile::tempdir().expect("tempdir");
     let source = dir.path().join("source");
     std::fs::create_dir_all(source.join("inside")).expect("dirs");
     std::fs::create_dir_all(source.join("mounted")).expect("mountpoint");
@@ -232,7 +232,7 @@ fn a_btrfs_source_is_snapshotted_for_point_in_time() {
             return;
         }
     }
-    let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+    let dir = tempfile::tempdir().expect("tempdir");
     let backing = dir.path().join("btrfs.img");
     let file = std::fs::File::create(&backing).expect("create");
     file.set_len(512 * 1024 * 1024).expect("size");

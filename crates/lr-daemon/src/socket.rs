@@ -242,7 +242,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_socket_is_bound_privately_and_never_twice() {
-        let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+        let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("daemon.sock");
         let (listener, origin) = listen(&path, None, false, None).await.expect("bind");
         assert_eq!(origin, Origin::Bound);
@@ -274,7 +274,7 @@ mod tests {
     #[tokio::test]
     async fn a_missing_group_degrades_to_root_only() {
         assert_eq!(lookup_group("linuxreflect-not-a-group"), None);
-        let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+        let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("daemon.sock");
         let (_listener, _origin) = listen(&path, Some("linuxreflect-not-a-group"), false, None)
             .await
@@ -285,7 +285,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_explicit_mode_is_honoured() {
-        let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+        let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("daemon.sock");
         let (_listener, _origin) = listen(&path, None, false, Some(0o666)).await.expect("bind");
         assert_eq!(mode_of(&path), 0o666);
@@ -298,7 +298,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_explicit_mode_wins_over_the_group() {
-        let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+        let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("daemon.sock");
         let (_listener, _origin) = listen(&path, Some("root"), false, Some(0o666))
             .await
@@ -315,7 +315,7 @@ mod tests {
         // Without root the chown fails and the mode stays 0600; the point is
         // that a known group never makes the socket world-accessible, and that
         // the directory never ends up more permissive than the socket.
-        let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+        let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("daemon.sock");
         let (_listener, _origin) = listen(&path, Some("root"), false, None)
             .await

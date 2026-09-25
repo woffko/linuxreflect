@@ -313,7 +313,7 @@ mod tests {
 
     #[test]
     fn sparse_files_report_their_holes() {
-        let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+        let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("sparse.bin");
         let file = std::fs::File::create(&path).expect("create");
         file.set_len(4 * 1024 * 1024).expect("size");
@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn attributes_round_trip_and_missing_names_fail() {
-        let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+        let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("xattr.bin");
         std::fs::write(&path, b"hello").expect("write");
         set_xattr(&path, b"user.lrtest", b"value").expect("setxattr");
@@ -344,7 +344,7 @@ mod tests {
 
     #[test]
     fn symlink_timestamps_are_set_on_the_link_itself() {
-        let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+        let dir = tempfile::tempdir().expect("tempdir");
         let target = dir.path().join("target");
         std::fs::write(&target, b"data").expect("write");
         let link = dir.path().join("link");
@@ -368,7 +368,7 @@ mod tests {
 
     #[test]
     fn device_nodes_can_be_created_when_privileged() {
-        let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+        let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("null");
         let mode = libc::S_IFCHR | 0o666;
         match mknod(&path, mode, libc::makedev(1, 3)) {
@@ -384,7 +384,7 @@ mod tests {
 
     #[test]
     fn timestamps_and_hole_punching_are_best_effort() {
-        let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+        let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("time.bin");
         std::fs::write(&path, b"0123456789").expect("write");
         set_times_nofollow(&path, 1_600_000_000, 0, 1_600_000_000, 0).expect("utimensat");

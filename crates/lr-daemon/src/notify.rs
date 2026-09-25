@@ -81,7 +81,7 @@ mod tests {
 
     #[test]
     fn notifications_reach_a_listening_socket() {
-        let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+        let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("notify.sock");
         let listener = std::os::unix::net::UnixDatagram::bind(&path).expect("bind");
         send_to(&path.to_string_lossy(), "READY=1").expect("send");

@@ -241,7 +241,7 @@ fn format(device: &Path, fs: Filesystem) -> bool {
 
 /// Back up, restore and check one filesystem (spec §K S17).
 fn round_trip(fs: Filesystem) {
-    let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+    let dir = tempfile::tempdir().expect("tempdir");
     let Some(source) = LoopDevice::attach(dir.path(), "source.img", fs.size_mib() * 1024 * 1024)
     else {
         return;
@@ -415,7 +415,7 @@ fn dm_flakey_bad_sectors_are_recorded_and_a_restore_refuses_them() {
         return;
     }
     const SIZE: u64 = 128 * 1024 * 1024;
-    let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+    let dir = tempfile::tempdir().expect("tempdir");
     let Some(source) = LoopDevice::attach(dir.path(), "flakey.img", SIZE) else {
         return;
     };
@@ -506,7 +506,7 @@ fn a_16_tb_virtual_disk_keeps_metadata_rss_bounded() {
         return;
     }
     const SIZE: u64 = 16 * 1000 * 1000 * 1000 * 1000; // 16 TB virtual
-    let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+    let dir = tempfile::tempdir().expect("tempdir");
     // Formatting a 16 TB filesystem takes about ten minutes, so a prepared
     // fixture may be reused (`LR_S17_HUGE_IMG=/path/to/huge.img`); the default
     // path creates and formats it.
@@ -536,13 +536,13 @@ fn a_16_tb_virtual_disk_keeps_metadata_rss_bounded() {
         }
     };
 
-    let cli = "/home/w0w/linuxreflect/target/debug/linuxreflect";
-    if !Path::new(cli).exists() {
+    let cli = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/linuxreflect");
+    if !cli.exists() {
         eprintln!("the CLI is not built; skipping");
         return;
     }
     let dest = dir.path().join("backups");
-    let mut child = Command::new(cli)
+    let mut child = Command::new(&cli)
         .args(["backup", "create", "--source"])
         .arg(source.path())
         .args(["--dest"])
@@ -767,7 +767,7 @@ fn start_nfs(work: &Path, dir: &Path, at: &Path) -> Option<String> {
 /// Interrupt a running backup by breaking the destination, then check the
 /// destination and a retry.
 fn interrupt_destination(mount: &Path, break_share: impl FnOnce(), label: &str) {
-    let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+    let dir = tempfile::tempdir().expect("tempdir");
     // A source large enough that the backup is still running when the share
     // goes away.
     let Some(source) = LoopDevice::attach(dir.path(), "source.img", 1024 * 1024 * 1024) else {
@@ -829,7 +829,7 @@ fn an_smb_destination_survives_an_interruption() {
     if !root_tests_enabled() {
         return;
     }
-    let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+    let dir = tempfile::tempdir().expect("tempdir");
     let share = dir.path().join("share");
     let mount = dir.path().join("cifs");
     let Some((mut smbd, _url)) = start_smb(dir.path(), &share, &mount) else {
@@ -856,7 +856,7 @@ fn an_nfs_destination_survives_an_interruption() {
     if !root_tests_enabled() {
         return;
     }
-    let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+    let dir = tempfile::tempdir().expect("tempdir");
     let export_dir = dir.path().join("export");
     let mount = dir.path().join("nfs");
     let Some(export) = start_nfs(dir.path(), &export_dir, &mount) else {
@@ -1169,7 +1169,7 @@ fn every_bootable_root_boots_under_bios_and_uefi_after_a_restore() {
             eprintln!("{} missing; skipping {}", fs.mkfs(), fs.name());
             continue;
         }
-        let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+        let dir = tempfile::tempdir().expect("tempdir");
         let Some(source) = bootable_disk(dir.path(), fs, &kernel) else {
             eprintln!("could not build the {} disk; skipping", fs.name());
             continue;
@@ -1234,7 +1234,7 @@ fn an_unaligned_tail_reads_without_direct_io() {
     }
     // 1 MiB + 512 bytes: the whole device is not 4 KiB-aligned.
     const SIZE: u64 = 1024 * 1024 + 512;
-    let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+    let dir = tempfile::tempdir().expect("tempdir");
     let Some(device) = LoopDevice::attach(dir.path(), "tail.img", SIZE) else {
         return;
     };

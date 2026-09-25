@@ -301,30 +301,43 @@ was performed.
 
 ## Acceptance checklist
 
-### Rescue command-boundary review: unresolved findings
+### Rescue command-boundary review: resolved (2026-09-25, D-105)
 
-Source inspection on 2026-09-24 (native LSP resolves the CLI apply call to
-`lr-rescue/src/lib.rs::apply_layout_recreation`) identified two remaining
-issues. These are source findings, not completed destructive-test evidence:
+The two source findings from 2026-09-24 are fixed:
 
-- **High priority — destructive confirmation boundary.**
-  `lr-rescue/src/main.rs::run` calls `apply_layout_recreation` immediately
-  after constructing a plan unless `--dry-run` was supplied. Its CLI has no
-  explicit confirmation/token fields. The apply function spawns the planned
-  `sfdisk` and filesystem commands without an application-level target-facts
-  recheck or confirmation check. The corresponding boot-repair branch also
-  directly applies its plan. The normal engine restore token guarantees must
-  not be attributed to these independent rescue commands. Resolve this
-  against the frozen rescue specification before claiming rescue safety.
-- **Functional compatibility — filesystem command construction.**
-  `plan_layout_recreation` constructs every formatter as `mkfs.<fs>` with
-  the same `-F`, `-U`, and `-L` options. This does not establish compatibility
-  with each formatter accepted through `--filesystem`; the parser accepts
-  any nonempty filesystem string. Validate supported types and use each
-  tool's documented arguments before running non-ext filesystem recreation.
+- **Confirmation boundary.** `linuxreflect-rescue boot-repair` and
+  `recreate-layout` now print the plan and exit non-zero unless `--confirm`
+  is given; `--dry-run` remains an explicit, successful preview.
+  `apply_layout_recreation` takes the `TargetFacts` captured with the
+  reviewed plan, re-reads them immediately before the first write
+  (`E_TARGET_CHANGED` on mismatch) and runs the engine's H.3
+  `preflight_target` (`E_TARGET_BUSY` for mounted, held, swap or running-root
+  disks). Boot repair gets the confirmation gate only: it legitimately works
+  on an ESP the operator may have mounted.
+- **Formatter construction.** Only `ext2`, `ext3`, `ext4`, `xfs`, `btrfs`,
+  `vfat` and `swap` are accepted, each with its own flags (`mkfs.xfs -f -m
+  uuid=`, `mkfs.fat -i <serial> -n <label>`, `mkfs.btrfs -f -U`, `mkswap -U`).
+  UUIDs, FAT serials and labels are validated; anything else, including a
+  type containing `/`, is refused before any command runs.
 
-No rescue write command was executed during this inspection. Existing
-historical rescue boot results do not close these findings.
+Evidence on this tree:
+
+- `cargo test -p lr-rescue`: 9 unit tests (including per-formatter argv and
+  refusal of unknown or malformed types) and 2 CLI tests (preview without
+  `--confirm` fails and leaves the disk byte-identical; an unsupported type is
+  refused before touching the disk) passed.
+- Root, owned loop devices only, binary
+  `root_rescue-2919894b788e770e`:
+  `recreating_a_layout_refuses_a_changed_or_busy_disk` passed in 3.39 s
+  (changed disk → `E_TARGET_CHANGED` with the first MiB unchanged; mounted
+  partition → `E_TARGET_BUSY` with its file intact) and
+  `recreating_a_layout_keeps_the_partition_and_filesystem_uuids` passed in
+  1.89 s. No skip output; `losetup -a` was empty afterwards.
+- Each planned formatter argv was run against a scratch file: `mkfs.xfs`,
+  `mkfs.fat`, `mkfs.ext4`, `mkfs.btrfs` and `mkswap` produced exactly the
+  requested UUID/serial and label according to `blkid`.
+
+Not covered: the rescue boot/medium root tests were not rerun for this change.
 
 ### Current file-mode root gate
 

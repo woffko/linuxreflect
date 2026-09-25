@@ -70,7 +70,7 @@ struct Sshd {
 
 impl Sshd {
     fn start() -> Option<Self> {
-        let owner = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+        let owner = tempfile::tempdir().expect("tempdir");
         let base = owner.path().to_path_buf();
         Self::start_in(base, Some(owner))
     }
@@ -306,7 +306,7 @@ fn an_sftp_destination_carries_a_chain() {
     if !root_tests_enabled() {
         return;
     }
-    let work = tempfile::tempdir_in("/tmp/opencode").expect("workdir");
+    let work = tempfile::tempdir().expect("workdir");
     std::fs::create_dir_all(work.path().join("served")).expect("served");
     let Some(mut server) = Sshd::start() else {
         return;
@@ -404,7 +404,7 @@ fn killing_the_server_mid_transfer_leaves_nothing_finalized() {
     // Let the short lease expire, restart the server on the same tree, and
     // resume: the stale lock is broken and the new job uses a new image UUID.
     std::thread::sleep(Duration::from_millis(2200));
-    let work = tempfile::tempdir_in("/tmp/opencode").expect("workdir");
+    let work = tempfile::tempdir().expect("workdir");
     let Some(source) = source_image(work.path()) else {
         return;
     };

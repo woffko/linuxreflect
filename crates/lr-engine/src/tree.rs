@@ -580,7 +580,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     fn temp() -> tempfile::TempDir {
-        tempfile::tempdir_in("/tmp/opencode").expect("tempdir")
+        tempfile::tempdir().expect("tempdir")
     }
 
     fn entry_for<'a>(tree: &'a super::WalkedTree, path: &str) -> &'a super::WalkedEntry {

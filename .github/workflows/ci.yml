@@ -18,6 +18,8 @@ jobs:
       - name: Toolchain
         run: rustup show && rustc --version
       - uses: Swatinem/rust-cache@v2
+      - name: Build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
       - name: rustfmt
         run: cargo fmt --all -- --check
       - name: clippy
@@ -30,6 +32,11 @@ jobs:
       - name: Toolchain
         run: rustup show && rustc --version
       - uses: Swatinem/rust-cache@v2
+      - name: Build and fixture dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler \
+            gdisk e2fsprogs xfsprogs btrfs-progs dosfstools fuse3
       - name: Tests (unprivileged)
         run: cargo test --workspace
 
@@ -45,9 +52,13 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
+      # A prebuilt cargo-audit: building it here would need a newer compiler
+      # than the toolchain this repository pins.
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      - name: cargo audit
+        run: cargo audit
 
   # Privileged acceptance tests (losetup, LVM, fsfreeze, xfs, qemu).
   #
@@ -67,7 +78,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential ca-certificates curl git \
+            build-essential ca-certificates curl git protobuf-compiler musl-tools \
             util-linux e2fsprogs xfsprogs lvm2 gdisk btrfs-progs dosfstools \
             qemu-system-x86 ovmf
       - name: Install Rust

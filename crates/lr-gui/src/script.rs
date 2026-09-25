@@ -238,7 +238,7 @@ mod tests {
 
     #[test]
     fn expectations_check_the_filesystem() {
-        let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+        let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("out.txt");
         std::fs::write(&path, b"hello scheduler").expect("write");
         assert!(check_expectation(&Step::ExpectFile(path.clone())).is_ok());
