@@ -305,15 +305,45 @@ fn sparse_holes(path: &Path, size: u64, warnings: &mut Vec<String>) -> Result<Ve
         return Ok(Vec::new());
     }
     let file = open_nofollow(path)?;
+    Ok(holes_from(
+        size,
+        |offset| lr_unsafe::filemeta::seek_data(&file, offset),
+        |offset| lr_unsafe::filemeta::seek_hole(&file, offset),
+        |error| {
+            warnings.push(format!(
+                "{}: cannot inspect sparse regions: {error}",
+                path.display()
+            ));
+        },
+    ))
+}
+
+/// The hole map of a file of `size` bytes, from its `SEEK_DATA` and
+/// `SEEK_HOLE` answers.
+///
+/// `Ok(None)` means `ENXIO`, "no data at or after this offset", and only
+/// that ends the walk with a trailing hole. Any error means there is no hole
+/// information: the whole file is then data (an empty map), so every byte is
+/// stored (R03). `EINVAL` and `ENOTSUP` are the normal answer of a filesystem
+/// without hole support and are not reported; other errors are.
+fn holes_from(
+    size: u64,
+    mut seek_data: impl FnMut(u64) -> std::io::Result<Option<u64>>,
+    mut seek_hole: impl FnMut(u64) -> std::io::Result<Option<u64>>,
+    mut warn: impl FnMut(&std::io::Error),
+) -> Vec<(u64, u64)> {
+    let mut no_information = |error: &std::io::Error| {
+        if !matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOTSUP)) {
+            warn(error);
+        }
+        Vec::new()
+    };
     let mut holes = Vec::new();
     let mut position = 0u64;
-    loop {
-        if position >= size {
-            break;
-        }
-        match lr_unsafe::filemeta::seek_data(&file, position) {
+    while position < size {
+        match seek_data(position) {
             Ok(Some(data)) if data > position => {
-                holes.push((position, data - position));
+                holes.push((position, data.min(size) - position));
                 position = data;
             }
             Ok(Some(_)) => {}
@@ -321,28 +351,23 @@ fn sparse_holes(path: &Path, size: u64, warnings: &mut Vec<String>) -> Result<Ve
                 holes.push((position, size - position));
                 break;
             }
-            Err(error) => {
-                warnings.push(format!(
-                    "{}: cannot inspect sparse regions: {error}",
-                    path.display()
-                ));
-                return Ok(Vec::new());
-            }
+            Err(error) => return no_information(&error),
         }
-        match lr_unsafe::filemeta::seek_hole(&file, position) {
+        if position >= size {
+            break;
+        }
+        match seek_hole(position) {
             Ok(Some(hole)) if hole > position => position = hole,
-            Ok(Some(_)) => {}
-            Ok(None) => break,
-            Err(error) => {
-                warnings.push(format!(
-                    "{}: cannot inspect sparse regions: {error}",
-                    path.display()
-                ));
-                return Ok(Vec::new());
+            // A hole at the data offset contradicts the previous answer;
+            // stop trusting the map rather than loop.
+            Ok(Some(_)) => {
+                return no_information(&std::io::Error::other("SEEK_HOLE and SEEK_DATA disagree"));
             }
+            Ok(None) => break,
+            Err(error) => return no_information(&error),
         }
     }
-    Ok(holes)
+    holes
 }
 
 /// Open a regular file for reading, refusing to follow a symbolic link.
@@ -581,6 +606,70 @@ mod tests {
 
     fn temp() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")
+    }
+
+    fn errno(code: i32) -> std::io::Error {
+        std::io::Error::from_raw_os_error(code)
+    }
+
+    #[test]
+    fn unsupported_hole_queries_mean_the_whole_file_is_data() {
+        // R03: a filesystem that answers EINVAL or ENOTSUP has no hole
+        // information, so nothing may be recorded as a hole and the whole
+        // file is stored.
+        for code in [libc::EINVAL, libc::ENOTSUP] {
+            let mut warned = 0;
+            let holes = super::holes_from(
+                8192,
+                |_| Err(errno(code)),
+                |_| Ok(Some(8192)),
+                |_| warned += 1,
+            );
+            assert!(holes.is_empty(), "errno {code}: {holes:?}");
+            assert_eq!(warned, 0, "an unsupported call is not a warning");
+
+            let holes = super::holes_from(
+                8192,
+                |offset| Ok(Some(offset)),
+                |_| Err(errno(code)),
+                |_| {},
+            );
+            assert!(holes.is_empty(), "errno {code} from SEEK_HOLE: {holes:?}");
+        }
+        let mut warned = 0;
+        let holes = super::holes_from(
+            8192,
+            |_| Err(errno(libc::EIO)),
+            |_| Ok(None),
+            |_| {
+                warned += 1;
+            },
+        );
+        assert!(holes.is_empty());
+        assert_eq!(warned, 1, "an unexpected error is reported");
+    }
+
+    #[test]
+    fn genuine_holes_are_still_mapped() {
+        // All hole: ENXIO at offset 0.
+        let holes = super::holes_from(4096, |_| Ok(None), |_| Ok(Some(0)), |_| {});
+        assert_eq!(holes, vec![(0, 4096)]);
+        // Hole, data, trailing hole.
+        let holes = super::holes_from(
+            12288,
+            |offset| Ok((offset < 8192).then_some(4096.max(offset))),
+            |offset| Ok(Some(if offset < 8192 { 8192 } else { 12288 })),
+            |_| {},
+        );
+        assert_eq!(holes, vec![(0, 4096), (8192, 4096)]);
+        // A contradictory answer stops trusting the map instead of looping.
+        let holes = super::holes_from(
+            4096,
+            |offset| Ok(Some(offset)),
+            |offset| Ok(Some(offset)),
+            |_| {},
+        );
+        assert!(holes.is_empty());
     }
 
     fn entry_for<'a>(tree: &'a super::WalkedTree, path: &str) -> &'a super::WalkedEntry {

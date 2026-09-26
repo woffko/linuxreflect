@@ -13,13 +13,13 @@ use std::path::Path;
 
 /// The next offset with data at or after `offset`, or `None` at end of file.
 ///
-/// `SEEK_DATA` is how file mode detects sparse regions (spec §F, §K S12). A
-/// filesystem that does not implement it reports the whole file as data, which
-/// is the safe answer: holes are then simply not recorded.
+/// `SEEK_DATA` is how file mode detects sparse regions (spec §F, §K S12).
 ///
 /// # Errors
 /// Returns the raw `lseek` error, except that `ENXIO` (past the last data
-/// extent) becomes `Ok(None)`.
+/// extent) becomes `Ok(None)`. `EINVAL` or `ENOTSUP` from a file that does
+/// not support the call is an error, never "no more data": the caller must
+/// then treat the whole file as data (R03).
 pub fn seek_data(fd: &impl AsRawFd, offset: u64) -> io::Result<Option<u64>> {
     seek(fd, offset, libc::SEEK_DATA)
 }
@@ -42,10 +42,10 @@ fn seek(fd: &impl AsRawFd, offset: u64, whence: libc::c_int) -> io::Result<Optio
     }
     let error = io::Error::last_os_error();
     match error.raw_os_error() {
+        // Only ENXIO means "past the last data extent". An unsupported call
+        // (EINVAL, ENOTSUP) carries no hole information at all; reporting it
+        // as `None` made the caller record the rest of the file as a hole.
         Some(libc::ENXIO) => Ok(None),
-        // Filesystems without hole support report data/ENOTSUP; treating that
-        // as "no information" keeps the walk correct.
-        Some(libc::ENOTSUP | libc::EINVAL) => Ok(None),
         _ => Err(error),
     }
 }
@@ -325,6 +325,17 @@ mod tests {
         // A freshly sized file is one big hole, so seeking to data reaches EOF.
         assert_eq!(seek_hole(&file, 0).expect("hole"), Some(0));
         assert_eq!(seek_data(&file, 0).expect("data"), None);
+    }
+
+    #[test]
+    fn an_unsupported_seek_is_an_error_not_the_end_of_data() {
+        // procfs files are seq_files, whose lseek refuses SEEK_DATA with
+        // EINVAL although they have content (R03).
+        let file = std::fs::File::open("/proc/self/status").expect("open procfs");
+        let error = seek_data(&file, 0).expect_err("SEEK_DATA is unsupported on procfs");
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL), "{error}");
+        let error = seek_hole(&file, 0).expect_err("SEEK_HOLE is unsupported on procfs");
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL), "{error}");
     }
 
     #[test]
