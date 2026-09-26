@@ -161,6 +161,11 @@ impl DestinationOptions {
 /// Returns [`Error::Unsupported`] for an unknown scheme or an SFTP option this
 /// build cannot honour, and propagates connection errors.
 pub fn open(uri: &str, options: &DestinationOptions) -> Result<std::sync::Arc<dyn Destination>> {
+    // The set name becomes a directory; an empty one is allowed only for
+    // listing the sets (D-106), and anything else must match D-115.
+    if !options.set_name.is_empty() {
+        lr_core::validate_set_name(&options.set_name)?;
+    }
     let parsed = uri::parse(uri)?;
     let destination: std::sync::Arc<dyn Destination> = match parsed {
         DestinationUri::Local { path } => {

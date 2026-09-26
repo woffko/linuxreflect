@@ -215,9 +215,9 @@ pub fn load(path: &Path) -> Result<Config> {
 fn validate(config: &Config) -> Result<()> {
     let mut names = std::collections::BTreeSet::new();
     for job in &config.jobs {
-        if job.name.is_empty() {
-            return Err(Error::corrupt("a job has an empty name"));
-        }
+        lr_core::validate_job_name(&job.name).map_err(|error| Error::corrupt(error.to_string()))?;
+        lr_core::validate_set_name(&job.set)
+            .map_err(|error| Error::corrupt(format!("job {}: {error}", job.name)))?;
         if !names.insert(job.name.clone()) {
             return Err(Error::corrupt(format!("duplicate job name {}", job.name)));
         }

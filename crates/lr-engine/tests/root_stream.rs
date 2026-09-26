@@ -402,3 +402,86 @@ fn btrfs_full_then_incremental_round_trips() {
         "extra subvolumes were left behind: {paths:?}"
     );
 }
+
+/// The snapshot cleanup of a Btrfs stream backup touches only its own
+/// snapshots (R02, D-115): foreign subvolumes, directories and files in the
+/// set's state directory survive, and a set name of `..` is refused before
+/// anything is mounted.
+#[test]
+#[ignore = "needs root, loop devices and btrfs-progs"]
+fn btrfs_cleanup_stays_inside_its_own_snapshots() {
+    if !root_tests_enabled() {
+        return;
+    }
+    for tool in ["btrfs", "mkfs.btrfs"] {
+        if !have(tool) {
+            lr_testkit::unavailable!("{tool} missing");
+        }
+    }
+    let source = LoopDisk::attach(512 * 1024 * 1024).expect("source loop device");
+    if !run("mkfs.btrfs", &["-q", "-f", &source.path()]) {
+        lr_testkit::fixture_failed!("mkfs.btrfs failed");
+    }
+    let work = tempfile::tempdir().expect("workdir");
+    let top = Mount::btrfs(&source.device, &work.path().join("top"), None).expect("mount top");
+    let subvol = |path: &Path| {
+        assert!(run(
+            "btrfs",
+            &["subvolume", "create", &path.display().to_string()]
+        ));
+    };
+    subvol(&top.path().join("@"));
+    let root_subvol =
+        Mount::btrfs(&source.device, &work.path().join("src-root"), Some("/@")).expect("mount @");
+    write_file(&root_subvol.path().join("etc/f1"), "one\n");
+
+    let dest = work.path().join("images");
+    std::fs::create_dir_all(&dest).expect("dest");
+
+    // `..` is refused before any mount or snapshot: the state directory
+    // would otherwise be the top level, and cleanup would prune `@`.
+    let Err(error) = BackupRequest::new(&source.device, &dest, "..", Encryption::NoEncrypt) else {
+        panic!("a set name of `..` must be refused");
+    };
+    assert!(error.to_string().contains("invalid set name"), "{error}");
+
+    let mut first =
+        BackupRequest::new(&source.device, &dest, "set", Encryption::NoEncrypt).expect("request");
+    first.compression = Compression::None;
+    backup_image(&first).expect("first stream backup");
+    let set_dir = top.path().join(".linuxreflect/set");
+    let first_dir = set_dir.join(first.image_uuid.to_string());
+    assert!(first_dir.is_dir(), "the first image keeps its snapshots");
+
+    // Foreign entries in the set's state directory: a subvolume and a
+    // directory with non-UUID names, and a UUID-named directory holding a
+    // plain file rather than a snapshot.
+    subvol(&set_dir.join("foreign-subvol"));
+    write_file(&set_dir.join("foreign-subvol/keep"), "subvolume\n");
+    write_file(&set_dir.join("notes/keep"), "directory\n");
+    let stray = set_dir.join("abababab-abab-abab-abab-abababababab");
+    write_file(&stray.join("keep"), "plain file\n");
+
+    let mut second =
+        BackupRequest::new(&source.device, &dest, "set", Encryption::NoEncrypt).expect("request");
+    second.set_id = first.set_id;
+    second.chain_id = first.chain_id;
+    second.compression = Compression::None;
+    second.member_type = MemberType::Incremental;
+    second.parent = Some("latest".to_owned());
+    backup_image(&second).expect("second stream backup");
+
+    assert!(
+        !first_dir.exists(),
+        "the previous image's snapshots are pruned"
+    );
+    assert!(set_dir.join(second.image_uuid.to_string()).is_dir());
+    for kept in [
+        set_dir.join("foreign-subvol/keep"),
+        set_dir.join("notes/keep"),
+        stray.join("keep"),
+        root_subvol.path().join("etc/f1"),
+    ] {
+        assert!(kept.exists(), "{} was removed by cleanup", kept.display());
+    }
+}

@@ -176,16 +176,7 @@ impl TreeSnapshot {
         // parent of *this* image is not needed any more either: the next
         // incremental uses this image's snapshots.
         let keep = self.image_prefix();
-        for entry in std::fs::read_dir(&self.set_dir).map_err(Error::Io)? {
-            let entry = entry.map_err(Error::Io)?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy().into_owned();
-            if name == "latest" || name == keep {
-                continue;
-            }
-            let path = entry.path();
-            let _ = delete_tree(&path);
-        }
+        prune_image_dirs(&self.set_dir, &keep)?;
         self.committed = true;
         Ok(())
     }
@@ -342,6 +333,10 @@ impl BtrfsProvider {
     /// [`Error::Unsupported`], and [`Error::StreamParentMissing`] when an
     /// incremental was required but its parent is gone.
     pub fn create(&self, src: &SourceLayout, opts: &TreeSnapshotOpts) -> Result<TreeSnapshot> {
+        // The set name becomes a directory whose other entries are pruned on
+        // commit; `..` would make that the top level itself (R02, D-115).
+        // Refuse before anything is mounted.
+        lr_core::validate_set_name(&opts.set_name)?;
         match self.supports(src, &opts.general) {
             Support::Yes => {}
             Support::No(reason) => {
@@ -367,7 +362,7 @@ impl BtrfsProvider {
             .join(format!("btrfs-{}", &fs_uuid[..8.min(fs_uuid.len())]));
         mount_top_level(&src.device, &mountpoint)?;
         let top = mountpoint.clone();
-        let set_dir = top.join(STATE_DIR).join(sanitize_component(&opts.set_name));
+        let set_dir = top.join(STATE_DIR).join(&opts.set_name);
         std::fs::create_dir_all(&set_dir).map_err(Error::Io)?;
         let image_dir = set_dir.join(opts.image_uuid.to_string());
         std::fs::create_dir_all(&image_dir).map_err(Error::Io)?;
@@ -643,26 +638,6 @@ pub fn snapshot_name(subvol_path: &str, image_uuid: &Id) -> String {
     }
 }
 
-/// Escape a backup set name so it is one directory name.
-#[must_use]
-pub fn sanitize_component(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if cleaned.is_empty() {
-        "_".to_owned()
-    } else {
-        cleaned
-    }
-}
-
 fn latest_path(set_dir: &Path) -> PathBuf {
     set_dir.join("latest")
 }
@@ -778,23 +753,53 @@ fn subvolume_uuid(path: &Path) -> Result<Option<Id>> {
     Ok(None)
 }
 
-fn delete_tree(path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
+/// Delete the snapshots of every earlier image of this set.
+///
+/// Only this provider's own layout is touched (R02): a directory directly in
+/// `set_dir` whose name is an image UUID, and within it only the subvolumes
+/// directly inside, each removed with `btrfs subvolume delete`. Nothing is
+/// followed through a symlink, nothing is removed recursively, and an image
+/// directory is removed only once it is empty. Anything else in `set_dir`
+/// is left alone.
+fn prune_image_dirs(set_dir: &Path, keep: &str) -> Result<()> {
+    let set_meta = std::fs::symlink_metadata(set_dir).map_err(Error::Io)?;
+    if !set_meta.is_dir() {
+        return Err(Error::unsupported(format!(
+            "{} is not a directory; snapshots are not pruned",
+            set_dir.display()
+        )));
     }
-    // Delete any subvolumes below the directory first, then the directory.
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let child = entry.path();
-            let _ = run_ok("btrfs", &["subvolume", "delete", &path_text(&child)]);
-            if child.is_dir() {
-                let _ = delete_tree(&child);
+    for entry in std::fs::read_dir(set_dir).map_err(Error::Io)? {
+        let entry = entry.map_err(Error::Io)?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name == keep || !is_image_dir_name(name) {
+            continue;
+        }
+        // `file_type` does not follow symlinks.
+        if !entry.file_type().map_err(Error::Io)?.is_dir() {
+            continue;
+        }
+        let image_dir = entry.path();
+        let Ok(children) = std::fs::read_dir(&image_dir) else {
+            continue;
+        };
+        for child in children.flatten() {
+            if child.file_type().is_ok_and(|kind| kind.is_dir()) {
+                let _ = run_ok("btrfs", &["subvolume", "delete", &path_text(&child.path())]);
             }
         }
+        let _ = std::fs::remove_dir(&image_dir);
     }
-    let _ = run_ok("btrfs", &["subvolume", "delete", &path_text(path)]);
-    let _ = std::fs::remove_dir_all(path);
     Ok(())
+}
+
+/// Whether `name` is an image directory this provider creates: an image
+/// UUID in its canonical text form.
+fn is_image_dir_name(name: &str) -> bool {
+    name.parse::<Id>().is_ok_and(|id| id.to_string() == name)
 }
 
 fn run(program: &str, args: &[&str]) -> Result<()> {
@@ -940,7 +945,7 @@ pub fn set_default(top: &Path, subvolid: u64) -> Result<()> {
 mod tests {
     use super::{
         Incremental, TOP_LEVEL_SUBVOLID, TreeSnapshotOpts, escape_path, parse_mounted_subvolumes,
-        parse_subvol_options, sanitize_component,
+        parse_subvol_options,
     };
     use crate::test_layout::offline;
     use lr_core::{Id, SourceLayout, Support};
@@ -976,11 +981,43 @@ mod tests {
     }
 
     #[test]
-    fn set_names_are_reduced_to_one_component() {
-        assert_eq!(sanitize_component("nightly"), "nightly");
-        assert_eq!(sanitize_component("a/b c"), "a_b_c");
-        assert_eq!(sanitize_component("../x"), ".._x");
-        assert_eq!(sanitize_component(""), "_");
+    fn a_set_name_that_leaves_the_state_directory_is_refused_before_mounting() {
+        // The fixture device does not exist: had the name been accepted, the
+        // provider would fail later at `mount`, with a different error.
+        let provider = super::BtrfsProvider;
+        for name in ["..", ".", "a/b", ""] {
+            let mut opts = TreeSnapshotOpts::new(name, Id::from_bytes([9u8; 16]));
+            opts.mount_root = std::path::PathBuf::from("/nonexistent-lr-test");
+            let Err(error) = provider.create(&btrfs_layout(), &opts) else {
+                panic!("{name:?}: an invalid set name must be refused");
+            };
+            assert!(
+                error.to_string().contains("invalid set name"),
+                "{name:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_image_uuid_directories_are_pruned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let set_dir = dir.path();
+        let keep = Id::from_bytes([1u8; 16]).to_string();
+        let old = Id::from_bytes([0xabu8; 16]).to_string();
+        for name in [keep.as_str(), old.as_str(), "@home", "not-a-uuid"] {
+            std::fs::create_dir(set_dir.join(name)).expect("dir");
+            std::fs::write(set_dir.join(name).join("file"), b"data").expect("file");
+        }
+        std::fs::write(set_dir.join("latest"), b"").expect("latest");
+        super::prune_image_dirs(set_dir, &keep).expect("prune");
+        // Plain files are never deleted: only subvolumes are, by `btrfs`.
+        for name in [keep.as_str(), old.as_str(), "@home", "not-a-uuid"] {
+            assert!(set_dir.join(name).join("file").exists(), "{name}");
+        }
+        assert!(super::is_image_dir_name(&old));
+        assert!(!super::is_image_dir_name("@home"));
+        assert!(!super::is_image_dir_name(".."));
+        assert!(!super::is_image_dir_name(&old.to_uppercase()));
     }
 
     #[test]

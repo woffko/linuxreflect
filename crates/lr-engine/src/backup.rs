@@ -141,7 +141,8 @@ impl BackupRequest {
     /// A request with the spec defaults.
     ///
     /// # Errors
-    /// Propagates RNG failures while generating identifiers.
+    /// Returns [`Error::Unsupported`] for a set name outside D-115 and
+    /// propagates RNG failures while generating identifiers.
     pub fn new(
         source: impl Into<PathBuf>,
         dest_root: impl Into<PathBuf>,
@@ -150,6 +151,7 @@ impl BackupRequest {
     ) -> Result<Self> {
         let dest_root = dest_root.into();
         let set_name = set_name.into();
+        lr_core::validate_set_name(&set_name)?;
         Ok(Self {
             source: source.into(),
             dest_root,
@@ -204,6 +206,9 @@ impl BackupRequest {
     /// # Errors
     /// Propagates URI parsing, connection and authentication errors.
     pub fn open_destination(&self) -> Result<std::sync::Arc<dyn Destination>> {
+        // `set_name` is public and may have changed since `new`; every backup
+        // opens its destination before it snapshots anything.
+        lr_core::validate_set_name(&self.set_name)?;
         let mut options = self.destination_options.clone();
         options.set_name.clone_from(&self.set_name);
         let dest = if self.dest.is_empty() {

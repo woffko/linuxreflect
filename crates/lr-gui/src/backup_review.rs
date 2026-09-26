@@ -38,6 +38,12 @@ pub(crate) fn validate(spec: &BackupSpec) -> Result<(), &'static str> {
     if spec.dest.trim().is_empty() || spec.set.trim().is_empty() {
         return Err("Choose a backup destination and enter a backup name.");
     }
+    if lr_core::validate_set_name(&spec.set).is_err() {
+        return Err(
+            "A backup name starts with a letter or digit and uses only letters, \
+                    digits, '.', '_' and '-' (at most 64).",
+        );
+    }
     if !spec.no_encrypt && spec.passphrase_file.is_empty() {
         return Err("Choose a passphrase file for the encrypted backup.");
     }
@@ -90,6 +96,15 @@ mod tests {
         assert!(review.accept(original.clone(), &original));
         review.begin();
         assert!(review.take(&original).is_err());
+    }
+
+    #[test]
+    fn a_backup_name_that_leaves_its_directory_is_refused() {
+        let mut spec = spec();
+        for name in ["..", ".", "a/b", "my backup"] {
+            name.clone_into(&mut spec.set);
+            assert!(validate(&spec).is_err(), "{name}");
+        }
     }
 
     #[test]

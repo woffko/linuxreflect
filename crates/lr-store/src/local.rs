@@ -234,6 +234,9 @@ impl Drop for RefreshGuard {
 
 impl Destination for LocalDestination {
     fn open_set(&self, set: &SetId) -> Result<SetHandle> {
+        // Without a valid name the set directory would be the destination
+        // root or somewhere outside it (R02, D-115).
+        lr_core::validate_set_name(&self.set_name)?;
         let dir = self.set_dir();
         std::fs::create_dir_all(&dir).map_err(Error::Io)?;
         Ok(SetHandle {

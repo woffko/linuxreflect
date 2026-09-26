@@ -14,6 +14,7 @@ pub mod error;
 pub mod geometry;
 pub mod ids;
 pub mod io;
+pub mod names;
 pub mod sysfs;
 
 pub use caps::{Capabilities, Capability};
@@ -26,6 +27,7 @@ pub use discovery::{
 pub use error::{Error, Result};
 pub use geometry::Geometry;
 pub use ids::{ChainId, Id, ImageId, SetId};
+pub use names::{validate_job_name, validate_set_name};
 pub use sysfs::{SysfsBlockDevice, list_block_devices, read_holders, read_mountpoints};
 
 /// Image kinds (spec §D.1).
