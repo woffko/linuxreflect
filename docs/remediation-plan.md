@@ -73,6 +73,13 @@ Stop only on a genuine blocker.
 | 0.3 | Regression scaffold: `crates/lr-engine/tests/review_probes.rs` (external probes, inverted) and the independent audit's root probes (target mounted in another mount namespace, source mounted there, restore onto a dirty target), each `#[ignore = "known defect <ID>"]` until its fix lands | Makes the remaining defect count visible |
 | 0.4 | Feature freeze until phase 1 is done | — |
 
+**Status (alpha.2).** 0.1, 0.2 and 0.4 are done. For 0.3, every phase 1
+finding landed with its own regression test, written first and failing on the
+unfixed code, so phase 1 needed no separate scaffold. The external review asks
+that its probes not join the normal gate unchanged, and probes for findings
+that are still open stay out of the public repository. Each later finding
+lands with its inverted probe as its regression test.
+
 ## Phase 1 — data destruction, false guarantees, cryptography
 
 ### 1.1 Exclusive device claims — A1, A2, R05

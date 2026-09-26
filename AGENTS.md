@@ -95,7 +95,9 @@ the GUI on GNOME Wayland, the update handoff), the graphical rescue medium
 boots to the GUI with its own daemon under SeaBIOS and Secure Boot, and
 `v0.1.0-alpha.1` is published as a GitHub pre-release. Deferred by the
 maintainer: completing a backup from the GUI inside GNOME (needs an
-administrator at the polkit dialog). The test host `192.168.189.144` has a
+administrator at the polkit dialog). The test host (Ubuntu 22.04, GNOME 42;
+now `192.168.189.142`, a DHCP lease on VMnet8, so check it with
+`vmrun getGuestIPAddress 'D:\WSL_VMs\ubuntu\ubuntu.vmx'` when it moves) has a
 NOPASSWD sudo rule for `codex` (`/etc/sudoers.d/90-codex-test`) for testing
 only.
 
@@ -148,9 +150,14 @@ Privileged environments available for this machine, in order of preference:
 
 2. **Privileged container or VM** with `util-linux e2fsprogs xfsprogs lvm2 gdisk
    btrfs-progs dosfstools qemu-system-x86 ovmf` installed.
-3. **Remote test host** `codex@192.168.189.144`, after key-based SSH is
-   configured (`ssh-copy-id -i ~/.ssh/rustadmin_vm_ed25519.pub codex@192.168.189.144`).
+3. **Remote test host** `codex@192.168.189.142` (see above), after key-based SSH is
+   configured (`ssh-copy-id -i ~/.ssh/rustadmin_vm_ed25519.pub codex@192.168.189.142`).
    Never place a password in a command argument; ask the maintainer instead.
+
+After WSL restarts, polkitd is not running until something activates it and
+the nbd module is not loaded; `cargo xtask root` then reports the polkit and
+NBD scenarios as unavailable or failed. Prepare the host first:
+`wsl.exe -u root -- sh -c 'modprobe nbd nbds_max=16 && systemctl start polkit'`.
 
 Never weaken a test to make it pass unprivileged. Never use destructive commands
 on a device the test did not create itself (`losetup` images, `dm-flakey`, qemu
