@@ -720,6 +720,44 @@ fn start_smb(work: &Path, share: &Path, at: &Path) -> Option<(Child, String)> {
     lr_testkit::fixture_failed!("the SMB share never mounted")
 }
 
+/// Every mount stacked at `at`, removed on drop even when the test panics.
+///
+/// A `mount` abandoned by [`run_bounded`] leaves its `mount.cifs` helper
+/// running, and that helper can still complete a mount afterwards, stacked
+/// under the one the test uses. A lazy unmount only removes the top one, so
+/// this keeps detaching until `/proc/mounts` no longer lists `at`.
+struct MountLayers {
+    at: PathBuf,
+}
+
+impl MountLayers {
+    fn layers(&self) -> usize {
+        let target = format!(" {} ", self.at.display());
+        std::fs::read_to_string("/proc/mounts")
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains(&target))
+            .count()
+    }
+}
+
+impl Drop for MountLayers {
+    fn drop(&mut self) {
+        let at = self.at.display().to_string();
+        for attempt in 0..20 {
+            let layers = self.layers();
+            if layers == 0 {
+                return;
+            }
+            eprintln!("{at}: detaching {layers} remaining mount(s), attempt {attempt}");
+            // `-c` skips canonicalization, which would stat the dead share.
+            let _ = run_bounded(12, "umount", &["-l", "-c", &at]);
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        eprintln!("{at} is still mounted after 20 lazy unmounts");
+    }
+}
+
 /// Export `dir` over NFS to localhost and mount it at `at`.
 fn start_nfs(work: &Path, dir: &Path, at: &Path) -> Option<String> {
     if !have("exportfs") || !have("mount.nfs") {
@@ -825,6 +863,8 @@ fn an_smb_destination_survives_an_interruption() {
     let dir = tempfile::tempdir().expect("tempdir");
     let share = dir.path().join("share");
     let mount = dir.path().join("cifs");
+    // Declared before the server so it is dropped after the server stops.
+    let layers = MountLayers { at: mount.clone() };
     let Some((mut smbd, _url)) = start_smb(dir.path(), &share, &mount) else {
         return;
     };
@@ -840,6 +880,13 @@ fn an_smb_destination_survives_an_interruption() {
             let _ = run_bounded(12, "umount", &["-l", &mount_point]);
         },
         "smb",
+    );
+    drop(layers);
+    assert_eq!(
+        MountLayers { at: mount.clone() }.layers(),
+        0,
+        "the SMB share is still mounted at {}",
+        mount.display()
     );
 }
 
