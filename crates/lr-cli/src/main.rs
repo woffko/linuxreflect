@@ -885,6 +885,9 @@ fn verify(
     println!("pages:       {}", report.pages);
     println!("chunks:      {}", report.chunks);
     println!("bytes:       {}", report.bytes_checked);
+    for warning in &report.warnings {
+        eprintln!("warning: {warning}");
+    }
     Ok(())
 }
 

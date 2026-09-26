@@ -132,6 +132,8 @@ fn a_verified_image_reports_its_content() {
     assert!(verified.pages > 0, "pages are checked");
     assert!(verified.chunks > 0, "chunks are re-hashed");
     assert!(verified.bytes_checked > 0);
+    // A current writer keeps metadata nonces apart (D-110).
+    assert!(verified.warnings.is_empty(), "{:?}", verified.warnings);
 }
 
 #[test]

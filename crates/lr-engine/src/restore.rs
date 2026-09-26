@@ -503,8 +503,10 @@ pub fn prepare_restore(request: &PrepareRequest) -> Result<RestorePlan> {
     };
     let destination = lr_store::open(&location.dest, &options)?;
     let set = destination.open_set(&lr_core::SetId::ZERO)?;
-    let (_reader, _keys, superblock) =
+    let (mut reader, keys, superblock) =
         open_image(&*destination, &set, &location.name, &request.encryption)?;
+    let repeated_page_nonces = superblock.is_encrypted()
+        && reader.has_repeated_page_nonces(&keys.meta_key, superblock.aead_kind()?)?;
 
     // A whole-disk image is always a full image; block and stream images may be
     // chain members, and applying one needs every ancestor.
@@ -555,6 +557,9 @@ pub fn prepare_restore(request: &PrepareRequest) -> Result<RestorePlan> {
     }
     if !superblock.is_encrypted() {
         warnings.push("image is not encrypted and not tamper-evident".to_owned());
+    }
+    if repeated_page_nonces {
+        warnings.push(crate::verify::legacy_nonce_warning(&location.name));
     }
     match superblock.consistency {
         Consistency::None => warnings.push(

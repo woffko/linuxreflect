@@ -23,6 +23,9 @@ pub struct VerifyReport {
     pub chunks: u64,
     /// Pages per stream that were decrypted successfully.
     pub pages: Vec<(StreamId, usize)>,
+    /// Two metadata pages share a nonce (a pre-D-110 writer, see
+    /// [`ImageReader::has_repeated_page_nonces`]).
+    pub repeated_page_nonces: bool,
 }
 
 impl VerifyReport {
@@ -79,7 +82,9 @@ pub fn verify_structure<R: Read + Seek>(
         pages.push((stream, count));
     }
 
+    let repeated_page_nonces = image.has_repeated_page_nonces(&meta_key, kind)?;
     Ok(VerifyReport {
+        repeated_page_nonces,
         file_len: image.file_len(),
         data_end_offset: image.footer().data_end_offset,
         chunks,

@@ -56,6 +56,9 @@ pub struct VerifyReport {
     pub chunks: u64,
     /// Plaintext bytes covered by those chunks.
     pub bytes_checked: u64,
+    /// Findings that do not fail verification but need the user's attention.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 impl VerifyReport {
@@ -72,6 +75,16 @@ impl VerifyReport {
             self.bytes_checked
         )
     }
+}
+
+/// The warning for an encrypted image written before D-110.
+#[must_use]
+pub fn legacy_nonce_warning(name: &str) -> String {
+    format!(
+        "{name} was written before the metadata nonce fix (D-110): its manifest and \
+         extras reuse nonces under one key, so their confidentiality and integrity are \
+         weakened (chunk data is not affected); create a new full backup to replace this chain"
+    )
 }
 
 /// Verify an image, and with `chain` its whole ancestry.
@@ -114,6 +127,7 @@ pub fn verify_image(request: &VerifyRequest) -> Result<VerifyReport> {
         pages: 0,
         chunks: 0,
         bytes_checked: 0,
+        warnings: Vec::new(),
     };
 
     // 1. Structure, MACs and page tags, member by member.
@@ -134,6 +148,11 @@ pub fn verify_image(request: &VerifyRequest) -> Result<VerifyReport> {
         })?;
         report.pages += page_report.total_pages() as u64;
         report.members += 1;
+        if encrypted && page_report.repeated_page_nonces {
+            report
+                .warnings
+                .push(legacy_nonce_warning(&member.file_name));
+        }
     }
 
     // 2. Content: every stored chunk's plaintext must hash to the manifest.

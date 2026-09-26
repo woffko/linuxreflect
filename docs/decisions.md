@@ -1218,3 +1218,44 @@ usual dual licence, MIT OR Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`, and
 `license` in every crate). Third-party licences are unchanged: the GUI binary
 links Slint under its Royalty-Free 2.0 licence, whose attribution the window
 and the README carry (D-090).
+
+## D-110 — One metadata nonce counter per image; older encrypted images are flagged
+
+Every metadata stream of an image (manifest, hash index, extras and the
+overflow page table) is sealed under the same per-image `meta_key`. §G.4
+asks for "separate counters for `data_key` and `meta_key`", that is one
+counter per key, but each `PageStream` started its own counter at zero.
+Page 0 of the manifest and page 0 of the extras stream therefore shared a
+`(key, nonce)` pair (R01). Under AES-256-GCM or ChaCha20-Poly1305 that
+reveals the XOR of the two plaintexts and, for GCM, the authentication
+subkey, so the metadata of an encrypted image lost confidentiality and
+integrity. Chunk data is sealed under the separate `data_key` with one
+counter per image and was not affected.
+
+- **Fix without a format change.** `ImageWriter` owns the image's single
+  metadata `NonceSeq`, and every page stream draws from it through the
+  `PageSink` it writes to. Each page record already stores its nonce, so
+  readers are unchanged and the format version stays at v1.
+- **One writer per stream.** `ImageWriter` requires every stream's pages in
+  order from page 0 and refuses a stream that is written a second time;
+  a reader could not tell such pages from the first writer's.
+- **Existing images.** A pre-fix image always repeats a nonce across its
+  streams (every image has a manifest and an extras stream), and a current
+  image never does. `verify` and `restore prepare` read the page nonces and
+  add a warning for an *encrypted* image that repeats one. The image still
+  restores and verifies, because its tags are valid, but the warning
+  recommends a new full backup to replace the chain. Unencrypted images make
+  no confidentiality claim and get no extra warning. `prepare` checks the
+  image it was given; `verify --chain` checks every member.
+- **Argon2 budget (R11).** The KDF parameters are read from the superblock
+  before anything can be authenticated. `derive_kek` now refuses
+  `m > 1 GiB`, `t > 16`, `p > 16` or `m × t > 4 GiB passes` before Argon2
+  allocates anything. The spec default (256 MiB, 3, 4) is well inside that
+  budget. Derivations in one process are serialised, so a daemon running
+  several jobs never holds more than one KDF's memory at a time.
+
+Regression tests: `crates/lr-format/tests/nonces.rs` checks three things.
+Nonces are unique across all four streams under both AEADs. A reopened
+stream is refused. An image sealed the old way is recognised. The `kdf`
+unit tests check that an over-budget header fails immediately. The first two
+nonce tests and the budget test fail without the fix.

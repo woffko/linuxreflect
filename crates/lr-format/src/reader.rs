@@ -9,8 +9,9 @@
 use std::io::{Read, Seek, SeekFrom};
 
 use lr_core::{Error, Result};
+use lr_crypto::NONCE_LEN;
 use lr_crypto::aead::AeadKind;
-use lr_crypto::page::{PAGE_OVERHEAD, StreamId};
+use lr_crypto::page::{PAGE_HEADER_LEN, PAGE_OVERHEAD, StreamId};
 
 use crate::chunk::{CHUNK_OVERHEAD_PLAIN, decode_header};
 use crate::footer::FOOTER_SIZE;
@@ -140,6 +141,36 @@ impl<R: Read + Seek> ImageReader<R> {
             }
         }
         parse_table(&bytes)
+    }
+
+    /// Whether two metadata pages of this image share a nonce.
+    ///
+    /// Every page is sealed under the image's `meta_key`, so every nonce must
+    /// be unique (spec §G.4). Writers before D-110 started a counter per
+    /// stream, so their images always repeat nonces across streams.
+    ///
+    /// # Errors
+    /// Propagates page-table resolution and I/O errors.
+    pub fn has_repeated_page_nonces(
+        &mut self,
+        meta_key: &[u8; 32],
+        kind: AeadKind,
+    ) -> Result<bool> {
+        let mut table = self.page_table(meta_key, kind)?;
+        table.extend(self.footer.entries_for(StreamId::PageTable));
+        let mut seen = std::collections::HashSet::with_capacity(table.len());
+        for entry in table {
+            // The nonce is the last field of the page header.
+            let mut nonce = [0u8; NONCE_LEN];
+            self.reader.seek(SeekFrom::Start(
+                entry.offset + (PAGE_HEADER_LEN - NONCE_LEN) as u64,
+            ))?;
+            self.reader.read_exact(&mut nonce)?;
+            if !seen.insert(nonce) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Open one page stream for sequential reading.

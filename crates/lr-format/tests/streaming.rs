@@ -7,6 +7,7 @@
 
 use lr_core::Result;
 use lr_crypto::aead::AeadKind;
+use lr_crypto::nonce::NonceSeq;
 use lr_crypto::page::StreamId;
 use lr_format::{BlockEntry, BlockManifestHeader, ENTRY_LEN, PageSink, PageStream, STATE_STORED};
 
@@ -14,12 +15,24 @@ const META_KEY: [u8; 32] = [0x44; 32];
 const KIND: AeadKind = AeadKind::Aes256Gcm;
 
 /// A page sink that keeps nothing but counters.
-#[derive(Default)]
 struct CountingSink {
     pages: u64,
     ciphertext_bytes: u64,
     page_numbers_seen: u64,
     last_page_no: Option<u64>,
+    nonces: NonceSeq,
+}
+
+impl Default for CountingSink {
+    fn default() -> Self {
+        Self {
+            pages: 0,
+            ciphertext_bytes: 0,
+            page_numbers_seen: 0,
+            last_page_no: None,
+            nonces: NonceSeq::new(),
+        }
+    }
 }
 
 impl PageSink for CountingSink {
@@ -32,6 +45,10 @@ impl PageSink for CountingSink {
         self.pages += 1;
         self.ciphertext_bytes += page.len() as u64;
         Ok(())
+    }
+
+    fn meta_nonces(&mut self) -> &mut NonceSeq {
+        &mut self.nonces
     }
 }
 

@@ -25,6 +25,13 @@ pub trait PageSink {
     /// # Errors
     /// Implementation defined.
     fn write_page(&mut self, stream: StreamId, page_no: u64, page: &[u8]) -> Result<()>;
+
+    /// The image's single metadata nonce counter (spec §G.4).
+    ///
+    /// Every page stream of an image is sealed under the same `meta_key`, so
+    /// all of them must draw from this one counter; a counter per stream
+    /// repeated nonces across streams (R01, D-110).
+    fn meta_nonces(&mut self) -> &mut NonceSeq;
 }
 
 /// Buffers writes into page-sized payloads and seals them.
@@ -35,7 +42,6 @@ pub struct PageStream<'a> {
     meta_key: [u8; 32],
     page_len: usize,
     buf: Vec<u8>,
-    nonce_seq: NonceSeq,
     page_no: u64,
     pages: u64,
 }
@@ -74,7 +80,6 @@ impl<'a> PageStream<'a> {
             meta_key,
             page_len,
             buf: Vec::with_capacity(page_len),
-            nonce_seq: NonceSeq::new(),
             page_no: 0,
             pages: 0,
         }
@@ -128,7 +133,7 @@ impl<'a> PageStream<'a> {
             self.stream,
             self.page_no,
             &self.buf,
-            &mut self.nonce_seq,
+            self.sink.meta_nonces(),
             &mut page,
         )?;
         self.sink.write_page(self.stream, self.page_no, &page)?;
@@ -277,20 +282,34 @@ mod tests {
     use crate::wire::{ByteSource, Reader};
     use lr_core::Result;
     use lr_crypto::aead::AeadKind;
+    use lr_crypto::nonce::NonceSeq;
     use lr_crypto::page::StreamId;
     use std::io::Cursor;
 
     const META_KEY: [u8; 32] = [0x33; 32];
 
-    #[derive(Default)]
     struct MemorySink {
         pages: Vec<(StreamId, u64, Vec<u8>)>,
+        nonces: NonceSeq,
+    }
+
+    impl Default for MemorySink {
+        fn default() -> Self {
+            Self {
+                pages: Vec::new(),
+                nonces: NonceSeq::new(),
+            }
+        }
     }
 
     impl PageSink for MemorySink {
         fn write_page(&mut self, stream: StreamId, page_no: u64, page: &[u8]) -> Result<()> {
             self.pages.push((stream, page_no, page.to_vec()));
             Ok(())
+        }
+
+        fn meta_nonces(&mut self) -> &mut NonceSeq {
+            &mut self.nonces
         }
     }
 

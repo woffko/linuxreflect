@@ -221,6 +221,16 @@ fn image_file_round_trips_with_a_passphrase() {
         Encryption::Passphrase(Passphrase::new(passphrase.as_bytes().to_vec())),
     ))
     .expect("prepare");
+    // A current writer keeps metadata nonces apart, so there is no D-110
+    // warning for a fresh encrypted image.
+    assert!(
+        !plan
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("D-110")),
+        "{:?}",
+        plan.warnings
+    );
     let report = apply_restore(&ApplyRequest {
         token: plan.token,
         confirm: true,

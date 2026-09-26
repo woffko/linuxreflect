@@ -53,6 +53,10 @@ pub struct ImageWriter<W: Write + Seek> {
     page_table: Vec<PageEntry>,
     data_end_offset: Option<u64>,
     total_chunks: u64,
+    /// Next expected page number of each metadata stream, by stream id.
+    next_page: [u64; 5],
+    /// The one nonce counter for every page sealed under `meta_key`.
+    meta_nonces: NonceSeq,
 }
 
 impl<W: Write + Seek> ImageWriter<W> {
@@ -76,6 +80,8 @@ impl<W: Write + Seek> ImageWriter<W> {
             page_table: Vec::new(),
             data_end_offset: None,
             total_chunks: 0,
+            next_page: [0; 5],
+            meta_nonces: NonceSeq::new(),
         })
     }
 
@@ -224,7 +230,19 @@ impl<W: Write + Seek> ImageWriter<W> {
 }
 
 impl<W: Write + Seek> PageSink for ImageWriter<W> {
-    fn write_page(&mut self, stream: StreamId, _page_no: u64, page: &[u8]) -> Result<()> {
+    fn write_page(&mut self, stream: StreamId, page_no: u64, page: &[u8]) -> Result<()> {
+        // A stream written a second time would restart at page 0, so a
+        // reader could not tell its pages from the first writer's (D-110).
+        // Pages must arrive in order, each stream exactly once.
+        let expected = &mut self.next_page[usize::from(stream.as_u8())];
+        if page_no != *expected {
+            return Err(lr_core::Error::corrupt(format!(
+                "metadata stream {stream:?} page {page_no} written after page {}; \
+                 a stream may be written only once per image",
+                expected.wrapping_sub(1)
+            )));
+        }
+        *expected += 1;
         if self.data_end_offset.is_none() {
             self.data_end_offset = Some(self.position);
         }
@@ -237,6 +255,10 @@ impl<W: Write + Seek> PageSink for ImageWriter<W> {
         self.writer.write_all(page)?;
         self.position += page.len() as u64;
         Ok(())
+    }
+
+    fn meta_nonces(&mut self) -> &mut NonceSeq {
+        &mut self.meta_nonces
     }
 }
 
