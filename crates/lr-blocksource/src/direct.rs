@@ -8,9 +8,9 @@
 //! implicitly (spec §L.1: no silent downgrade).
 
 use std::fs::File;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::FileExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use lr_core::{Error, Result};
 use lr_unsafe::AlignedBuf;
@@ -39,6 +39,38 @@ fn alignment_for(path: &Path) -> usize {
     lbs.max(MIN_ALIGNMENT)
 }
 
+/// A busy device is reported as [`Error::TargetBusy`], anything else as
+/// the caller's error.
+fn busy_or(
+    path: &Path,
+    error: std::io::Error,
+    other: impl FnOnce(std::io::Error) -> Error,
+) -> Error {
+    if error.kind() == std::io::ErrorKind::ResourceBusy {
+        Error::TargetBusy {
+            holder: format!(
+                "{} is in use: it is mounted (possibly in another mount namespace), \
+                 held by another device, or claimed by another program",
+                path.display()
+            ),
+        }
+    } else {
+        other(error)
+    }
+}
+
+/// Open the same device again through `/proc/self/fd`, without `O_DIRECT`.
+///
+/// The new description refers to the open device, not to whatever the path
+/// names now, so a renamed or replaced node cannot redirect the write.
+fn reopen_buffered(fd: std::os::fd::RawFd, write: bool) -> Result<File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(write)
+        .open(format!("/proc/self/fd/{fd}"))
+        .map_err(Error::Io)
+}
+
 fn open_direct(path: &Path, write: bool) -> Result<OwnedFd> {
     lr_unsafe::open_o_direct(path, write).map_err(|e| {
         Error::unsupported(format!(
@@ -51,8 +83,6 @@ fn open_direct(path: &Path, write: bool) -> Result<OwnedFd> {
 /// A chunk-aligned reader.
 pub struct DirectBlockSource {
     handle: Handle,
-    /// Kept so an unaligned tail can be read without `O_DIRECT` (D-097).
-    path: PathBuf,
     size_bytes: u64,
     logical_block_size: u32,
     alignment: usize,
@@ -86,7 +116,6 @@ impl DirectBlockSource {
     fn finish(handle: Handle, path: &Path) -> Result<Self> {
         Ok(Self {
             handle,
-            path: path.to_path_buf(),
             size_bytes: device_size(path)?,
             logical_block_size: lr_unsafe::block_device_logical_sector_size(path).unwrap_or(512),
             alignment: alignment_for(path),
@@ -147,7 +176,10 @@ impl crate::BlockSource for DirectBlockSource {
         // (D-097). The data is identical; only the transfer mode differs.
         if matches!(self.handle, Handle::Direct(_)) && !want.is_multiple_of(self.alignment) {
             tracing::debug!(offset, want, "reading an unaligned tail without O_DIRECT");
-            let file = File::open(&self.path).map_err(Error::Io)?;
+            let Handle::Direct(fd) = &self.handle else {
+                unreachable!("checked above")
+            };
+            let file = reopen_buffered(fd.as_raw_fd(), false)?;
             return file
                 .read_at(&mut buf.as_mut_slice()[..want], offset)
                 .map_err(Error::Io);
@@ -164,41 +196,78 @@ impl crate::BlockSource for DirectBlockSource {
 /// A chunk-aligned writer used by restore.
 pub struct DirectBlockTarget {
     handle: Handle,
-    /// Kept so an unaligned tail can be written without `O_DIRECT` (D-097).
-    path: PathBuf,
     size_bytes: u64,
     logical_block_size: u32,
     alignment: usize,
 }
 
 impl DirectBlockTarget {
-    /// Open a device or file read-write with `O_DIRECT`.
+    /// Claim a device or file exclusively and open it read-write with
+    /// `O_DIRECT`.
+    ///
+    /// The claim (`O_EXCL`) is held until the target is dropped: a device
+    /// that is mounted anywhere, in any mount namespace, is refused, and
+    /// nothing can mount it while the restore writes (A1).
     ///
     /// # Errors
-    /// Returns [`Error::Unsupported`] when the path cannot be opened with
-    /// `O_DIRECT`, and [`Error::Io`] for other failures.
+    /// Returns [`Error::TargetBusy`] when the device is in use,
+    /// [`Error::Unsupported`] when it cannot be opened with `O_DIRECT`, and
+    /// [`Error::Io`] for other failures.
     pub fn open(path: &Path) -> Result<Self> {
-        let fd = open_direct(path, true)?;
+        let fd = lr_unsafe::open_block_exclusive(path, true, true).map_err(|error| {
+            busy_or(path, error, |error| {
+                Error::unsupported(format!(
+                    "O_DIRECT on {}: {error}; this device or filesystem cannot be used for \
+                     block I/O",
+                    path.display()
+                ))
+            })
+        })?;
         Self::finish(Handle::Direct(fd), path)
     }
 
-    /// Open a device or file read-write without `O_DIRECT`.
+    /// Claim a device or file exclusively and open it read-write without
+    /// `O_DIRECT`.
     ///
     /// # Errors
-    /// Propagates I/O errors.
+    /// Returns [`Error::TargetBusy`] when the device is in use and propagates
+    /// other I/O errors.
     pub fn open_buffered(path: &Path) -> Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(Error::Io)?;
-        Self::finish(Handle::Buffered(file), path)
+        let fd = lr_unsafe::open_block_exclusive(path, true, false)
+            .map_err(|error| busy_or(path, error, Error::Io))?;
+        Self::finish(Handle::Buffered(File::from(fd)), path)
+    }
+
+    /// Device number (`st_rdev`) of the claimed target, read from the open
+    /// descriptor, so it names the device this target will write.
+    ///
+    /// # Errors
+    /// Propagates `fstat` failures.
+    pub fn device_id(&self) -> Result<u64> {
+        use std::os::unix::fs::MetadataExt;
+        let fd = match &self.handle {
+            Handle::Direct(fd) => fd.try_clone(),
+            Handle::Buffered(file) => file.as_fd().try_clone_to_owned(),
+        }
+        .map_err(Error::Io)?;
+        Ok(File::from(fd).metadata().map_err(Error::Io)?.rdev())
+    }
+
+    /// A buffered read-write handle on the same claimed device, for writers
+    /// such as the GPT crate that need a `File` (see [`reopen_buffered`]).
+    ///
+    /// # Errors
+    /// Propagates the reopen failure.
+    pub fn buffered_handle(&self) -> Result<File> {
+        match &self.handle {
+            Handle::Direct(fd) => reopen_buffered(fd.as_raw_fd(), true),
+            Handle::Buffered(file) => file.try_clone().map_err(Error::Io),
+        }
     }
 
     fn finish(handle: Handle, path: &Path) -> Result<Self> {
         Ok(Self {
             handle,
-            path: path.to_path_buf(),
             size_bytes: device_size(path)?,
             logical_block_size: lr_unsafe::block_device_logical_sector_size(path).unwrap_or(512),
             alignment: alignment_for(path),
@@ -260,10 +329,7 @@ impl DirectBlockTarget {
                     // write would clobber the bytes after the chunk, so the
                     // unaligned tail is written buffered (D-097).
                     tracing::debug!(offset, len, "writing an unaligned tail without O_DIRECT");
-                    let file = std::fs::OpenOptions::new()
-                        .write(true)
-                        .open(&self.path)
-                        .map_err(Error::Io)?;
+                    let file = reopen_buffered(fd.as_raw_fd(), true)?;
                     return file
                         .write_all_at(&buf.as_slice()[..len], offset)
                         .map_err(Error::Io);

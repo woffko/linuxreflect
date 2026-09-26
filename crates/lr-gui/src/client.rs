@@ -243,6 +243,7 @@ impl Client {
         image: &str,
         target: &str,
         passphrase_file: &str,
+        replace_partition_table: bool,
     ) -> anyhow::Result<lr_proto::v1::RestorePlanInfo> {
         Ok(self
             .service()
@@ -250,6 +251,7 @@ impl Client {
                 image: image.to_owned(),
                 target: target.to_owned(),
                 passphrase_file: passphrase_file.to_owned(),
+                replace_partition_table,
                 ..RestoreSpec::default()
             })
             .await?

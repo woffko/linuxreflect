@@ -14,6 +14,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod aligned;
+pub mod beneath;
 pub mod directio;
 pub mod filemeta;
 
@@ -166,6 +167,40 @@ pub fn open_o_direct(path: &std::path::Path, write: bool) -> io::Result<OwnedFd>
     flags |= if write { libc::O_RDWR } else { libc::O_RDONLY };
     // SAFETY: `cpath` is a valid NUL-terminated C string, `flags` is a valid
     // open(2) flag set, and the returned descriptor is immediately wrapped.
+    let fd = unsafe { libc::open(cpath.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(last_os_error());
+    }
+    // SAFETY: `fd` is a freshly opened descriptor owned by us.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Open a device or file and claim it exclusively with `O_EXCL`.
+///
+/// On a block device `O_EXCL` without `O_CREAT` is the kernel's own "in use"
+/// check: it fails with `EBUSY` while the device is mounted in *any* mount
+/// namespace, held by md/dm/LVM, or claimed by another exclusive opener, and
+/// while the claim is held nobody else can mount or claim it. Sysfs and
+/// `mountinfo` checks cannot see mounts in other namespaces (A1, A2). On a
+/// regular file Linux ignores the flag. `direct` adds `O_DIRECT`.
+pub fn open_block_exclusive(
+    path: &std::path::Path,
+    write: bool,
+    direct: bool,
+) -> io::Result<OwnedFd> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let cpath = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let mut flags = libc::O_EXCL | libc::O_CLOEXEC;
+    flags |= if write { libc::O_RDWR } else { libc::O_RDONLY };
+    if direct {
+        flags |= libc::O_DIRECT;
+    }
+    // SAFETY: `cpath` is a valid NUL-terminated C string, `flags` is a valid
+    // open(2) flag set without `O_CREAT` (so no mode argument is read), and
+    // the returned descriptor is immediately wrapped.
     let fd = unsafe { libc::open(cpath.as_ptr(), flags) };
     if fd < 0 {
         return Err(last_os_error());

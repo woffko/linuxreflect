@@ -52,6 +52,7 @@ export component MainWindow inherits Window {
     in-out property <string> image-detail: "";
     in-out property <string> target: "";
     in-out property <string> restore-passphrase-file: "";
+    in-out property <bool> restore-replace-table: false;
     in-out property <string> restore-plan: "(no plan yet)";
     in-out property <string> restore-summary: "";
     in-out property <bool> show-restore-details: false;
@@ -629,6 +630,11 @@ export component MainWindow inherits Window {
                                             disk-path: root.disks[card.disk-index].path;
                                             disk-unavailable: root.disks[card.disk-index].restore-unavailable;
                                             select(row) => { root.choosing-restore-target = true; root.disk-selected(row); }
+                                        }
+                                        CheckBox {
+                                            text: "Replace the partition table when a single-partition backup goes onto a whole disk";
+                                            checked <=> root.restore-replace-table;
+                                            enabled: !root.busy;
                                         }
                                     }
 

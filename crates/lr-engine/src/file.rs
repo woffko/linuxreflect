@@ -414,7 +414,8 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
                         &writer_keys,
                         chunk_options,
                         &mut nonce_seq,
-                        &walk_root.join(std::ffi::OsStr::from_bytes(&entry.path)),
+                        walk.open_file(walked)?,
+                        &String::from_utf8_lossy(&entry.path),
                         &mut index,
                         &mut stored_chunks,
                         &mut deduplicated_chunks,
@@ -569,7 +570,8 @@ fn chunk_file<W: Write + Seek>(
     writer_keys: &WriterKeys,
     options: ChunkOptions,
     nonce_seq: &mut NonceSeq,
-    path: &Path,
+    file: std::fs::File,
+    name: &str,
     index: &mut BTreeMap<[u8; 32], BlockEntry>,
     stored_chunks: &mut u64,
     deduplicated_chunks: &mut u64,
@@ -577,7 +579,6 @@ fn chunk_file<W: Write + Seek>(
     processed: u64,
     seq_in_chain: u32,
 ) -> Result<Vec<[u8; 32]>> {
-    let file = tree::open_nofollow(path)?;
     let reader: Box<dyn Read> = Box::new(file);
     let chunker = StreamCDC::with_level(
         reader,
@@ -590,9 +591,8 @@ fn chunk_file<W: Write + Seek>(
     let mut hashes = Vec::new();
     let mut reported = processed;
     for chunk in chunker {
-        let chunk = chunk.map_err(|error| {
-            Error::corrupt(format!("chunking {} failed: {error}", path.display()))
-        })?;
+        let chunk =
+            chunk.map_err(|error| Error::corrupt(format!("chunking {name} failed: {error}")))?;
         reported += chunk.length as u64;
         reporter.report(reported)?;
         let hash = lr_crypto::content_hash(&writer_keys.dedup_key, &chunk.data);
@@ -757,15 +757,14 @@ pub fn restore_file(request: &FileRestoreRequest) -> Result<FileRestoreReport> {
     }
     let hardlink_targets: BTreeMap<u32, PathBuf> = group_paths
         .iter()
-        .map(|(group, path)| {
-            (
-                *group,
-                request.target.join(std::ffi::OsStr::from_bytes(path)),
-            )
-        })
+        .map(|(group, path)| (*group, PathBuf::from(std::ffi::OsStr::from_bytes(path))))
         .collect();
 
+    // Nothing is written before the whole tree is known to stay inside the
+    // target (R06).
+    validate_tree(&final_entries)?;
     prepare_target(&request.target, request.merge)?;
+    let root = tree::RestoreRoot::open(&request.target)?;
 
     let total_bytes: u64 = final_entries
         .values()
@@ -827,7 +826,7 @@ pub fn restore_file(request: &FileRestoreRequest) -> Result<FileRestoreReport> {
             Ok(())
         };
         tree::restore_entry(
-            &request.target,
+            &root,
             &record.entry,
             &record.holes,
             &hardlink_targets,
@@ -842,10 +841,7 @@ pub fn restore_file(request: &FileRestoreRequest) -> Result<FileRestoreReport> {
         .map(|record| record.entry.clone())
         .collect();
     for entry in tree::deepest_first(&entries) {
-        let path = request
-            .target
-            .join(std::ffi::OsStr::from_bytes(&entry.path));
-        if let Err(error) = tree::apply_metadata(&path, entry) {
+        if let Err(error) = tree::apply_metadata(&root, entry) {
             if entry.file_kind == lr_format::FILE_KIND_SPECIAL {
                 warnings.push(format!(
                     "{}: {}",
@@ -919,6 +915,50 @@ fn write_skipping_holes(
     Ok(())
 }
 
+/// Check a manifest's tree before anything is written (R06).
+///
+/// Every path must be plain and relative (no `/` prefix, `.`, `..` or empty
+/// component), and every entry's parent must be the root or a directory
+/// entry of the same manifest, so no entry can sit below a symlink, a file or
+/// a hard link. Paths are the map's keys, so they are unique by construction.
+///
+/// # Errors
+/// Returns [`Error::Corrupt`] naming the first offending path.
+pub fn validate_tree(entries: &BTreeMap<Vec<u8>, FileRecord>) -> Result<()> {
+    for path in entries.keys() {
+        if path.is_empty() {
+            continue;
+        }
+        let relative = Path::new(std::ffi::OsStr::from_bytes(path));
+        lr_unsafe::beneath::normal_components(relative).map_err(|_| {
+            Error::corrupt(format!(
+                "the image contains the path {:?}, which is not a plain relative path; \
+                 nothing was restored",
+                String::from_utf8_lossy(path)
+            ))
+        })?;
+        let parent = path
+            .iter()
+            .rposition(|byte| *byte == b'/')
+            .map_or(&path[..0], |slash| &path[..slash]);
+        if parent.is_empty() {
+            continue;
+        }
+        let parent_is_directory = entries
+            .get(parent)
+            .is_some_and(|record| record.entry.file_kind == lr_format::FILE_KIND_DIRECTORY);
+        if !parent_is_directory {
+            return Err(Error::corrupt(format!(
+                "the image places {:?} below {:?}, which is not a directory of the image; \
+                 nothing was restored",
+                String::from_utf8_lossy(path),
+                String::from_utf8_lossy(parent)
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn prepare_target(target: &Path, merge: bool) -> Result<()> {
     match std::fs::metadata(target) {
         Ok(metadata) if !metadata.is_dir() => {
@@ -977,4 +1017,89 @@ pub fn read_file_metadata(
         }
     }
     Ok(metadata)
+}
+
+#[cfg(test)]
+mod tree_validation {
+    use super::validate_tree;
+    use lr_format::file_manifest::{FileEntry, FileRecord};
+    use std::collections::BTreeMap;
+
+    fn record(path: &str, file_kind: u8) -> (Vec<u8>, FileRecord) {
+        (
+            path.as_bytes().to_vec(),
+            FileRecord {
+                entry: FileEntry {
+                    file_kind,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    mtime_sec: 0,
+                    mtime_nsec: 0,
+                    size: 0,
+                    rdev: 0,
+                    hardlink_group: 0,
+                    link_target: Vec::new(),
+                    path: path.as_bytes().to_vec(),
+                    xattrs: Vec::new(),
+                    acl: Vec::new(),
+                    chunk_refs_total: 0,
+                    chunk_refs_here: Vec::new(),
+                },
+                holes: Vec::new(),
+            },
+        )
+    }
+
+    fn tree(entries: &[(&str, u8)]) -> BTreeMap<Vec<u8>, FileRecord> {
+        entries
+            .iter()
+            .map(|(path, kind)| record(path, *kind))
+            .collect()
+    }
+
+    #[test]
+    fn a_well_formed_tree_is_accepted() {
+        let entries = tree(&[
+            ("", lr_format::FILE_KIND_DIRECTORY),
+            ("etc", lr_format::FILE_KIND_DIRECTORY),
+            ("etc/hosts", lr_format::FILE_KIND_REGULAR),
+            ("link", lr_format::FILE_KIND_SYMLINK),
+        ]);
+        assert!(validate_tree(&entries).is_ok());
+    }
+
+    #[test]
+    fn escaping_or_misplaced_paths_are_refused() {
+        for bad in [
+            vec![("/etc/passwd", lr_format::FILE_KIND_REGULAR)],
+            vec![("../escape", lr_format::FILE_KIND_REGULAR)],
+            vec![
+                ("a", lr_format::FILE_KIND_DIRECTORY),
+                ("a/../../escape", lr_format::FILE_KIND_REGULAR),
+            ],
+            vec![
+                ("a", lr_format::FILE_KIND_DIRECTORY),
+                ("a/./b", lr_format::FILE_KIND_REGULAR),
+            ],
+            vec![("a//b", lr_format::FILE_KIND_REGULAR)],
+            // Below a symlink, a file, or a directory the image does not list.
+            vec![
+                ("link", lr_format::FILE_KIND_SYMLINK),
+                ("link/passwd", lr_format::FILE_KIND_REGULAR),
+            ],
+            vec![
+                ("file", lr_format::FILE_KIND_REGULAR),
+                ("file/child", lr_format::FILE_KIND_REGULAR),
+            ],
+            vec![("missing/child", lr_format::FILE_KIND_REGULAR)],
+        ] {
+            let entries = tree(&bad);
+            let error = validate_tree(&entries).expect_err("must be refused");
+            assert!(
+                error.to_string().contains("nothing was restored"),
+                "{error}"
+            );
+        }
+    }
 }

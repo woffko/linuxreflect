@@ -768,10 +768,22 @@ mod tests {
         file.flush().expect("flush");
     }
 
+    /// A temporary directory whose name is a valid set name (D-115).
+    fn set_dir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("set")
+            .tempdir()
+            .expect("tempdir")
+    }
+
     /// A destination whose set root is `dir` itself, so a member's name is its
-    /// file name.
+    /// file name; `dir` comes from [`set_dir`].
     fn destination_for(dir: &Path) -> (LocalDestination, SetHandle) {
-        let destination = LocalDestination::new(dir, "");
+        let name = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("set directory name");
+        let destination = LocalDestination::new(dir.parent().expect("parent"), name);
         let set = destination
             .open_set(&lr_core::SetId::ZERO)
             .expect("open set");
@@ -849,7 +861,7 @@ mod tests {
 
     #[test]
     fn the_merged_state_is_the_last_mention_in_sequence_order() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = set_dir();
         let seen = merged(dir.path());
         let full = superblock(0, 0, 0xA1, false);
         assert_eq!(
@@ -891,7 +903,7 @@ mod tests {
 
     #[test]
     fn payloads_come_from_the_member_that_stores_them() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = set_dir();
         let files = chain(dir.path());
         let (destination, set) = destination_for(dir.path());
         let members = open_chain(&destination, &set, &files, &Encryption::NoEncrypt).expect("open");
@@ -913,7 +925,7 @@ mod tests {
 
     #[test]
     fn a_chain_with_a_gap_is_refused() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = set_dir();
         let mut files = chain(dir.path());
         files.remove(1);
         let (destination, set) = destination_for(dir.path());
@@ -924,7 +936,7 @@ mod tests {
 
     #[test]
     fn a_broken_link_is_refused() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = set_dir();
         let files = chain(dir.path());
         write_image(
             &dir.path().join("001-incr.lrimg"),

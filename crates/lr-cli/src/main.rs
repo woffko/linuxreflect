@@ -116,6 +116,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             known_hosts,
             insecure_ignore_host_key,
             merge,
+            replace_partition_table,
         }) => restore_prepare(
             cli.json,
             image,
@@ -124,6 +125,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             PrepareFlags {
                 ttl: *ttl,
                 merge: *merge,
+                replace_partition_table: *replace_partition_table,
             },
             &DestinationOptions {
                 set_name: String::new(),
@@ -1164,6 +1166,7 @@ fn probe(
 struct PrepareFlags {
     ttl: u64,
     merge: bool,
+    replace_partition_table: bool,
 }
 
 fn restore_prepare(
@@ -1175,7 +1178,11 @@ fn restore_prepare(
     options: &DestinationOptions,
     socket: Option<&Path>,
 ) -> anyhow::Result<()> {
-    let PrepareFlags { ttl, merge } = flags;
+    let PrepareFlags {
+        ttl,
+        merge,
+        replace_partition_table,
+    } = flags;
     if ttl > lr_engine::DEFAULT_TTL.as_secs() {
         bail!(
             "token lifetime {ttl}s exceeds the {}s allowed by spec §H.2",
@@ -1203,6 +1210,7 @@ fn restore_prepare(
             insecure_ignore_host_key: options.insecure_ignore_host_key,
             ttl_secs: ttl,
             merge,
+            replace_partition_table,
         })?;
         if json {
             println!("{}", serde_json::to_string_pretty(&plan)?);
@@ -1236,6 +1244,7 @@ fn restore_prepare(
     request.known_hosts.clone_from(&options.known_hosts);
     request.insecure_ignore_host_key = options.insecure_ignore_host_key;
     request.merge = merge;
+    request.replace_partition_table = replace_partition_table;
     request.ttl = std::time::Duration::from_secs(ttl);
     let plan = prepare_restore(&request)?;
 

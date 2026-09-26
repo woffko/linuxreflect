@@ -44,17 +44,51 @@ impl BlockSnapshotProvider for OfflineProvider {
 
     fn create(&self, src: &SourceLayout, _opts: &SnapshotOpts) -> Result<BlockSnapshot> {
         preflight(&src.device, src)?;
+        let claim = claim(&src.device)?;
         Ok(BlockSnapshot::new(
             src.device.clone(),
             Consistency::Offline,
-            OfflineGuard,
+            OfflineGuard { _claim: claim },
         ))
     }
 }
 
-/// Nothing is acquired for an offline read, but the guard keeps teardown
-/// uniform across providers.
-struct OfflineGuard;
+/// The exclusive claim on the source, held for the whole read.
+///
+/// While it is held nothing can mount the device or any of its partitions,
+/// in any mount namespace, so "offline" stays true until the image is done.
+struct OfflineGuard {
+    _claim: std::os::fd::OwnedFd,
+}
+
+/// Claim `device` exclusively (`O_EXCL`), read-only.
+///
+/// This is the authoritative offline check (A2): the sysfs and `mountinfo`
+/// checks above only see this mount namespace, while the kernel refuses the
+/// claim with `EBUSY` whenever the device, or for a whole disk any of its
+/// partitions, is mounted anywhere or held by another program.
+///
+/// # Errors
+/// Returns [`Error::NoConsistentMethod`] when the device is in use and
+/// [`Error::Io`] for other failures.
+pub fn claim(device: &Path) -> Result<std::os::fd::OwnedFd> {
+    lr_unsafe::open_block_exclusive(device, false, false).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::ResourceBusy {
+            Error::no_consistent_method([
+                format!(
+                    "{} is in use although no mount of it is visible here: it is mounted in \
+                     another mount namespace (a container or a private mount) or held by \
+                     another program, so it cannot be read offline",
+                    device.display()
+                ),
+                "unmount it everywhere and retry".to_owned(),
+                "boot rescue media and run the statically linked CLI".to_owned(),
+            ])
+        } else {
+            Error::Io(error)
+        }
+    })
+}
 
 /// Reason the layout cannot be read offline, derived from discovery alone.
 fn layout_busy_reason(src: &SourceLayout) -> Option<String> {

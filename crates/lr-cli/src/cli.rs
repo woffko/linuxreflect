@@ -305,6 +305,11 @@ pub(crate) enum RestoreCommand {
         /// Allow a file-mode restore into a non-empty directory.
         #[arg(long)]
         merge: bool,
+
+        /// Allow a single-filesystem image onto a whole disk, replacing its
+        /// partition table and every partition on it.
+        #[arg(long)]
+        replace_partition_table: bool,
     },
 
     /// Mount a file-mode image read-only through FUSE.

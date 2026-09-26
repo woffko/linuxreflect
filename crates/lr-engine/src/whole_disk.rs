@@ -164,8 +164,10 @@ pub fn backup_whole_disk(request: &crate::backup::BackupRequest) -> Result<Whole
             "boot rescue media and run the statically linked CLI (offline)".to_owned(),
         ]));
     }
-    // The disk itself and every partition must be idle.
-    provider.create(&layout, &snapshot_opts)?;
+    // The disk itself and every partition must be idle, and stay idle: the
+    // snapshot holds the provider's exclusive claim on the disk until the
+    // whole image is written (A2).
+    let _claim = provider.create(&layout, &snapshot_opts)?;
 
     let mut source = DirectBlockSource::open(&request.source)?;
     let disk_size = source.size_bytes();
@@ -598,7 +600,10 @@ fn read_pt_raw(source: &Path, lbs: u32, pt_type: PtType) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Restore a whole-disk image.
+/// Restore a whole-disk image onto the target that `apply` claimed.
+///
+/// Every write, including the swap headers and the regenerated GPT, goes
+/// through that claim; the target is never reopened by path (A1, R05).
 ///
 /// # Errors
 /// Returns [`Error::TargetChanged`] when the target changed since `prepare`,
@@ -610,12 +615,12 @@ pub(crate) fn restore_whole_disk<R: std::io::Read + std::io::Seek>(
     keys: &ImageKeys,
     superblock: &Superblock,
     token: &RestoreToken,
+    mut target: DirectBlockTarget,
     reporter: &mut crate::progress::Reporter,
 ) -> Result<RestoreReport> {
     let kind = superblock.aead_kind()?;
     let lbs = u64::from(superblock.logical_block_size);
     let chunk_size = u64::from(superblock.chunk_size);
-    let mut target = DirectBlockTarget::open(&token.target_path)?;
     if target.size_bytes() < superblock.source_size_bytes {
         return Err(Error::NoSpace);
     }
@@ -637,7 +642,7 @@ pub(crate) fn restore_whole_disk<R: std::io::Read + std::io::Seek>(
         reporter.phase(&format!("region {}", region.index));
         reporter.report(region.start_lba * lbs)?;
         if region.kind == RegionKind::Swap {
-            write_swap(&token.target_path, region, lbs)?;
+            write_swap(&mut target, region, lbs)?;
             continue;
         }
         if !region.has_manifest() {
@@ -707,7 +712,8 @@ pub(crate) fn restore_whole_disk<R: std::io::Read + std::io::Seek>(
     // Regenerate the GPT for the target size (spec §H.1): the crate computes a
     // fresh backup LBA and rewrites both headers with valid CRCs.
     if disk_header.pt_type == PtType::Gpt {
-        regenerate_gpt(&token.target_path)?;
+        target.sync()?;
+        regenerate_gpt(&target, &token.target_path)?;
     }
 
     target.sync()?;
@@ -723,16 +729,19 @@ pub(crate) fn restore_whole_disk<R: std::io::Read + std::io::Seek>(
     })
 }
 
-/// Rewrite the primary and backup GPT for the current target size.
-fn regenerate_gpt(target: &Path) -> Result<()> {
+/// Rewrite the primary and backup GPT for the current target size, through
+/// the claimed target (`path` only names it in messages).
+fn regenerate_gpt(target: &DirectBlockTarget, path: &Path) -> Result<()> {
     let config = gpt::GptConfig::new()
         .writable(true)
         .only_valid_headers(false)
         .change_partition_count(true);
-    let mut disk = config.open(target).map_err(|e| {
+    let file = target.buffered_handle()?;
+    let flush = file.try_clone().map_err(Error::Io)?;
+    let mut disk = config.open_from_device(file).map_err(|e| {
         Error::corrupt(format!(
             "cannot reopen {} to regenerate the partition table: {e}",
-            target.display()
+            path.display()
         ))
     })?;
     // `update_partitions` recomputes both headers for the *current* device
@@ -743,54 +752,26 @@ fn regenerate_gpt(target: &Path) -> Result<()> {
         .map_err(|e| Error::corrupt(format!("cannot rebuild the partition table: {e}")))?;
     disk.write_inplace()
         .map_err(|e| Error::corrupt(format!("cannot write the regenerated GPT: {e}")))?;
-    Ok(())
+    flush.sync_all().map_err(Error::Io)
 }
 
-/// Recreate a swap region.
+/// Recreate a swap region from its stored header.
 ///
-/// On a device with partition nodes this calls `mkswap -U <uuid> -L <label>`
-/// (spec §G.7). On a plain image file there is no partition node to hand to
-/// `mkswap`, so the stored 4 KiB header is written back and the caller is told
-/// to verify it.
-fn write_swap(target: &Path, region: &RegionRecord, lbs: u64) -> Result<()> {
-    let offset = region.start_lba * lbs;
-    let name = lr_core::sysfs::device_name(target).unwrap_or_default();
-    let partition_node = if name.starts_with("loop") || name.starts_with("nvme") {
-        PathBuf::from(format!("{}p{}", target.display(), region.index))
-    } else {
-        PathBuf::from(format!("{}{}", target.display(), region.index))
-    };
-    if partition_node.exists() {
-        let mut command = std::process::Command::new("mkswap");
-        if !region.fs_uuid.is_empty() {
-            command.arg("-U").arg(&region.fs_uuid);
-        }
-        if !region.fs_label.is_empty() {
-            command.arg("-L").arg(&region.fs_label);
-        }
-        let status = command.arg(&partition_node).status().map_err(Error::Io)?;
-        if status.success() {
-            return Ok(());
-        }
-        tracing::warn!(
-            partition = %partition_node.display(),
-            "mkswap failed; falling back to the stored swap header"
-        );
-    }
-    if region.swap_header.is_empty() {
+/// The first 4 KiB of the source's swap area carry its signature, UUID,
+/// label and size, and the region is restored at the image's own offset, so
+/// writing that header back through the claimed whole-disk target recreates
+/// the same swap area. `mkswap` on a partition node was used before, but the
+/// node could still describe the target's *old* partition table and format
+/// the wrong extent (R05).
+fn write_swap(target: &mut DirectBlockTarget, region: &RegionRecord, lbs: u64) -> Result<()> {
+    if region.swap_header.len() != SWAP_HEADER_BYTES {
         return Err(Error::corrupt(format!(
-            "swap region {} has no stored header",
-            region.index
+            "swap region {} has a {}-byte header, expected {SWAP_HEADER_BYTES}",
+            region.index,
+            region.swap_header.len()
         )));
     }
-    let mut buffer = lr_unsafe::AlignedBuf::new(SWAP_HEADER_BYTES, 4096).map_err(Error::Io)?;
-    buffer.as_mut_slice()[..region.swap_header.len()].copy_from_slice(&region.swap_header);
-    let mut target = DirectBlockTarget::open(target)?;
-    target.write_at(offset, &buffer, region.swap_header.len())?;
-    target.sync()?;
-    tracing::warn!(
-        region = region.index,
-        "swap recreated from the stored header; verify it before activating"
-    );
-    Ok(())
+    let mut buffer = target.buffer(SWAP_HEADER_BYTES)?;
+    buffer.as_mut_slice()[..SWAP_HEADER_BYTES].copy_from_slice(&region.swap_header);
+    target.write_at(region.start_lba * lbs, &buffer, SWAP_HEADER_BYTES)
 }

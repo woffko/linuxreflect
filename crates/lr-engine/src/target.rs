@@ -75,6 +75,93 @@ pub fn preflight_target(device: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Match what the image is with what the target is (A3).
+///
+/// A whole-disk image carries a partition table and boot area and belongs on
+/// a whole disk, never inside a partition. A partition or stream image
+/// written to a disk that has partitions replaces the disk's partition table
+/// and every partition on it, so that needs `replace_partition_table`, and
+/// the returned warning names what is lost.
+///
+/// # Errors
+/// Returns [`Error::Unsupported`] naming the target and, for a disk, its
+/// partitions.
+pub fn check_kinds(
+    target: &Path,
+    superblock: &lr_format::Superblock,
+    replace_partition_table: bool,
+) -> Result<Vec<String>> {
+    let layout = discover_source(target)?;
+    let target_is_partition = layout.device_facts.dev_type == lr_core::BlockDeviceType::Partition;
+    if superblock.is_whole_disk() {
+        if target_is_partition {
+            return Err(Error::unsupported(format!(
+                "{} is a partition, but this is a whole-disk image with its own partition \
+                 table; restore it to a whole disk",
+                target.display()
+            )));
+        }
+        return Ok(Vec::new());
+    }
+    if !layout.is_whole_disk() {
+        return Ok(Vec::new());
+    }
+    let partitions: Vec<String> = layout
+        .partitions
+        .iter()
+        .map(|partition| {
+            let name = partition.path.as_ref().map_or_else(
+                || format!("partition {}", partition.index),
+                |path| path.display().to_string(),
+            );
+            let fs = partition
+                .fs_type
+                .as_ref()
+                .map(|fs_type| format!(", {fs_type}"))
+                .unwrap_or_default();
+            format!("{name} ({} bytes{fs})", partition.size_bytes)
+        })
+        .collect();
+    let summary = format!(
+        "{} is a whole disk with a partition table; restoring this single-filesystem image \
+         onto it replaces the partition table and removes every partition: {}",
+        target.display(),
+        partitions.join(", ")
+    );
+    if !replace_partition_table {
+        return Err(Error::unsupported(format!(
+            "{summary}. Choose one of its partitions as the target, or confirm replacing the \
+             whole disk (--replace-partition-table, or \"Replace the partition table\" in the \
+             restore wizard)"
+        )));
+    }
+    Ok(vec![summary])
+}
+
+/// Refuse a device that is in use anywhere, including in another mount
+/// namespace (A1).
+///
+/// A read-only `O_EXCL` open is the kernel's own busy check; it is released
+/// at once. `restore apply` takes the lasting claim itself, so this probe is
+/// for `prepare`, which should refuse early.
+///
+/// # Errors
+/// Returns [`Error::TargetBusy`] when the device is in use and [`Error::Io`]
+/// for other failures.
+pub fn probe_exclusive(device: &Path) -> Result<()> {
+    match lr_unsafe::open_block_exclusive(device, false, false) {
+        Ok(_claim) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::ResourceBusy => Err(Error::TargetBusy {
+            holder: format!(
+                "{} is in use: it is mounted (possibly in another mount namespace), \
+                     held by another device, or claimed by another program",
+                device.display()
+            ),
+        }),
+        Err(error) => Err(Error::Io(error)),
+    }
+}
+
 fn refuse_if_running_root(device: &Path) -> Result<()> {
     let metadata = std::fs::metadata(device).map_err(Error::Io)?;
     let target = metadata.rdev();

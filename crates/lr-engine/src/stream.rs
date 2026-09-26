@@ -816,7 +816,20 @@ pub fn restore_stream(request: &StreamRestoreRequest) -> Result<StreamRestoreRep
         }
     }
 
-    // A fresh filesystem with the source's UUID and label.
+    // Every subvolume path becomes a directory path below the new
+    // filesystem; check them all before anything is formatted (R06).
+    for content in &contents {
+        for section in &content.sections {
+            subvolume_relative(&section.section.subvol_path)?;
+        }
+    }
+
+    // A fresh filesystem with the source's UUID and label. The exclusive
+    // claim proves the target is not mounted in any namespace (A1); it is
+    // released right before `mkfs.btrfs`, which claims the device itself.
+    drop(lr_blocksource::DirectBlockTarget::open_buffered(
+        &request.target,
+    )?);
     btrfs::create_filesystem(&request.target, &first.layout.fs_uuid, &first.layout.label)?;
     let mountpoint = request.mount_root.join(format!(
         "restore-{}",
@@ -835,7 +848,8 @@ pub fn restore_stream(request: &StreamRestoreRequest) -> Result<StreamRestoreRep
 
     // Receive every section in order; the last subvolume of each source path
     // is the final state.
-    let mut created: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    let root = crate::tree::RestoreRoot::open(mounted.path())?;
+    let mut created: BTreeMap<String, Vec<(PathBuf, String)>> = BTreeMap::new();
     let mut received_bytes = 0u64;
     for content in &contents {
         let reader = ImageReader::open(destination.open_ro(&set, &content.image)?)?;
@@ -843,9 +857,9 @@ pub fn restore_stream(request: &StreamRestoreRequest) -> Result<StreamRestoreRep
         let kind = reader.superblock().aead_kind()?;
         let mut chunks = reader.chunk_reader_with(destination.open_ro(&set, &content.image)?);
         for section in &content.sections {
-            let parent = dirname_of(&section.section.subvol_path);
-            let parent_dir = mounted.path().join(&parent);
-            std::fs::create_dir_all(&parent_dir).map_err(Error::Io)?;
+            let relative = subvolume_relative(&section.section.subvol_path)?;
+            let parent = relative.parent().unwrap_or(Path::new("")).to_path_buf();
+            let parent_dir = root.dir(&parent, 0o755)?;
             let mut stream = ChunkStream {
                 chunks: &mut chunks,
                 entries: section.entries.clone(),
@@ -856,33 +870,42 @@ pub fn restore_stream(request: &StreamRestoreRequest) -> Result<StreamRestoreRep
                 data_key: keys.data_key.as_deref(),
                 dedup_key: &keys.dedup_key,
             };
-            let name = btrfs::receive_top_level(&parent_dir, &mut stream)?;
+            let name = btrfs::receive_top_level(&parent_dir.for_child(), &mut stream)?;
+            // The name comes from the stream; it must be one component.
+            parent_dir.entry(std::ffi::OsStr::new(&name))?;
             received_bytes += section.section.send_stream_bytes;
             reporter.report(received_bytes)?;
             created
                 .entry(section.section.subvol_path.clone())
                 .or_default()
-                .push(parent_dir.join(&name));
+                .push((parent, name));
         }
     }
 
     // Keep only the final subvolume of each path and give it its real name.
     let mut restored = Vec::new();
-    for (subvol_path, paths) in &created {
-        for stale in &paths[..paths.len() - 1] {
+    for (subvol_path, received) in &created {
+        for (parent, name) in &received[..received.len() - 1] {
+            let parent = root.dir(parent, 0o755)?;
             let _ = std::process::Command::new("btrfs")
                 .args(["subvolume", "delete"])
-                .arg(stale)
+                .arg(parent.for_child().with_file_name(name))
                 .output();
         }
-        let Some(last) = paths.last() else {
+        let Some((parent, name)) = received.last() else {
             continue;
         };
-        let final_path = mounted.path().join(subvol_path.trim_matches('/'));
-        if last != &final_path {
-            std::fs::create_dir_all(final_path.parent().unwrap_or(mounted.path()))
-                .map_err(Error::Io)?;
-            std::fs::rename(last, &final_path).map_err(Error::Io)?;
+        let relative = subvolume_relative(subvol_path)?;
+        let final_parent = relative.parent().unwrap_or(Path::new(""));
+        let final_name = relative.file_name().unwrap_or_default();
+        if parent.as_path() != final_parent || std::ffi::OsStr::new(name) != final_name {
+            let from = root.dir(parent, 0o755)?;
+            let to = root.dir(final_parent, 0o755)?;
+            std::fs::rename(
+                from.entry(std::ffi::OsStr::new(name))?,
+                to.entry(final_name)?,
+            )
+            .map_err(Error::Io)?;
         }
         restored.push(subvol_path.clone());
     }
@@ -897,6 +920,7 @@ pub fn restore_stream(request: &StreamRestoreRequest) -> Result<StreamRestoreRep
         .to_owned();
     if !default_path.is_empty()
         && default_path != "-"
+        && lr_unsafe::beneath::normal_components(Path::new(&default_path)).is_ok()
         && mounted.path().join(&default_path).exists()
         && let Some(id) = btrfs::subvolume_id(&mounted.path().join(&default_path))?
     {
@@ -1000,11 +1024,16 @@ impl Drop for MountGuard {
     }
 }
 
-fn dirname_of(subvol_path: &str) -> String {
-    let trimmed = subvol_path.trim_matches('/');
-    match trimmed.rsplit_once('/') {
-        Some((parent, _)) => parent.to_owned(),
-        None => String::new(),
+/// A recorded subvolume path (`/@`, `/home/u1`) as a plain path relative to
+/// the new filesystem's top level (R06).
+fn subvolume_relative(subvol_path: &str) -> Result<PathBuf> {
+    let relative = Path::new(subvol_path.strip_prefix('/').unwrap_or(subvol_path));
+    match lr_unsafe::beneath::normal_components(relative) {
+        Ok(components) if !components.is_empty() => Ok(relative.to_path_buf()),
+        _ => Err(Error::corrupt(format!(
+            "the image records the subvolume path {subvol_path:?}, which is not a plain path \
+             below the filesystem's top level; nothing was restored"
+        ))),
     }
 }
 
@@ -1022,6 +1051,18 @@ mod tests {
     use lr_core::Id;
     use lr_crypto::aead::AeadKind;
     use lr_crypto::nonce::NonceSeq;
+
+    #[test]
+    fn subvolume_paths_must_stay_below_the_top_level() {
+        assert_eq!(
+            super::subvolume_relative("/home/u1").expect("plain"),
+            std::path::PathBuf::from("home/u1")
+        );
+        assert!(super::subvolume_relative("/@").is_ok());
+        for bad in ["/", "", "/../etc", "/a/../../b", "//x", "/a/./b", "/a/"] {
+            assert!(super::subvolume_relative(bad).is_err(), "{bad:?}");
+        }
+    }
     use lr_format::{ChunkOptions, ImageWriter, Superblock, WriterKeys};
     use std::io::Cursor;
 

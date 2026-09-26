@@ -210,7 +210,10 @@ linuxreflect backup create --source / --dest /mnt/backup --set root --mode file 
 linuxreflect backup list --dest /mnt/backup --set laptop-root
 linuxreflect verify --image /mnt/backup/laptop-root/<chain>/000-full-<uuid>.lrimg --chain
 
-# Restore: prepare (shows the plan and a token), then apply.
+# Restore: prepare (shows the plan and a token), then apply. The target must
+# be idle everywhere, including other mount namespaces. A single-filesystem
+# image goes onto a partition; putting it onto a whole disk that has partitions
+# needs --replace-partition-table, and the plan names what is removed.
 linuxreflect restore prepare --image /mnt/backup/laptop-root/<chain>/000-full-<uuid>.lrimg \
     --target /dev/sdb2
 linuxreflect restore apply --token <token> --confirm

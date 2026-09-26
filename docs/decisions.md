@@ -1337,3 +1337,101 @@ the root test `btrfs_send_parents_follow_the_catalog`. The root test checks
 that a rollover full has no send parent and restores on its own, that an
 incremental after another destination's full is refused, and that a new full
 resumes the chain. The rollover assertion fails without the fix.
+
+## D-117 — Devices are claimed with `O_EXCL` for restores and offline reads
+
+The §H.3 busy check reads sysfs holders, `/proc/swaps` and the process's own
+`mountinfo`. A filesystem mounted in another mount namespace (a container, a
+service with `PrivateMounts=`, `unshare -m`) is invisible to all three. A
+restore wrote over such a mount (A1), and an offline backup read one and
+reported `offline` consistency (A2). On Linux, `open(O_EXCL)` without
+`O_CREAT` on a block device is the kernel's own check: it fails with `EBUSY`
+while the device, or for a whole disk any of its partitions, is mounted in any
+namespace or held by md/dm/LVM or another exclusive opener. While the claim is
+held, nothing else can mount or claim the device.
+
+- **Restore.** `restore apply` claims the target first
+  (`DirectBlockTarget::open`, which now always uses `O_EXCL`). It then re-reads
+  the target facts and ties them to the claimed device through its device
+  number. Every write goes through that claim. The GPT regeneration and the
+  unaligned-tail writes reopen the same device through
+  `/proc/self/fd/<fd>`, never by path. `restore prepare` also probes the claim
+  (read-only) so it refuses early. A stream restore releases the claim just
+  before `mkfs.btrfs`, which takes its own.
+- **Offline backup.** The offline provider holds a read-only `O_EXCL` claim for
+  the lifetime of its snapshot. `EBUSY` becomes `E_NO_CONSISTENT_METHOD` with
+  the reason. A whole-disk backup now keeps that snapshot alive for the whole
+  read; before, it dropped it at once.
+- **Swap (R05).** A whole-disk restore recreated swap with `mkswap` on the
+  target's partition node. That node could still describe the target's *old*
+  partition table and format the wrong extent. The stored 4 KiB swap header
+  (signature, UUID, label, size) is now written back through the claimed
+  whole-disk target at the image's own offset, and `mkswap` is not run.
+
+A regular file ignores `O_EXCL` without `O_CREAT`, so image-file targets and
+sources behave as before. Regression tests: `crates/lr-engine/tests/root_claims.rs`
+(a hidden-namespace mount refuses a restore and leaves the target
+byte-identical, refuses `prepare`, and refuses an offline backup; a whole-disk
+restore over a stale partition layout keeps a file that spans the old swap
+node intact). All three fail on the code before this change.
+
+## D-118 — File restores and live walks are confined beneath a pinned directory
+
+File-mode restores joined manifest paths to the target and called path-based
+syscalls (R06). An absolute path, `..`, an image symlink used as an ancestor,
+or a symlink already present in a `--merge` target could make a restore
+create, delete or change files outside the approved directory. The live walk
+of a file-mode backup recorded metadata by path and reopened each file by
+path for its content, so an ancestor swapped for a symlink between the two
+passes could redirect the root reader outside the source (R14).
+
+- **Validation before any write.** Every manifest path must be plain and
+  relative (no `/` prefix, `.`, `..` or empty component). Every entry's parent
+  must be the root or a directory entry of the same manifest. Otherwise the
+  restore is refused before anything is written. Stream restores apply the
+  same rule to subvolume paths before formatting, and to the subvolume name
+  that `btrfs receive` reports.
+- **Descriptor-relative operations.** `lr_unsafe::beneath` resolves a
+  directory from a pinned root with `openat2(RESOLVE_BENEATH |
+  RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)`. On kernels without
+  `openat2` it walks one `O_NOFOLLOW` component at a time. An entry is then
+  named `/proc/self/fd/<dir>/<name>`: the magic link resolves to exactly the
+  pinned directory, and `name` is one component. Create, unlink, `lchown`,
+  `utimensat(AT_SYMLINK_NOFOLLOW)` and `lsetxattr` go through that path, so
+  none of them can follow a symlink. `chmod`, which always follows, goes
+  through an `O_PATH` descriptor of the entry after checking that it is not a
+  symlink. A `--merge` symlink where the image has a directory is replaced by
+  the directory, not followed. Child processes such as `btrfs receive` get
+  `/proc/<pid>/fd/<dir>`, because they inherit no descriptors.
+- **Live walk.** The walk pins its root, reaches every directory beneath it
+  without following symlinks, and names children through their pinned
+  parent. A regular file's `(st_dev, st_ino)` is recorded from the descriptor
+  its sparse map is read from. The content pass reopens the file the same way
+  and refuses a different file with "was replaced while the backup ran; retry
+  the backup". Refusing is deliberate: the recorded metadata belongs to the
+  old file, and content from another file would be inconsistent.
+
+Regression tests: `crates/lr-unsafe/src/beneath.rs`, the engine's
+`crafted_entries_cannot_leave_the_restore_root`,
+`the_content_pass_refuses_a_swapped_ancestor_or_file` (which also shows that
+the previous path-based open read the outside sentinel), the
+`tree_validation` tests, and the integration test
+`a_merge_restore_does_not_follow_a_planted_symlink`.
+
+## D-119 — The image kind must match the target kind
+
+`restore prepare` compared only sizes (A3). A whole-disk image could be
+written into a partition, nesting a partition table inside it. A
+single-filesystem image could be written onto a whole disk, silently
+replacing the disk's partition table and every partition on it.
+
+- A whole-disk image onto a partition (`/sys/class/block/<dev>/partition`) is
+  refused.
+- A partition or stream image onto a disk that has partitions is refused
+  unless the request acknowledges it (`--replace-partition-table`,
+  `RestoreSpec.replace_partition_table`, or the restore wizard's "Replace the
+  partition table" option). Both the refusal and the plan's warning name every
+  partition that will be removed.
+
+Regression test: the root test `image_and_target_kinds_must_match`, which
+fails before the change.

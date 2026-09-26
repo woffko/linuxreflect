@@ -10,6 +10,8 @@
 #   linuxreflect.target=<target block device>
 #   linuxreflect.backup=<device holding the image>   (optional; mounted first)
 #   linuxreflect.merge=1                             (optional, file mode)
+#   linuxreflect.replace_partition_table=1           (optional; a single-
+#       filesystem image onto a whole disk with partitions, D-119)
 #   linuxreflect.mode=disk|file                      (default: disk)
 #
 # Every step announces itself on the serial console so a headless run is
@@ -47,6 +49,8 @@ fi
 
 prepare_args="restore prepare --image $image --target $target"
 [ "$mode" = "file" ] && prepare_args="$prepare_args --merge"
+[ "$(param linuxreflect.replace_partition_table)" = "1" ] &&
+    prepare_args="$prepare_args --replace-partition-table"
 
 token=$($CLI $prepare_args 2>>"$serial" | sed -n 's/^token: //p' | head -1)
 if [ -z "$token" ]; then

@@ -381,6 +381,9 @@ pub struct PrepareRequest {
     pub insecure_ignore_host_key: bool,
     /// Allow a file-mode restore into a non-empty directory.
     pub merge: bool,
+    /// Acknowledge that restoring a partition image onto a whole disk
+    /// replaces its partition table and every partition on it (A3).
+    pub replace_partition_table: bool,
 }
 
 impl PrepareRequest {
@@ -415,7 +418,15 @@ impl PrepareRequest {
             known_hosts: None,
             insecure_ignore_host_key: false,
             merge: false,
+            replace_partition_table: false,
         }
+    }
+
+    /// Acknowledge replacing a whole disk's partition table (A3).
+    #[must_use]
+    pub fn with_replace_partition_table(mut self, replace: bool) -> Self {
+        self.replace_partition_table = replace;
+        self
     }
 
     /// Allow writing into a non-empty target directory (file mode).
@@ -523,6 +534,7 @@ pub fn prepare_restore(request: &PrepareRequest) -> Result<RestorePlan> {
 
     // File mode restores into an existing directory: the space check is about
     // free bytes, and there is no device to preflight.
+    let mut kind_warnings = Vec::new();
     let (target_facts, target_directory) = if superblock.image_kind == ImageKind::File {
         let directory = crate::target::DirectoryFacts::read(&request.target)?;
         let free = directory.free_bytes()?;
@@ -539,10 +551,16 @@ pub fn prepare_restore(request: &PrepareRequest) -> Result<RestorePlan> {
             return Err(Error::NoSpace);
         }
         crate::target::preflight_target(&request.target)?;
+        crate::target::probe_exclusive(&request.target)?;
+        kind_warnings = crate::target::check_kinds(
+            &request.target,
+            &superblock,
+            request.replace_partition_table,
+        )?;
         (facts, None)
     };
 
-    let mut warnings = Vec::new();
+    let mut warnings = kind_warnings;
     if target_facts.size_bytes > superblock.source_size_bytes && target_directory.is_none() {
         warnings.push(format!(
             "target is {} bytes larger than the source; the extra space stays unallocated (spec §H.1)",
@@ -769,9 +787,14 @@ pub fn apply_restore(request: &ApplyRequest) -> Result<RestoreOutcome> {
         ));
     }
 
-    // Re-read the target immediately before writing (spec §H.2).
+    // Claim the target first (A1): `O_EXCL` fails while it is mounted in
+    // any mount namespace or held by anything, and keeps it that way until
+    // the claim is dropped. The facts are then re-read (spec §H.2) and tied
+    // to the claimed device through its device number, so the checks and
+    // every write below concern the same device.
+    let target = DirectBlockTarget::open(&token.target_path)?;
     let current = TargetFacts::read(&token.target_path)?;
-    if !current.matches(&token.target) {
+    if !current.matches(&token.target) || target.device_id()? != current.dev_id {
         return Err(Error::TargetChanged);
     }
     crate::target::preflight_target(&token.target_path)?;
@@ -798,12 +821,17 @@ pub fn apply_restore(request: &ApplyRequest) -> Result<RestoreOutcome> {
             &keys,
             &superblock,
             &token,
+            target,
             &mut reporter,
         )
         .map(RestoreOutcome::Block);
     }
 
     if superblock.image_kind == ImageKind::Stream {
+        // A stream restore formats the target with `mkfs.btrfs`, which takes
+        // its own exclusive claim, so ours is released just before; the
+        // stream restore claims the device again before formatting.
+        drop(target);
         let report = crate::stream::restore_stream(&crate::stream::StreamRestoreRequest {
             dest: token.dest.clone(),
             set: token.set.clone(),
@@ -831,7 +859,8 @@ pub fn apply_restore(request: &ApplyRequest) -> Result<RestoreOutcome> {
         })
         .collect::<Result<_>>()?;
     let members = crate::chain::open_chain(&*destination, &set, &files, &request.encryption)?;
-    write_block_chain(members, &superblock, &token, &mut reporter).map(RestoreOutcome::Block)
+    write_block_chain(members, &superblock, &token, target, &mut reporter)
+        .map(RestoreOutcome::Block)
 }
 
 /// Restore a whole-disk image (which is always a single full image).
@@ -841,6 +870,7 @@ fn write_image(
     keys: &ImageKeys,
     superblock: &Superblock,
     token: &RestoreToken,
+    target: DirectBlockTarget,
     reporter: &mut crate::progress::Reporter,
 ) -> Result<RestoreReport> {
     if !superblock.is_whole_disk() {
@@ -848,7 +878,7 @@ fn write_image(
             "a partition image must be restored through the chain walker",
         ));
     }
-    crate::whole_disk::restore_whole_disk(reader, chunks, keys, superblock, token, reporter)
+    crate::whole_disk::restore_whole_disk(reader, chunks, keys, superblock, token, target, reporter)
 }
 
 /// Restore a block image, merging every chain member's state.
@@ -861,6 +891,7 @@ fn write_block_chain(
     members: Vec<crate::chain::OpenMember>,
     superblock: &Superblock,
     token: &RestoreToken,
+    mut target: DirectBlockTarget,
     reporter: &mut crate::progress::Reporter,
 ) -> Result<RestoreReport> {
     let chunk_size = u64::from(superblock.chunk_size);
@@ -873,7 +904,6 @@ fn write_block_chain(
         ));
     }
 
-    let mut target = DirectBlockTarget::open(&token.target_path)?;
     if target.size_bytes() < superblock.source_size_bytes {
         return Err(Error::NoSpace);
     }

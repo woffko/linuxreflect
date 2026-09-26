@@ -422,6 +422,9 @@ impl Actions {
             .upgrade()
             .map(|ui| ui.get_restore_passphrase_file().to_string())
             .unwrap_or_default();
+        let replace_partition_table = ui
+            .upgrade()
+            .is_some_and(|ui| ui.get_restore_replace_table());
         let request = self
             .shared
             .restore_review
@@ -434,7 +437,9 @@ impl Actions {
         self.runtime.spawn(async move {
             let outcome = async {
                 let client = Client::connect(&socket).await?;
-                client.prepare_restore(&image, &target, &passphrase_file).await
+                client
+                    .prepare_restore(&image, &target, &passphrase_file, replace_partition_table)
+                    .await
             }
             .await;
             match outcome {

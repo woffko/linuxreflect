@@ -576,6 +576,7 @@ impl LinuxReflect for DaemonService {
             (!spec.known_hosts.is_empty()).then(|| PathBuf::from(&spec.known_hosts));
         prepare.insecure_ignore_host_key = spec.insecure_ignore_host_key;
         prepare.merge = spec.merge;
+        prepare.replace_partition_table = spec.replace_partition_table;
         if spec.ttl_secs > 0 {
             prepare.ttl = std::time::Duration::from_secs(spec.ttl_secs.min(600));
         }

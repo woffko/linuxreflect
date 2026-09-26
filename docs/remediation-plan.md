@@ -373,20 +373,20 @@ P3 = cleanup.
 
 | ID | Priority | Finding | Work item | Done |
 |---|---|---|---|---|
-| R01 | P0 | Metadata streams reuse AEAD nonces under one key | 1.2 | ☐ |
-| R02 | P0 | A set name of `..` redirects Btrfs cleanup into the source | 1.3 | ☐ |
-| R03 | P0 | Unsupported sparse seeking restores data as zeros | 1.4 | ☐ |
-| R04 | P0 | Btrfs send parents do not match catalog parents | 1.5 | ☐ |
-| R05 | P0 | Swap recreation can format a stale partition extent | 1.1 | ☐ |
-| R06 | P1 | File and Stream restores are not confined to the target | 1.6 | ☐ |
+| R01 | P0 | Metadata streams reuse AEAD nonces under one key | 1.2 | ☑ |
+| R02 | P0 | A set name of `..` redirects Btrfs cleanup into the source | 1.3 | ☑ |
+| R03 | P0 | Unsupported sparse seeking restores data as zeros | 1.4 | ☑ |
+| R04 | P0 | Btrfs send parents do not match catalog parents | 1.5 | ☑ |
+| R05 | P0 | Swap recreation can format a stale partition extent | 1.1 | ☑ |
+| R06 | P1 | File and Stream restores are not confined to the target | 1.6 | ☑ |
 | R07 | P1 | Catalog temporary-file symlink redirects root writes | 2.1 | ☐ |
 | R08 | P1 | Shared scratch spool permits manifest substitution | 2.1 | ☐ |
 | R09 | P1 | NBD inspection mounts keep setuid and device nodes | 2.6 | ☐ |
 | R10 | P2 | Read permission can cancel another user's job | 3 | ☐ |
-| R11 | P2 | Unauthenticated Argon2 parameters choose resource use | 1.2 | ☐ |
+| R11 | P2 | Unauthenticated Argon2 parameters choose resource use | 1.2 | ☑ |
 | R12 | P2 | A passphrase FIFO blocks request threads | 3 | ☐ |
 | R13 | P2 | `known_hosts` negations and revocations not enforced | 3 | ☐ |
-| R14 | P2 | Live file backup can follow replaced ancestors | 1.6 | ☐ |
+| R14 | P2 | Live file backup can follow replaced ancestors | 1.6 | ☑ |
 | R15 | P1 | Requested encryption ignored on a plaintext chain | 2.2 | ☐ |
 | R16 | P1 | Live file backups lack per-file stability checks | 2.2 | ☐ |
 | R17 | P1 | Incrementals miss changes that keep size and mtime | 2.2 | ☐ |
@@ -412,10 +412,10 @@ P3 = cleanup.
 | R37 | P2 | Whole-disk backup rejects legal partition numbering | 3 | ☐ |
 | R38 | P2 | Filesystem-tool parse errors can deadlock a job | 3 | ☐ |
 | R39 | P3 | Block-backup failure cleanup targets the wrong spool | 2.1 | ☐ |
-| R40 | P2 | Integration tests pass when setup fails | 0.2 | ☐ |
-| A1 | P0 | Restore writes over a filesystem mounted in another mount namespace (no `O_EXCL`) | 1.1 | ☐ |
-| A2 | P0 | A device mounted elsewhere is backed up as `consistency: offline` | 1.1 | ☐ |
-| A3 | P0 | Image kind and target kind are not matched | 1.7 | ☐ |
+| R40 | P2 | Integration tests pass when setup fails | 0.2 | ☑ |
+| A1 | P0 | Restore writes over a filesystem mounted in another mount namespace (no `O_EXCL`) | 1.1 | ☑ |
+| A2 | P0 | A device mounted elsewhere is backed up as `consistency: offline` | 1.1 | ☑ |
+| A3 | P0 | Image kind and target kind are not matched | 1.7 | ☑ |
 | A4 | P2 | `VerifyImage` makes root read client-named secret files and skip host keys | 3 | ☐ |
 | A5 | P1 | All verifications share one job set | 2.7 | ☐ |
 | A6 | P1 | SFTP unusable through the daemon from the GUI; list calls drop SSH options | 2.5 | ☐ |

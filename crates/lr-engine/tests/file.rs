@@ -441,3 +441,50 @@ fn a_file_deleted_before_a_later_member_stays_deleted() {
         );
     }
 }
+
+/// A `--merge` target whose subdirectory is a symlink to somewhere else
+/// cannot redirect the restore (R06): the symlink is replaced by the image's
+/// directory and nothing outside the target changes.
+#[test]
+fn a_merge_restore_does_not_follow_a_planted_symlink() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = dir.path().join("source");
+    let dest = dir.path().join("backups");
+    let target = dir.path().join("restored");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(source.join("sub")).expect("dirs");
+    std::fs::write(source.join("sub/file"), b"from the image").expect("file");
+    std::fs::create_dir_all(&outside).expect("outside");
+    std::fs::write(outside.join("file"), b"sentinel").expect("sentinel");
+    std::fs::create_dir_all(&target).expect("target");
+    std::os::unix::fs::symlink(&outside, target.join("sub")).expect("planted symlink");
+
+    let report = backup_file(
+        &request(&source, &dest, "planted"),
+        &FileBackupOptions::default(),
+    )
+    .expect("backup");
+    let merged = prepare_restore(
+        &PrepareRequest::from_path(&report.image_path, &target, Encryption::NoEncrypt)
+            .with_merge(true),
+    )
+    .expect("prepare");
+    restore(&merged);
+
+    assert_eq!(
+        std::fs::read(outside.join("file")).expect("sentinel"),
+        b"sentinel",
+        "the restore wrote through the planted symlink"
+    );
+    assert!(
+        !std::fs::symlink_metadata(target.join("sub"))
+            .expect("sub")
+            .file_type()
+            .is_symlink(),
+        "the image's directory replaces the symlink"
+    );
+    assert_eq!(
+        std::fs::read(target.join("sub/file")).expect("restored"),
+        b"from the image"
+    );
+}

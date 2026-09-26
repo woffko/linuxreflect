@@ -199,6 +199,9 @@ message RestoreSpec {
   uint64 ttl_secs = 7;
   // File mode: allow restoring into a non-empty directory (spec §K S12).
   bool merge = 8;
+  // Acknowledge that a single-filesystem image written to a whole disk
+  // replaces its partition table and every partition on it (A3).
+  bool replace_partition_table = 9;
 }
 
 message RestorePlanInfo {
