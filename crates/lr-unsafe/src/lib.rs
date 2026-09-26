@@ -394,7 +394,9 @@ mod tests {
         let pid = std::process::id();
         match super::pidfd_open(pid) {
             Ok(Some(_fd)) => {}
-            Ok(None) => eprintln!("pidfd_open not implemented; skipped"),
+            Ok(None) => {
+                lr_testkit::report_unavailable("pidfd_open is not implemented by this kernel")
+            }
             Err(e) => panic!("pidfd_open(self) failed: {e}"),
         }
     }

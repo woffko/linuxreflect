@@ -29,8 +29,7 @@ const SET_NAME: &str = "sftp-set";
 
 fn root_tests_enabled() -> bool {
     if std::env::var("LR_ROOT_TESTS").as_deref() != Ok("1") {
-        eprintln!("LR_ROOT_TESTS != 1; skipping root test");
-        return false;
+        lr_testkit::unavailable!(return false; "LR_ROOT_TESTS != 1 - root test");
     }
     let uid = Command::new("id")
         .arg("-u")
@@ -38,8 +37,7 @@ fn root_tests_enabled() -> bool {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
         .unwrap_or_default();
     if uid != "0" {
-        eprintln!("not running as root (uid {uid}); skipping root test");
-        return false;
+        lr_testkit::unavailable!(return false; "not running as root (uid {uid}) - root test");
     }
     true
 }
@@ -78,12 +76,10 @@ impl Sshd {
     /// Start a server; reusing `base` keeps the served tree across a restart.
     fn start_in(base: PathBuf, owner: Option<tempfile::TempDir>) -> Option<Self> {
         if !have("sshd") {
-            eprintln!("sshd missing (install openssh-server); skipping");
-            return None;
+            lr_testkit::unavailable!(return None; "sshd missing (install openssh-server)");
         }
         if !have("ssh-keygen") {
-            eprintln!("ssh-keygen missing; skipping");
-            return None;
+            lr_testkit::unavailable!(return None; "ssh-keygen missing");
         }
         let _ = std::fs::create_dir_all(base.join("served"));
         let host_key = base.join("hostkey");
@@ -103,8 +99,7 @@ impl Sshd {
                     &key.display().to_string(),
                 ],
             ) {
-                eprintln!("ssh-keygen failed; skipping");
-                return None;
+                lr_testkit::fixture_failed!("ssh-keygen failed");
             }
         }
         let authorized = base.join("authorized_keys");
@@ -148,7 +143,7 @@ impl Sshd {
             ])
             .stderr(Stdio::null())
             .spawn()
-            .ok()?;
+            .expect("spawn sshd");
 
         let host_public =
             std::fs::read_to_string(host_key.with_extension("pub")).expect("host public key");
@@ -171,11 +166,10 @@ impl Sshd {
             port,
         };
         if !server.wait_until_ready() {
-            eprintln!(
-                "sshd did not start; skipping (log: {})",
+            lr_testkit::fixture_failed!(
+                "sshd did not start - (log: {})",
                 std::fs::read_to_string(server.base.join("sshd.log")).unwrap_or_default()
             );
-            return None;
         }
         Some(server)
     }
@@ -267,12 +261,12 @@ fn payload(seed: u64, len: usize) -> Vec<u8> {
 /// A 256 MiB ext4 image with ~40 MiB of data.
 fn source_image(dir: &Path) -> Option<PathBuf> {
     if !have("mkfs.ext4") || !have("debugfs") {
-        return None;
+        lr_testkit::unavailable!(return None; "mkfs.ext4 or debugfs missing");
     }
     let source = dir.join("source.img");
     sparse(&source, 256 * 1024 * 1024);
     if !run("mkfs.ext4", &["-F", "-q", &source.display().to_string()]) {
-        return None;
+        lr_testkit::fixture_failed!("mkfs.ext4 failed");
     }
     let payload_file = dir.join("payload");
     std::fs::write(&payload_file, payload(1, 40 * 1024 * 1024)).expect("payload");

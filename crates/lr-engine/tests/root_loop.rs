@@ -23,8 +23,7 @@ const CHUNK_SIZE: u32 = 1024 * 1024;
 
 fn root_tests_enabled() -> bool {
     if std::env::var("LR_ROOT_TESTS").as_deref() != Ok("1") {
-        eprintln!("LR_ROOT_TESTS != 1; skipping root test");
-        return false;
+        lr_testkit::unavailable!(return false; "LR_ROOT_TESTS != 1 - root test");
     }
     let uid = Command::new("id")
         .arg("-u")
@@ -32,8 +31,7 @@ fn root_tests_enabled() -> bool {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
         .unwrap_or_default();
     if uid != "0" {
-        eprintln!("not running as root (uid {uid}); skipping root test");
-        return false;
+        lr_testkit::unavailable!(return false; "not running as root (uid {uid}) - root test");
     }
     true
 }
@@ -83,10 +81,12 @@ impl LoopDevice {
         file.set_len(size_bytes).expect("size");
         drop(file);
 
-        let free = Command::new("losetup").arg("-f").output().ok()?;
+        let free = Command::new("losetup")
+            .arg("-f")
+            .output()
+            .expect("run losetup -f");
         if !free.status.success() {
-            eprintln!("losetup -f failed");
-            return None;
+            lr_testkit::fixture_failed!("losetup -f failed");
         }
         let device = PathBuf::from(String::from_utf8_lossy(&free.stdout).trim().to_owned());
         if !run(
@@ -97,9 +97,8 @@ impl LoopDevice {
                 &backing.display().to_string(),
             ],
         ) {
-            eprintln!("losetup attach failed for {}", device.display());
             let _ = run("losetup", &["-d", &device.display().to_string()]);
-            return None;
+            lr_testkit::fixture_failed!("losetup attach failed for {}", device.display());
         }
         Some(Self {
             device,
@@ -260,8 +259,7 @@ fn ext4_loop_completeness_and_size_bound() {
         return;
     }
     if !have("mkfs.ext4") || !have("fsck.ext4") {
-        eprintln!("e2fsprogs missing; skipping");
-        return;
+        lr_testkit::unavailable!("e2fsprogs missing");
     }
 
     const SIZE: u64 = 1024 * 1024 * 1024;
@@ -368,8 +366,7 @@ fn xfs_loop_completeness() {
         return;
     }
     if !have("mkfs.xfs") || !have("xfs_repair") {
-        eprintln!("xfsprogs missing; skipping");
-        return;
+        lr_testkit::unavailable!("xfsprogs missing");
     }
 
     const SIZE: u64 = 512 * 1024 * 1024;
@@ -534,8 +531,7 @@ fn restore_refuses_a_swap_target() {
     };
     assert!(run("mkswap", &[&target.path().display().to_string()]));
     if !run("swapon", &[&target.path().display().to_string()]) {
-        eprintln!("swapon unavailable in this environment; skipping the swap check");
-        return;
+        lr_testkit::unavailable!("swapon unavailable in this environment - the swap check");
     }
     let result = prepare_restore(&PrepareRequest::from_path(
         &backup.image_path,

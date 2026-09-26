@@ -16,8 +16,7 @@ const CLI: &str = env!("CARGO_BIN_EXE_linuxreflect");
 
 fn root_tests_enabled() -> bool {
     if std::env::var("LR_ROOT_TESTS").as_deref() != Ok("1") {
-        eprintln!("LR_ROOT_TESTS != 1; skipping");
-        return false;
+        lr_testkit::unavailable!(return false; "LR_ROOT_TESTS != 1");
     }
     let uid = Command::new("id")
         .arg("-u")
@@ -25,8 +24,7 @@ fn root_tests_enabled() -> bool {
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
         .unwrap_or_default();
     if uid != "0" {
-        eprintln!("not running as root (uid {uid}); skipping");
-        return false;
+        lr_testkit::unavailable!(return false; "not running as root (uid {uid})");
     }
     true
 }
@@ -92,8 +90,7 @@ impl SourceImage {
             "losetup",
             &["-P", &loop_device, &backing.display().to_string()],
         ) {
-            eprintln!("losetup failed; skipping");
-            return None;
+            lr_testkit::fixture_failed!("losetup failed");
         }
         let formatted = match fs {
             "ext4" => run("mkfs.ext4", &["-F", "-q", "-L", "LREXPORT", &loop_device]),
@@ -102,15 +99,13 @@ impl SourceImage {
         };
         if !formatted {
             let _ = run("losetup", &["-d", &loop_device]);
-            eprintln!("mkfs.{fs} failed; skipping");
-            return None;
+            lr_testkit::fixture_failed!("mkfs.{fs} failed");
         }
         let mountpoint = dir.join(format!("{fs}-populate"));
         std::fs::create_dir_all(&mountpoint).expect("mountpoint");
         if !run("mount", &[&loop_device, &mountpoint.display().to_string()]) {
             let _ = run("losetup", &["-d", &loop_device]);
-            eprintln!("mounting the source failed; skipping");
-            return None;
+            lr_testkit::fixture_failed!("mounting the source failed");
         }
         std::fs::create_dir_all(mountpoint.join("nested/deeper")).expect("dirs");
         std::fs::write(mountpoint.join("hello.txt"), b"block export\n").expect("file");
@@ -148,8 +143,7 @@ fn free_nbd_device() -> Option<PathBuf> {
         .ok()?;
     let device = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if device.is_empty() || device == "/dev/" {
-        eprintln!("no free NBD device; skipping");
-        return None;
+        lr_testkit::unavailable!(return None; "no free NBD device");
     }
     Some(PathBuf::from(device))
 }
@@ -160,13 +154,11 @@ fn export_case(fs: &str, size_mib: u64) {
     }
     for tool in ["nbd-client", "losetup", "mount", "umount", "sha256sum"] {
         if !have(tool) {
-            eprintln!("{tool} missing; skipping");
-            return;
+            lr_testkit::unavailable!("{tool} missing");
         }
     }
     if !have("mkfs.ext4") || !have("mkfs.xfs") {
-        eprintln!("mkfs.ext4/mkfs.xfs missing; skipping");
-        return;
+        lr_testkit::unavailable!("mkfs.ext4/mkfs.xfs missing");
     }
     if free_nbd_device().is_none() {
         return;
@@ -320,8 +312,7 @@ fn the_daemon_exports_an_image() {
     }
     for tool in ["nbd-client", "losetup", "mount", "umount"] {
         if !have(tool) {
-            eprintln!("{tool} missing; skipping");
-            return;
+            lr_testkit::unavailable!("{tool} missing");
         }
     }
     if free_nbd_device().is_none() {

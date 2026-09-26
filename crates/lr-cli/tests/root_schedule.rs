@@ -21,8 +21,7 @@ const CLI: &str = env!("CARGO_BIN_EXE_linuxreflect");
 
 fn root_tests_enabled() -> bool {
     if std::env::var("LR_ROOT_TESTS").as_deref() != Ok("1") {
-        eprintln!("LR_ROOT_TESTS != 1; skipping");
-        return false;
+        lr_testkit::unavailable!(return false; "LR_ROOT_TESTS != 1");
     }
     let uid = Command::new("id")
         .arg("-u")
@@ -30,8 +29,7 @@ fn root_tests_enabled() -> bool {
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
         .unwrap_or_default();
     if uid != "0" {
-        eprintln!("not running as root (uid {uid}); skipping");
-        return false;
+        lr_testkit::unavailable!(return false; "not running as root (uid {uid})");
     }
     true
 }
@@ -79,8 +77,7 @@ fn a_generated_timer_runs_the_job() {
     }
     for tool in ["systemctl", "systemd-analyze"] {
         if !have(tool) {
-            eprintln!("{tool} missing; skipping");
-            return;
+            lr_testkit::unavailable!("{tool} missing");
         }
     }
     let running = Command::new("systemctl")
@@ -92,8 +89,7 @@ fn a_generated_timer_runs_the_job() {
         })
         .unwrap_or(false);
     if !running {
-        eprintln!("systemd is not running as PID 1; skipping");
-        return;
+        lr_testkit::unavailable!("systemd is not running as PID 1");
     }
 
     let dir = tempfile::tempdir_in("/tmp").expect("tempdir");
@@ -274,8 +270,7 @@ fn the_session_helper_posts_a_notification() {
     }
     for tool in ["dbus-daemon", "python3"] {
         if !have(tool) {
-            eprintln!("{tool} missing; skipping");
-            return;
+            lr_testkit::unavailable!("{tool} missing");
         }
     }
     let session = Path::new(CLI)
@@ -283,8 +278,7 @@ fn the_session_helper_posts_a_notification() {
         .expect("cli parent")
         .join("linuxreflect-session");
     if !session.exists() {
-        eprintln!("linuxreflect-session is not built next to the CLI; skipping");
-        return;
+        lr_testkit::unavailable!("linuxreflect-session is not built next to the CLI");
     }
     let daemon_binary = Path::new(CLI)
         .parent()
@@ -422,8 +416,7 @@ fn the_session_helper_posts_a_notification_on_wayland() {
     }
     for tool in ["dbus-daemon", "sway", "mako", "makoctl"] {
         if !have(tool) {
-            eprintln!("{tool} missing; skipping");
-            return;
+            lr_testkit::unavailable!("{tool} missing");
         }
     }
     let session = Path::new(CLI)
@@ -435,8 +428,7 @@ fn the_session_helper_posts_a_notification_on_wayland() {
         .expect("cli parent")
         .join("linuxreflect-daemon");
     if !session.exists() || !daemon_binary.exists() {
-        eprintln!("linuxreflect-session/daemon are not built next to the CLI; skipping");
-        return;
+        lr_testkit::unavailable!("linuxreflect-session/daemon are not built next to the CLI");
     }
 
     let dir = tempfile::tempdir_in("/tmp").expect("tempdir");

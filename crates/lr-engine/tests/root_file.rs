@@ -14,8 +14,7 @@ use lr_engine::restore::{ApplyRequest, PrepareRequest, apply_restore, prepare_re
 
 fn root_tests_enabled() -> bool {
     if std::env::var("LR_ROOT_TESTS").as_deref() != Ok("1") {
-        eprintln!("LR_ROOT_TESTS != 1; skipping");
-        return false;
+        lr_testkit::unavailable!(return false; "LR_ROOT_TESTS != 1");
     }
     let uid = Command::new("id")
         .arg("-u")
@@ -23,8 +22,7 @@ fn root_tests_enabled() -> bool {
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
         .unwrap_or_default();
     if uid != "0" {
-        eprintln!("not running as root (uid {uid}); skipping");
-        return false;
+        lr_testkit::unavailable!(return false; "not running as root (uid {uid})");
     }
     true
 }
@@ -106,8 +104,7 @@ fn device_nodes_ownership_and_xattrs_round_trip() {
     }
     for tool in ["rsync", "mkfifo", "setfacl", "getfacl"] {
         if !have(tool) {
-            eprintln!("{tool} missing; skipping");
-            return;
+            lr_testkit::unavailable!("{tool} missing");
         }
     }
     let dir = tempfile::tempdir().expect("tempdir");
@@ -197,8 +194,7 @@ fn one_file_system_does_not_cross_a_mount() {
             &source.join("mounted").display().to_string(),
         ],
     ) {
-        eprintln!("mounting a tmpfs failed; skipping");
-        return;
+        lr_testkit::fixture_failed!("mounting a tmpfs failed");
     }
     std::fs::write(source.join("mounted/other.txt"), b"other").expect("file");
     let walk = lr_engine::tree::walk(
@@ -228,8 +224,7 @@ fn a_btrfs_source_is_snapshotted_for_point_in_time() {
     }
     for tool in ["mkfs.btrfs", "btrfs", "losetup", "mount", "rsync"] {
         if !have(tool) {
-            eprintln!("{tool} missing; skipping");
-            return;
+            lr_testkit::unavailable!("{tool} missing");
         }
     }
     let dir = tempfile::tempdir().expect("tempdir");
@@ -243,8 +238,7 @@ fn a_btrfs_source_is_snapshotted_for_point_in_time() {
         .expect("losetup -f");
     let device = String::from_utf8_lossy(&free.stdout).trim().to_owned();
     if !run("losetup", &["-P", &device, &backing.display().to_string()]) {
-        eprintln!("losetup failed; skipping");
-        return;
+        lr_testkit::fixture_failed!("losetup failed");
     }
     let cleanup = |mountpoint: &Path| {
         let _ = run("umount", &[&mountpoint.display().to_string()]);
@@ -252,15 +246,13 @@ fn a_btrfs_source_is_snapshotted_for_point_in_time() {
     };
     if !run("mkfs.btrfs", &["-f", "-q", &device]) {
         cleanup(&dir.path().join("mnt"));
-        eprintln!("mkfs.btrfs failed; skipping");
-        return;
+        lr_testkit::fixture_failed!("mkfs.btrfs failed");
     }
     let top = dir.path().join("mnt");
     std::fs::create_dir_all(&top).expect("mountpoint");
     if !run("mount", &[&device, &top.display().to_string()]) {
         cleanup(&top);
-        eprintln!("mounting btrfs failed; skipping");
-        return;
+        lr_testkit::fixture_failed!("mounting btrfs failed");
     }
     // The provider snapshots subvolumes, not the top level (spec §E.1).
     if !run(
@@ -272,8 +264,7 @@ fn a_btrfs_source_is_snapshotted_for_point_in_time() {
         ],
     ) {
         cleanup(&top);
-        eprintln!("btrfs subvolume create failed; skipping");
-        return;
+        lr_testkit::fixture_failed!("btrfs subvolume create failed");
     }
     let _ = run("umount", &[&top.display().to_string()]);
     let source = dir.path().join("subvol");
@@ -283,8 +274,7 @@ fn a_btrfs_source_is_snapshotted_for_point_in_time() {
         &["-o", "subvol=data", &device, &source.display().to_string()],
     ) {
         let _ = run("losetup", &["-d", &device]);
-        eprintln!("mounting the subvolume failed; skipping");
-        return;
+        lr_testkit::fixture_failed!("mounting the subvolume failed");
     }
 
     let dest = dir.path().join("backups");

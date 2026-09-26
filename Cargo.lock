@@ -3263,6 +3263,7 @@ dependencies = [
  "lr-proto",
  "lr-snapshot",
  "lr-store",
+ "lr-testkit",
  "serde",
  "serde_json",
  "tempfile",
@@ -3278,6 +3279,7 @@ name = "lr-core"
 version = "0.1.0"
 dependencies = [
  "gpt",
+ "lr-testkit",
  "lr-unsafe",
  "mbrman",
  "serde",
@@ -3317,6 +3319,7 @@ dependencies = [
  "lr-proto",
  "lr-snapshot",
  "lr-store",
+ "lr-testkit",
  "lr-unsafe",
  "nix",
  "serde",
@@ -3348,6 +3351,7 @@ dependencies = [
  "lr-fsmap",
  "lr-snapshot",
  "lr-store",
+ "lr-testkit",
  "lr-unsafe",
  "serde",
  "serde_json",
@@ -3390,6 +3394,7 @@ name = "lr-fsmap"
 version = "0.1.0"
 dependencies = [
  "lr-core",
+ "lr-testkit",
  "lr-unsafe",
  "tempfile",
  "thiserror 2.0.20",
@@ -3405,6 +3410,7 @@ dependencies = [
  "lr-engine",
  "lr-format",
  "lr-store",
+ "lr-testkit",
  "tempfile",
  "tracing",
 ]
@@ -3420,6 +3426,7 @@ dependencies = [
  "lr-engine",
  "lr-proto",
  "lr-store",
+ "lr-testkit",
  "png",
  "rfd",
  "serde",
@@ -3453,6 +3460,7 @@ dependencies = [
  "clap",
  "lr-core",
  "lr-engine",
+ "lr-testkit",
  "serde",
  "serde_json",
  "tempfile",
@@ -3509,10 +3517,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lr-testkit"
+version = "0.1.0"
+
+[[package]]
 name = "lr-unsafe"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "lr-testkit",
  "tempfile",
 ]
 

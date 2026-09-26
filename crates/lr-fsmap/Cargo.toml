@@ -14,6 +14,7 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+lr-testkit.workspace = true
 tempfile.workspace = true
 
 [lints]

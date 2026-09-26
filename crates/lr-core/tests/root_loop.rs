@@ -15,8 +15,7 @@ use std::process::Command;
 
 fn root_tests_enabled() -> bool {
     if std::env::var("LR_ROOT_TESTS").as_deref() != Ok("1") {
-        eprintln!("LR_ROOT_TESTS != 1; skipping root test");
-        return false;
+        lr_testkit::unavailable!(return false; "LR_ROOT_TESTS != 1 - root test");
     }
     let uid = Command::new("id")
         .arg("-u")
@@ -24,8 +23,7 @@ fn root_tests_enabled() -> bool {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
         .unwrap_or_default();
     if uid != "0" {
-        eprintln!("not running as root (uid {uid}); skipping root test");
-        return false;
+        lr_testkit::unavailable!(return false; "not running as root (uid {uid}) - root test");
     }
     true
 }
@@ -54,13 +52,15 @@ impl Loop {
 
         // `losetup --find --show` is racy in some kernels/containers, so pick a
         // free device and attach explicitly (works on WSL2, which has no udev).
-        let free = Command::new("losetup").arg("-f").output().ok()?;
+        let free = Command::new("losetup")
+            .arg("-f")
+            .output()
+            .expect("run losetup -f");
         if !free.status.success() {
-            eprintln!(
+            lr_testkit::fixture_failed!(
                 "losetup -f failed: {}",
                 String::from_utf8_lossy(&free.stderr)
             );
-            return None;
         }
         let device = PathBuf::from(String::from_utf8_lossy(&free.stdout).trim().to_owned());
         let attached = Command::new("losetup")
@@ -70,13 +70,12 @@ impl Loop {
             .output()
             .expect("run losetup");
         if !attached.status.success() {
-            eprintln!(
+            let _ = Command::new("losetup").arg("-d").arg(&device).status();
+            lr_testkit::fixture_failed!(
                 "losetup -P {} failed: {}",
                 device.display(),
                 String::from_utf8_lossy(&attached.stderr)
             );
-            let _ = Command::new("losetup").arg("-d").arg(&device).status();
-            return None;
         }
         Some(Self { device, _dir: dir })
     }
@@ -183,8 +182,7 @@ fn real_loop_gpt_partitions_and_filesystems_are_discovered() {
     assert!(status.success(), "sgdisk must succeed");
 
     if !loop_dev.reread_partitions(3) {
-        eprintln!("partition nodes did not appear; skipping the real-device part");
-        return;
+        lr_testkit::fixture_failed!("partition nodes did not appear - the real-device part");
     }
 
     let root_part = loop_dev.partition_path(2);

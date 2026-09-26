@@ -46,15 +46,14 @@ fn payload(seed: u64, len: usize) -> Vec<u8> {
 
 fn source_image(dir: &Path) -> Option<PathBuf> {
     if !have("mkfs.ext4") || !have("debugfs") {
-        eprintln!("mkfs.ext4 or debugfs missing; skipping");
-        return None;
+        lr_testkit::unavailable!(return None; "mkfs.ext4 or debugfs missing");
     }
     let source = dir.join("source.img");
     let file = std::fs::File::create(&source).expect("create");
     file.set_len(DEVICE_SIZE).expect("size");
     drop(file);
     if !run("mkfs.ext4", &["-F", "-q", &source.display().to_string()]) {
-        return None;
+        lr_testkit::fixture_failed!("mkfs.ext4 failed");
     }
     let payload_file = dir.join("payload");
     std::fs::write(&payload_file, payload(1, 4 * 1024 * 1024)).expect("payload");

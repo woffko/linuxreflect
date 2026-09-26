@@ -42,16 +42,14 @@ fn sparse(path: &Path, size: u64) {
 /// Create an ext4 filesystem in `path` and write `files` into it with debugfs.
 fn make_ext4(path: &Path, files: &[(String, Vec<u8>)]) -> bool {
     if !have("mkfs.ext4") || !have("debugfs") {
-        eprintln!("mkfs.ext4 or debugfs missing; skipping");
-        return false;
+        lr_testkit::unavailable!(return false; "mkfs.ext4 or debugfs missing");
     }
     sparse(path, DEVICE_SIZE);
     if !run(
         "mkfs.ext4",
         &["-F", "-q", "-L", "ROOTFS", &path.display().to_string()],
     ) {
-        eprintln!("mkfs.ext4 failed");
-        return false;
+        lr_testkit::fixture_failed!("mkfs.ext4 failed");
     }
     let dir = tempfile::tempdir().expect("tempdir");
     let mut commands = String::new();

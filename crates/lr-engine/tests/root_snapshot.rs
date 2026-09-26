@@ -29,8 +29,7 @@ const MARKER_PATTERN: u8 = 0xA5;
 
 fn root_tests_enabled() -> bool {
     if std::env::var("LR_ROOT_TESTS").as_deref() != Ok("1") {
-        eprintln!("LR_ROOT_TESTS != 1; skipping root test");
-        return false;
+        lr_testkit::unavailable!(return false; "LR_ROOT_TESTS != 1 - root test");
     }
     let uid = Command::new("id")
         .arg("-u")
@@ -38,8 +37,7 @@ fn root_tests_enabled() -> bool {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
         .unwrap_or_default();
     if uid != "0" {
-        eprintln!("not running as root (uid {uid}); skipping root test");
-        return false;
+        lr_testkit::unavailable!(return false; "not running as root (uid {uid}) - root test");
     }
     true
 }
@@ -111,9 +109,12 @@ impl LoopDisk {
         let dir = tempfile::tempdir().expect("tempdir");
         let backing = dir.path().join("disk.img");
         sparse(&backing, size);
-        let free = Command::new("losetup").arg("-f").output().ok()?;
+        let free = Command::new("losetup")
+            .arg("-f")
+            .output()
+            .expect("run losetup -f");
         if !free.status.success() {
-            return None;
+            lr_testkit::fixture_failed!("losetup -f found no free loop device");
         }
         let device = PathBuf::from(String::from_utf8_lossy(&free.stdout).trim().to_owned());
         if !run(
@@ -124,7 +125,7 @@ impl LoopDisk {
                 &backing.display().to_string(),
             ],
         ) {
-            return None;
+            lr_testkit::fixture_failed!("losetup could not attach {}", backing.display());
         }
         Some(Self { device, _dir: dir })
     }
@@ -152,18 +153,15 @@ impl VolumeGroup {
             "pvcreate", "vgcreate", "lvcreate", "lvremove", "vgremove", "lvs",
         ] {
             if !have(tool) {
-                eprintln!("{tool} missing; skipping the LVM test");
-                return None;
+                lr_testkit::unavailable!(return None; "{tool} missing - the LVM test");
             }
         }
         let loop_disk = LoopDisk::attach(size)?;
         if !run("pvcreate", &["-f", "-y", &loop_disk.label()]) {
-            eprintln!("pvcreate failed");
-            return None;
+            lr_testkit::fixture_failed!("pvcreate failed");
         }
         if !run("vgcreate", &[name, &loop_disk.label()]) {
-            eprintln!("vgcreate failed");
-            return None;
+            lr_testkit::fixture_failed!("vgcreate failed");
         }
         Some(Self {
             name: name.to_owned(),
@@ -203,13 +201,11 @@ fn source_layout(device: &Path) -> lr_core::SourceLayout {
 /// Build a classic-snapshot origin: one ext4 LV inside a loop-backed VG.
 fn classic_origin(vg: &VolumeGroup) -> Option<String> {
     if !run("lvcreate", &["-n", "origin", "-L", "1G", &vg.path()]) {
-        eprintln!("lvcreate origin failed");
-        return None;
+        lr_testkit::fixture_failed!("lvcreate origin failed");
     }
     let origin = vg.lv("origin");
     if !run("mkfs.ext4", &["-F", "-q", &format!("/dev/{origin}")]) {
-        eprintln!("mkfs.ext4 on the LV failed");
-        return None;
+        lr_testkit::fixture_failed!("mkfs.ext4 on the LV failed");
     }
     Some(origin)
 }
@@ -298,10 +294,9 @@ fn a_killed_job_leaves_a_snapshot_that_the_sweep_removes() {
         std::thread::sleep(Duration::from_millis(200));
     }
     if !ready.exists() {
-        eprintln!("the child never signalled readiness; skipping");
         let _ = child.kill();
         let _ = child.wait();
-        return;
+        lr_testkit::fixture_failed!("the child never signalled readiness");
     }
     assert!(
         !vg.stray_snapshots().is_empty(),
@@ -395,7 +390,11 @@ fn an_overflowing_snapshot_aborts_the_job() {
             "unexpected abort reason: {result:?}"
         );
     } else {
-        eprintln!("the snapshot did not reach 90 % in 20 s; the abort path is unproven here");
+        // The overflow scenario did not happen, so the abort path was not
+        // exercised: that is an unavailable scenario, never a pass.
+        lr_testkit::report_unavailable(
+            "the snapshot did not reach 90 % in 20 s; the abort path is unproven",
+        );
     }
     assert!(
         !path.exists(),
@@ -410,8 +409,7 @@ fn a_thin_snapshot_is_supported() {
         return;
     }
     if !have("thin_check") {
-        eprintln!("thin-provisioning-tools missing; skipping");
-        return;
+        lr_testkit::unavailable!("thin-provisioning-tools missing");
     }
     let Some(vg) = VolumeGroup::create("lrtestthin", 2 * 1024 * 1024 * 1024) else {
         return;
@@ -431,8 +429,7 @@ fn a_thin_snapshot_is_supported() {
             &vg.path(),
         ],
     ) {
-        eprintln!("creating the thin pool failed; skipping");
-        return;
+        lr_testkit::fixture_failed!("creating the thin pool failed");
     }
     if !run(
         "lvcreate",
@@ -448,8 +445,7 @@ fn a_thin_snapshot_is_supported() {
             &vg.path(),
         ],
     ) {
-        eprintln!("creating the thin LV failed; skipping");
-        return;
+        lr_testkit::fixture_failed!("creating the thin LV failed");
     }
     let origin_dev = PathBuf::from(format!("/dev/{}", vg.lv("origin")));
     if !run(
@@ -483,19 +479,18 @@ fn a_thin_snapshot_is_supported() {
 /// Mount a loop-backed ext4 filesystem and return `(mountpoint, guard)`.
 fn mounted_ext4(work: &Path, name: &str) -> Option<(PathBuf, tempfile::TempDir, LoopDisk)> {
     if !have("mkfs.ext4") {
-        return None;
+        lr_testkit::unavailable!(return None; "mkfs.ext4 missing");
     }
     let loop_disk = LoopDisk::attach(256 * 1024 * 1024)?;
     if !run("mkfs.ext4", &["-F", "-q", &loop_disk.label()]) {
-        return None;
+        lr_testkit::fixture_failed!("mkfs.ext4 failed");
     }
     let mountpoint = tempfile::tempdir_in(work).expect("mountpoint dir");
     if !run(
         "mount",
         &[&loop_disk.label(), &mountpoint.path().display().to_string()],
     ) {
-        eprintln!("mount failed");
-        return None;
+        lr_testkit::fixture_failed!("mount failed");
     }
     let path = mountpoint.path().to_path_buf();
     let _ = name;
@@ -593,10 +588,9 @@ fn kill_9_is_recovered_by_the_deadman() {
         std::thread::sleep(Duration::from_millis(200));
     }
     if !ready.exists() {
-        eprintln!("the child never froze; skipping");
         let _ = child.kill();
         let _ = child.wait();
-        return;
+        lr_testkit::fixture_failed!("the child never froze");
     }
 
     // kill -9 with no chance to thaw: only the external deadman can help.

@@ -19,13 +19,11 @@ static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0)
 
 fn root_tests_enabled() -> bool {
     if std::env::var("LR_ROOT_TESTS").as_deref() != Ok("1") {
-        eprintln!("LR_ROOT_TESTS != 1; skipping root test");
-        return false;
+        lr_testkit::unavailable!(return false; "LR_ROOT_TESTS != 1 - root test");
     }
     let uid = text(Command::new("id").arg("-u").output().ok());
     if uid.trim() != "0" {
-        eprintln!("not running as root (uid {}); skipping", uid.trim());
-        return false;
+        lr_testkit::unavailable!(return false; "not running as root (uid {})", uid.trim());
     }
     true
 }
@@ -71,8 +69,7 @@ impl SystemPolicy {
     fn ensure() -> Option<Self> {
         let dir = Path::new("/usr/share/polkit-1/actions");
         if !dir.is_dir() {
-            eprintln!("{} is missing; skipping the polkit test", dir.display());
-            return None;
+            lr_testkit::unavailable!(return None; "{} is missing - the polkit test", dir.display());
         }
         let path = dir.join("org.linuxreflect.policy");
         if path.exists() {
@@ -97,9 +94,8 @@ impl SystemPolicy {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        eprintln!("polkitd did not register org.linuxreflect.backup.create");
         let _ = std::fs::remove_file(&path);
-        None
+        lr_testkit::fixture_failed!("polkitd did not register org.linuxreflect.backup.create")
     }
 }
 
@@ -278,7 +274,7 @@ impl Daemon {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
-            .ok()?;
+            .expect("spawn the daemon");
         let mut daemon = Self { child, socket, dir };
         for _ in 0..60 {
             if daemon.socket.exists()
@@ -287,12 +283,14 @@ impl Daemon {
                 return Some(daemon);
             }
             if let Ok(Some(_)) = daemon.child.try_wait() {
-                eprintln!("daemon exited: {}", daemon.stderr());
-                return None;
+                lr_testkit::fixture_failed!(
+                    "the daemon exited before listening: {}",
+                    daemon.stderr()
+                );
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        None
+        lr_testkit::fixture_failed!("the daemon did not listen within 6 s: {}", daemon.stderr())
     }
 
     fn stderr(&mut self) -> String {
@@ -350,7 +348,7 @@ struct LoopDisk {
 impl LoopDisk {
     fn ext4(size_mib: u64) -> Option<Self> {
         if !have("losetup") || !have("mkfs.ext4") {
-            return None;
+            lr_testkit::unavailable!(return None; "losetup or mkfs.ext4 missing");
         }
         let dir = tempfile::tempdir().expect("tempdir");
         let backing = dir.path().join("disk.img");
@@ -372,12 +370,11 @@ impl LoopDisk {
                 &backing.display().to_string(),
             ],
         ) {
-            eprintln!("losetup failed; skipping");
-            return None;
+            lr_testkit::fixture_failed!("losetup failed");
         }
         if !run("mkfs.ext4", &["-F", "-q", &device.display().to_string()]) {
             let _ = run("losetup", &["-d", &device.display().to_string()]);
-            return None;
+            lr_testkit::fixture_failed!("mkfs.ext4 failed");
         }
         let mount_dir = tempfile::tempdir().expect("mountdir");
         Some(Self { device, mount_dir })
@@ -413,8 +410,7 @@ fn a_loop_device_round_trips_through_the_daemon() {
     }
     for tool in ["losetup", "mount", "mkfs.ext4", "diff", "sha256sum"] {
         if !have(tool) {
-            eprintln!("{tool} missing; skipping");
-            return;
+            lr_testkit::unavailable!("{tool} missing");
         }
     }
     let Some(source) = LoopDisk::ext4(256) else {
@@ -437,8 +433,7 @@ fn a_loop_device_round_trips_through_the_daemon() {
     let Some(daemon) =
         Daemon::start(&["--dev-mode", "--auth", "static:0", "--socket-group", &group])
     else {
-        eprintln!("the daemon did not start; skipping");
-        return;
+        lr_testkit::fixture_failed!("the daemon did not start");
     };
     let mode = std::fs::metadata(&daemon.socket)
         .expect("socket stat")
@@ -555,16 +550,14 @@ fn polkit_denies_a_non_root_peer_and_allows_root() {
     }
     for tool in ["setpriv"] {
         if !have(tool) {
-            eprintln!("{tool} missing; skipping");
-            return;
+            lr_testkit::unavailable!("{tool} missing");
         }
     }
     // polkit only works while its daemon answers on the system bus.
     let polkit_running =
         run("pgrep", &["-x", "polkitd"]) && Path::new("/run/dbus/system_bus_socket").exists();
     if !polkit_running {
-        eprintln!("polkitd or the system bus is not running; skipping the polkit test");
-        return;
+        lr_testkit::unavailable!("polkitd or the system bus is not running - the polkit test");
     }
     let Some(_policy) = SystemPolicy::ensure() else {
         return;
@@ -575,8 +568,7 @@ fn polkit_denies_a_non_root_peer_and_allows_root() {
     // A world-connectable socket lets the unprivileged peer reach the daemon
     // at all; the decision under test is polkit's, not the socket's.
     let Some(daemon) = Daemon::start(&["--socket-mode", "0666"]) else {
-        eprintln!("the daemon did not start; skipping");
-        return;
+        lr_testkit::fixture_failed!("the daemon did not start");
     };
     let work = tempfile::tempdir().expect("workdir");
     let source = work.path().join("source.img");
@@ -640,12 +632,10 @@ fn socket_activation_is_honoured() {
         return;
     }
     if !have("systemd-socket-activate") {
-        eprintln!("systemd-socket-activate missing; skipping");
-        return;
+        lr_testkit::unavailable!("systemd-socket-activate missing");
     }
     let Some(binary) = daemon_binary() else {
-        eprintln!("the daemon binary is missing; skipping");
-        return;
+        lr_testkit::unavailable!("the daemon binary is missing");
     };
     let dir = tempfile::tempdir_in("/tmp").expect("tempdir");
     let activated = dir.path().join("activated.sock");

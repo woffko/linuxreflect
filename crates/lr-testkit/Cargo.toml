@@ -1,0 +1,13 @@
+[package]
+name = "lr-testkit"
+description = "Test helpers: honest accounting of unavailable prerequisites and fixture failures (R40)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -105,8 +105,7 @@ fn restore(plan: &lr_engine::restore::RestorePlan) -> lr_engine::file::FileResto
 #[test]
 fn a_tree_round_trips_with_no_rsync_difference() {
     if !have("rsync") {
-        eprintln!("rsync missing; skipping");
-        return;
+        lr_testkit::unavailable!("rsync missing");
     }
     let dir = tempfile::tempdir().expect("tempdir");
     let source = dir.path().join("source");
@@ -144,8 +143,7 @@ fn a_tree_round_trips_with_no_rsync_difference() {
 #[test]
 fn an_incremental_stores_only_the_changed_file() {
     if !have("rsync") {
-        eprintln!("rsync missing; skipping");
-        return;
+        lr_testkit::unavailable!("rsync missing");
     }
     let dir = tempfile::tempdir().expect("tempdir");
     let source = dir.path().join("source");
@@ -196,8 +194,7 @@ fn an_incremental_stores_only_the_changed_file() {
 #[test]
 fn a_differential_only_needs_the_full_to_restore() {
     if !have("rsync") {
-        eprintln!("rsync missing; skipping");
-        return;
+        lr_testkit::unavailable!("rsync missing");
     }
     let dir = tempfile::tempdir().expect("tempdir");
     let source = dir.path().join("source");
@@ -403,8 +400,7 @@ fn a_non_empty_target_needs_merge() {
 #[test]
 fn a_file_deleted_before_a_later_member_stays_deleted() {
     if !have("rsync") {
-        eprintln!("rsync missing; skipping");
-        return;
+        lr_testkit::unavailable!("rsync missing");
     }
     for member_type in [MemberType::Incremental, MemberType::Differential] {
         let dir = tempfile::tempdir().expect("tempdir");

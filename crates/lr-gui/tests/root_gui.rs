@@ -60,8 +60,7 @@ fn private_test_dir() -> tempfile::TempDir {
 
 fn root_tests_enabled() -> bool {
     if std::env::var("LR_ROOT_TESTS").as_deref() != Ok("1") {
-        eprintln!("LR_ROOT_TESTS != 1; skipping");
-        return false;
+        lr_testkit::unavailable!(return false; "LR_ROOT_TESTS != 1");
     }
     true
 }
@@ -268,14 +267,12 @@ fn x11_round_trip(encrypted: bool) {
     }
     for tool in ["Xvfb", "xdotool"] {
         if !have(tool) {
-            eprintln!("{tool} missing; skipping the X11 GUI test");
-            return;
+            lr_testkit::unavailable!("{tool} missing - the X11 GUI test");
         }
     }
     let dir = private_test_dir();
     let Some(daemon) = Daemon::start(dir.path()) else {
-        eprintln!("the daemon binary is not built next to the GUI; skipping");
-        return;
+        lr_testkit::unavailable!("the daemon binary is not built next to the GUI");
     };
 
     // A private X server so the GUI and xdotool share one display.
@@ -421,13 +418,11 @@ fn create_and_restore_through_the_gui_on_wayland() {
         return;
     }
     if !have("weston") {
-        eprintln!("weston missing; skipping the Wayland GUI test");
-        return;
+        lr_testkit::unavailable!("weston missing - the Wayland GUI test");
     }
     let dir = private_test_dir();
     let Some(daemon) = Daemon::start(dir.path()) else {
-        eprintln!("the daemon binary is not built next to the GUI; skipping");
-        return;
+        lr_testkit::unavailable!("the daemon binary is not built next to the GUI");
     };
     let runtime = dir.path().join("run");
     std::fs::create_dir_all(&runtime).expect("runtime dir");

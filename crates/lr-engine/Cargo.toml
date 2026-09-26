@@ -29,6 +29,7 @@ tracing.workspace = true
 tempfile.workspace = true
 
 [dev-dependencies]
+lr-testkit.workspace = true
 libc.workspace = true
 lr-fsmap.workspace = true
 lr-snapshot.workspace = true

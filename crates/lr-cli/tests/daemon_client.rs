@@ -24,9 +24,19 @@ struct Daemon {
 }
 
 impl Daemon {
+    /// Start a private daemon. A missing binary is an unavailable
+    /// prerequisite; a daemon that exits or never listens is a fixture
+    /// failure, reported with its own stderr (R40).
     fn start(auth: &str) -> Option<Self> {
-        let binary = daemon_binary()?;
-        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(binary) = daemon_binary() else {
+            lr_testkit::unavailable!(return None; "the daemon binary is not built next to the CLI");
+        };
+        // 0700 whatever the umask: the daemon rightly refuses a
+        // group-writable directory for its token key.
+        let dir = tempfile::Builder::new()
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .tempdir()
+            .expect("private daemon directory");
         let socket = dir.path().join("daemon.sock");
         let child = Command::new(binary)
             .args([
@@ -43,9 +53,9 @@ impl Daemon {
                 &dir.path().join("token.key").display().to_string(),
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
-            .ok()?;
+            .expect("spawn the daemon");
         let mut daemon = Self {
             child,
             socket,
@@ -55,12 +65,18 @@ impl Daemon {
             if daemon.socket.exists() {
                 return Some(daemon);
             }
-            if let Ok(Some(_)) = daemon.child.try_wait() {
-                return None;
+            if let Ok(Some(status)) = daemon.child.try_wait() {
+                let mut error = String::new();
+                if let Some(mut pipe) = daemon.child.stderr.take() {
+                    let _ = std::io::Read::read_to_string(&mut pipe, &mut error);
+                }
+                lr_testkit::fixture_failed!(
+                    "the daemon exited ({status}) before listening: {error}"
+                );
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        None
+        lr_testkit::fixture_failed!("the daemon did not create its socket within 5 s")
     }
 
     fn cli(&self, args: &[&str]) -> Output {
@@ -97,8 +113,7 @@ fn have(tool: &str) -> bool {
 
 fn source_image(dir: &Path) -> Option<PathBuf> {
     if !have("mkfs.ext4") {
-        eprintln!("mkfs.ext4 missing; skipping");
-        return None;
+        lr_testkit::unavailable!(return None; "mkfs.ext4 missing");
     }
     let source = dir.join("source.img");
     let file = std::fs::File::create(&source).expect("create");
@@ -125,7 +140,6 @@ fn stderr(output: &Output) -> String {
 #[test]
 fn the_cli_round_trips_through_the_daemon() {
     let Some(daemon) = Daemon::start(&format!("static:{}", uid())) else {
-        eprintln!("the daemon binary is not built next to the CLI; skipping");
         return;
     };
     let work = tempfile::tempdir().expect("workdir");
@@ -290,7 +304,6 @@ fn the_cli_round_trips_through_the_daemon() {
 #[test]
 fn the_cli_round_trips_a_file_tree_through_the_daemon() {
     let Some(daemon) = Daemon::start(&format!("static:{}", uid())) else {
-        eprintln!("the daemon binary is not built next to the CLI; skipping");
         return;
     };
     let work = tempfile::tempdir().expect("workdir");

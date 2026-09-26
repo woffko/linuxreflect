@@ -23,8 +23,7 @@ use lr_engine::{backup_block_full, backup_image};
 
 fn root_tests_enabled() -> bool {
     if std::env::var("LR_ROOT_TESTS").as_deref() != Ok("1") {
-        eprintln!("LR_ROOT_TESTS != 1; skipping");
-        return false;
+        lr_testkit::unavailable!(return false; "LR_ROOT_TESTS != 1");
     }
     let uid = Command::new("id")
         .arg("-u")
@@ -32,8 +31,7 @@ fn root_tests_enabled() -> bool {
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
         .unwrap_or_default();
     if uid != "0" {
-        eprintln!("not running as root (uid {uid}); skipping");
-        return false;
+        lr_testkit::unavailable!(return false; "not running as root (uid {uid})");
     }
     true
 }
@@ -110,8 +108,7 @@ impl LoopDevice {
             .expect("losetup -f");
         let device = String::from_utf8_lossy(&free.stdout).trim().to_owned();
         if !run("losetup", &["-P", &device, &backing.display().to_string()]) {
-            eprintln!("could not attach a loop device; skipping");
-            return None;
+            lr_testkit::fixture_failed!("could not attach a loop device");
         }
         Some(Self { device, backing })
     }
@@ -247,8 +244,7 @@ fn round_trip(fs: Filesystem) {
         return;
     };
     if !format(&source.path(), fs) {
-        eprintln!("mkfs.{} failed; skipping {}", fs.name(), fs.name());
-        return;
+        lr_testkit::fixture_failed!("mkfs.{} failed - {}", fs.name(), fs.name());
     }
     let mount = dir.path().join("source-mount");
     let mount_options = fs.mount_type();
@@ -263,12 +259,10 @@ fn round_trip(fs: Filesystem) {
                 &mount.display().to_string(),
             ],
         ) {
-            eprintln!("mounting {} failed; skipping", fs.name());
-            return;
+            lr_testkit::fixture_failed!("mounting {} failed", fs.name());
         }
     } else if !source.mount(&mount) {
-        eprintln!("mounting {} failed; skipping", fs.name());
-        return;
+        lr_testkit::fixture_failed!("mounting {} failed", fs.name());
     }
     populate(&mount, 6);
     let expected = tree_hashes(&mount);
@@ -398,8 +392,7 @@ fn flakey_over(backing: &Path, sectors: u64) -> Option<String> {
         .output()
         .expect("dmsetup create");
     if !output.status.success() {
-        eprintln!("dm-flakey is unavailable: {}", text(&output));
-        return None;
+        lr_testkit::unavailable!(return None; "dm-flakey is unavailable: {}", text(&output));
     }
     // Without udev (a container) nothing creates the node; ask dmsetup to.
     let node = format!("/dev/mapper/{name}");
@@ -420,8 +413,7 @@ fn dm_flakey_bad_sectors_are_recorded_and_a_restore_refuses_them() {
         return;
     }
     if !have("dmsetup") || !have("mkfs.ext4") {
-        eprintln!("dmsetup or mkfs.ext4 missing; skipping");
-        return;
+        lr_testkit::unavailable!("dmsetup or mkfs.ext4 missing");
     }
     const SIZE: u64 = 128 * 1024 * 1024;
     let dir = tempfile::tempdir().expect("tempdir");
@@ -511,8 +503,7 @@ fn a_16_tb_virtual_disk_keeps_metadata_rss_bounded() {
         return;
     }
     if !have("mkfs.ext4") {
-        eprintln!("mkfs.ext4 missing; skipping");
-        return;
+        lr_testkit::unavailable!("mkfs.ext4 missing");
     }
     const SIZE: u64 = 16 * 1000 * 1000 * 1000 * 1000; // 16 TB virtual
     let dir = tempfile::tempdir().expect("tempdir");
@@ -547,8 +538,7 @@ fn a_16_tb_virtual_disk_keeps_metadata_rss_bounded() {
 
     let cli = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/linuxreflect");
     if !cli.exists() {
-        eprintln!("the CLI is not built; skipping");
-        return;
+        lr_testkit::unavailable!("the CLI is not built");
     }
     let dest = dir.path().join("backups");
     let mut child = Command::new(&cli)
@@ -646,8 +636,7 @@ fn a_16_tb_virtual_disk_keeps_metadata_rss_bounded() {
 /// used, so the test skips instead of pretending.
 fn start_smb(work: &Path, share: &Path, at: &Path) -> Option<(Child, String)> {
     if !have("smbd") || !have("mount.cifs") || !have("timeout") {
-        eprintln!("smbd, mount.cifs or timeout missing; skipping the SMB test");
-        return None;
+        lr_testkit::unavailable!(return None; "smbd, mount.cifs or timeout missing - the SMB test");
     }
     let port = 24000 + (std::process::id() % 10000) as u16;
     std::fs::create_dir_all(share).expect("share");
@@ -701,7 +690,7 @@ fn start_smb(work: &Path, share: &Path, at: &Path) -> Option<(Child, String)> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .ok()?;
+        .expect("spawn smbd");
     let url = "//127.0.0.1/matrix".to_owned();
     let options = format!("guest,vers=3.1.1,uid=0,gid=0,port={port},soft");
     // The share is ready once our own marker is visible through the mount, so
@@ -727,16 +716,14 @@ fn start_smb(work: &Path, share: &Path, at: &Path) -> Option<(Child, String)> {
         let _ = run_bounded(12, "umount", &["-f", &at.display().to_string()]);
         std::thread::sleep(Duration::from_millis(250));
     }
-    eprintln!("the SMB share never mounted; skipping");
     let _ = child.kill();
-    None
+    lr_testkit::fixture_failed!("the SMB share never mounted")
 }
 
 /// Export `dir` over NFS to localhost and mount it at `at`.
 fn start_nfs(work: &Path, dir: &Path, at: &Path) -> Option<String> {
     if !have("exportfs") || !have("mount.nfs") {
-        eprintln!("exportfs or mount.nfs missing; skipping the NFS test");
-        return None;
+        lr_testkit::unavailable!(return None; "exportfs or mount.nfs missing - the NFS test");
     }
     std::fs::create_dir_all(dir).expect("export dir");
     std::fs::create_dir_all(at).expect("mount point");
@@ -744,16 +731,14 @@ fn start_nfs(work: &Path, dir: &Path, at: &Path) -> Option<String> {
     // `rpc.nfsd` starts the kernel threads; eight is plenty.
     let nfsd = Command::new("rpc.nfsd").arg("8").output();
     if nfsd.map(|output| !output.status.success()).unwrap_or(true) {
-        eprintln!("rpc.nfsd could not be started; skipping the NFS test");
-        return None;
+        lr_testkit::fixture_failed!("rpc.nfsd could not be started - the NFS test");
     }
     let export = format!("127.0.0.1:{}", dir.display());
     if !run(
         "exportfs",
         &["-i", "-o", "rw,no_root_squash,insecure,fsid=0", &export],
     ) {
-        eprintln!("exportfs refused the export; skipping the NFS test");
-        return None;
+        lr_testkit::fixture_failed!("exportfs refused the export - the NFS test");
     }
     let _ = work;
     if !run(
@@ -767,8 +752,7 @@ fn start_nfs(work: &Path, dir: &Path, at: &Path) -> Option<String> {
             &at.display().to_string(),
         ],
     ) {
-        eprintln!("the NFS export never mounted; skipping");
-        return None;
+        lr_testkit::fixture_failed!("the NFS export never mounted");
     }
     Some(export)
 }
@@ -972,7 +956,7 @@ fn bootable_disk(dir: &Path, fs: Filesystem, kernel: &Path) -> Option<LoopDevice
             &device.display().to_string(),
         ],
     ) {
-        return None;
+        lr_testkit::fixture_failed!("sgdisk could not partition {}", device.display());
     }
     let esp_device = PathBuf::from(format!("{}p2", device.display()));
     let root_device = PathBuf::from(format!("{}p3", device.display()));
@@ -1148,13 +1132,11 @@ fn every_bootable_root_boots_under_bios_and_uefi_after_a_restore() {
         "cpio",
     ] {
         if !have(tool) {
-            eprintln!("{tool} missing; skipping the boot matrix");
-            return;
+            lr_testkit::unavailable!("{tool} missing - the boot matrix");
         }
     }
     if !Path::new("/usr/share/OVMF/OVMF_CODE_4M.fd").exists() {
-        eprintln!("OVMF missing; skipping the boot matrix");
-        return;
+        lr_testkit::unavailable!("OVMF missing - the boot matrix");
     }
     // The newest kernel the machine has, with the matching modules.
     let mut kernels: Vec<PathBuf> = std::fs::read_dir("/boot")
@@ -1169,19 +1151,17 @@ fn every_bootable_root_boots_under_bios_and_uefi_after_a_restore() {
         .collect();
     kernels.sort();
     let Some(kernel) = kernels.pop() else {
-        eprintln!("no kernel in /boot; skipping the boot matrix");
-        return;
+        lr_testkit::unavailable!("no kernel in /boot - the boot matrix");
     };
 
     for fs in [Filesystem::Ext4, Filesystem::Xfs, Filesystem::Btrfs] {
         if !have(fs.mkfs()) {
-            eprintln!("{} missing; skipping {}", fs.mkfs(), fs.name());
+            lr_testkit::report_unavailable(&format!("{} missing - {}", fs.mkfs(), fs.name()));
             continue;
         }
         let dir = tempfile::tempdir().expect("tempdir");
         let Some(source) = bootable_disk(dir.path(), fs, &kernel) else {
-            eprintln!("could not build the {} disk; skipping", fs.name());
-            continue;
+            lr_testkit::fixture_failed!("could not build the {} disk", fs.name());
         };
         // The image is taken first: booting the same loop device in qemu before
         // the backup makes its final chunk unreadable on this kernel, and the

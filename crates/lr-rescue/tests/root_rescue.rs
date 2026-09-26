@@ -33,8 +33,7 @@ const GRUB_SIGNED: &str = "/usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed";
 
 fn root_tests_enabled() -> bool {
     if std::env::var("LR_ROOT_TESTS").as_deref() != Ok("1") {
-        eprintln!("LR_ROOT_TESTS != 1; skipping");
-        return false;
+        lr_testkit::unavailable!(return false; "LR_ROOT_TESTS != 1");
     }
     let uid = Command::new("id")
         .arg("-u")
@@ -42,8 +41,7 @@ fn root_tests_enabled() -> bool {
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
         .unwrap_or_default();
     if uid != "0" {
-        eprintln!("not running as root (uid {uid}); skipping");
-        return false;
+        lr_testkit::unavailable!(return false; "not running as root (uid {uid})");
     }
     true
 }
@@ -169,19 +167,16 @@ fn the_rescue_media_boots_on_seabios_and_with_secure_boot() {
         "cpio",
     ] {
         if !have(tool) {
-            eprintln!("{tool} missing; skipping");
-            return;
+            lr_testkit::unavailable!("{tool} missing");
         }
     }
     for file in [OVMF_CODE_SECBOOT, OVMF_VARS_MS, SHIM_SIGNED, GRUB_SIGNED] {
         if !Path::new(file).exists() {
-            eprintln!("{file} missing; skipping");
-            return;
+            lr_testkit::unavailable!("{file} missing");
         }
     }
     let Some(kernel) = kernel() else {
-        eprintln!("no /boot/vmlinuz-* found; skipping");
-        return;
+        lr_testkit::unavailable!("no /boot/vmlinuz-* found");
     };
     // A stable directory (not a temporary one) so a failure leaves the images
     // and the serial logs behind for inspection.
@@ -248,17 +243,14 @@ fn a_restored_esp_boots_again_after_boot_repair() {
         "losetup",
     ] {
         if !have(tool) {
-            eprintln!("{tool} missing; skipping");
-            return;
+            lr_testkit::unavailable!("{tool} missing");
         }
     }
     if !Path::new(OVMF_CODE).exists() {
-        eprintln!("OVMF missing; skipping");
-        return;
+        lr_testkit::unavailable!("OVMF missing");
     }
     let Some(kernel) = kernel() else {
-        eprintln!("no /boot/vmlinuz-* found; skipping");
-        return;
+        lr_testkit::unavailable!("no /boot/vmlinuz-* found");
     };
     let work = tempfile::tempdir().expect("workdir");
 
@@ -270,8 +262,7 @@ fn a_restored_esp_boots_again_after_boot_repair() {
     request.size_mib = 256;
     request.bios = false;
     if build_media(&request).is_err() {
-        eprintln!("could not build the fixture medium; skipping");
-        return;
+        lr_testkit::fixture_failed!("could not build the fixture medium");
     }
 
     // Destroy the fallback loader: this is the state a restore that only wrote
@@ -352,8 +343,7 @@ fn recreating_a_layout_keeps_the_partition_and_filesystem_uuids() {
         "wipefs",
     ] {
         if !have(tool) {
-            eprintln!("{tool} missing; skipping");
-            return;
+            lr_testkit::unavailable!("{tool} missing");
         }
     }
     let work = tempfile::tempdir().expect("workdir");
@@ -563,10 +553,13 @@ fn recreating_a_layout_refuses_a_changed_or_busy_disk() {
 
 /// Attach a sparse image to the first free loop device.
 fn attach_loop(image: &Path) -> Option<String> {
-    let free = Command::new("losetup").arg("-f").output().ok()?;
+    let free = Command::new("losetup")
+        .arg("-f")
+        .output()
+        .expect("run losetup -f");
     let device = String::from_utf8_lossy(&free.stdout).trim().to_owned();
     if device.is_empty() || !run("losetup", &["-P", &device, &image.display().to_string()]) {
-        return None;
+        lr_testkit::fixture_failed!("could not attach {} to a loop device", image.display());
     }
     Some(device)
 }
@@ -624,17 +617,14 @@ fn a_bare_metal_restore_from_the_medium_boots() {
         "timeout",
     ] {
         if !have(tool) {
-            eprintln!("{tool} missing; skipping");
-            return;
+            lr_testkit::unavailable!("{tool} missing");
         }
     }
     let Some(kernel) = kernel() else {
-        eprintln!("no /boot/vmlinuz-* found; skipping");
-        return;
+        lr_testkit::unavailable!("no /boot/vmlinuz-* found");
     };
     let Some(cli) = rescue_cli() else {
-        eprintln!("the static rescue CLI is not built; skipping");
-        return;
+        lr_testkit::unavailable!("the static rescue CLI is not built");
     };
     let work = tempfile::tempdir().expect("workdir");
     let secret = work.path().join("token.key");
@@ -649,16 +639,14 @@ fn a_bare_metal_restore_from_the_medium_boots() {
     request.cli = Some(cli.clone());
     request.size_mib = 256;
     if let Err(error) = build_media(&request) {
-        eprintln!("could not build the source machine: {error}; skipping");
-        return;
+        lr_testkit::fixture_failed!("could not build the source machine: {error}");
     }
 
     // Back it up whole-disk.
     let backups = work.path().join("backups");
     std::fs::create_dir_all(&backups).expect("backups");
     let Some(source_loop) = attach_loop(&source) else {
-        eprintln!("could not attach the source; skipping");
-        return;
+        lr_testkit::fixture_failed!("could not attach the source");
     };
     let backed_up = Command::new(&cli)
         .args([
@@ -691,8 +679,7 @@ fn a_bare_metal_restore_from_the_medium_boots() {
     file.set_len(64 * 1024 * 1024).expect("size");
     drop(file);
     let Some(backup_loop) = attach_loop(&backup_disk) else {
-        eprintln!("could not attach the backup disk; skipping");
-        return;
+        lr_testkit::fixture_failed!("could not attach the backup disk");
     };
     assert!(run("mkfs.ext4", &["-q", "-F", &backup_loop]), "mkfs.ext4");
     let backup_mount = work.path().join("backup-mnt");
@@ -724,8 +711,7 @@ fn a_bare_metal_restore_from_the_medium_boots() {
         "linuxreflect.target=/dev/vdc".to_owned(),
     ];
     if let Err(error) = build_media(&request) {
-        eprintln!("could not build the rescue medium: {error}; skipping");
-        return;
+        lr_testkit::fixture_failed!("could not build the rescue medium: {error}");
     }
 
     let serial = work.path().join("autorun.log");

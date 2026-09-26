@@ -74,22 +74,19 @@ fn build_partition_table(path: &Path) -> bool {
         .output()
         .expect("run sgdisk");
     if !status.status.success() {
-        eprintln!("sgdisk failed: {}", String::from_utf8_lossy(&status.stderr));
-        return false;
+        lr_testkit::fixture_failed!("sgdisk failed: {}", String::from_utf8_lossy(&status.stderr));
     }
     true
 }
 
 fn make_fixture() -> Option<Fixture> {
     if !have("sgdisk") {
-        eprintln!("sgdisk not installed; skipping S2 fixture test");
-        return None;
+        lr_testkit::unavailable!(return None; "sgdisk not installed - S2 fixture test");
     }
     let dir = tempfile::tempdir().expect("tempdir");
     let image = dir.path().join("fixture.img");
     if !build_partition_table(&image) {
-        eprintln!("could not build the GPT fixture; skipping");
-        return None;
+        lr_testkit::fixture_failed!("could not build the GPT fixture");
     }
     let layout = discover_source(&image).expect("discover fixture");
     Some(Fixture {
@@ -124,12 +121,11 @@ impl FsKind {
 /// them.
 fn write_filesystem(image: &Path, offset: u64, size: u64, kind: FsKind) -> bool {
     if !have(kind.tool()) {
-        eprintln!(
-            "{} not installed; skipping {:?} signature",
+        lr_testkit::unavailable!(return false;
+            "{} not installed - {:?} signature",
             kind.tool(),
             kind
         );
-        return false;
     }
     let dir = tempfile::tempdir().expect("tempdir");
     let scratch = dir.path().join("fs.img");
@@ -153,8 +149,7 @@ fn write_filesystem(image: &Path, offset: u64, size: u64, kind: FsKind) -> bool 
     }
     .expect("run mkfs");
     if !status.success() {
-        eprintln!("mkfs for {kind:?} failed; skipping");
-        return false;
+        lr_testkit::fixture_failed!("mkfs for {kind:?} failed");
     }
 
     let data = std::fs::read(&scratch).expect("read scratch");
@@ -304,8 +299,7 @@ fn sparse_file_without_table_is_reported_as_none() {
 #[test]
 fn an_mbr_disk_reports_one_partition_per_used_entry() {
     if !have("sfdisk") {
-        eprintln!("sfdisk not installed; skipping MBR test");
-        return;
+        lr_testkit::unavailable!("sfdisk not installed - MBR test");
     }
     let dir = tempfile::tempdir().expect("tempdir");
     let image = dir.path().join("mbr.img");

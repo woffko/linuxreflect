@@ -59,16 +59,14 @@ fn payload(seed: u64, len: usize) -> Vec<u8> {
 /// Create an empty ext4 filesystem in a sparse image.
 fn make_ext4(path: &Path) -> bool {
     if !have("mkfs.ext4") || !have("debugfs") {
-        eprintln!("mkfs.ext4 or debugfs missing; skipping");
-        return false;
+        lr_testkit::unavailable!(return false; "mkfs.ext4 or debugfs missing");
     }
     sparse(path, DEVICE_SIZE);
     if !run(
         "mkfs.ext4",
         &["-F", "-q", "-L", "ROOTFS", &path.display().to_string()],
     ) {
-        eprintln!("mkfs.ext4 failed");
-        return false;
+        lr_testkit::fixture_failed!("mkfs.ext4 failed");
     }
     true
 }

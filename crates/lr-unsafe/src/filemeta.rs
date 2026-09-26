@@ -377,7 +377,7 @@ mod tests {
                 assert_eq!(metadata.rdev(), libc::makedev(1, 3));
             }
             Err(error) => {
-                eprintln!("mknod needs privileges; skipping: {error}");
+                lr_testkit::report_unavailable(&format!("mknod needs privileges: {error}"));
             }
         }
     }

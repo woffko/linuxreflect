@@ -21,8 +21,7 @@ use lr_engine::{ImageReport, backup_image};
 
 fn root_tests_enabled() -> bool {
     if std::env::var("LR_ROOT_TESTS").as_deref() != Ok("1") {
-        eprintln!("LR_ROOT_TESTS != 1; skipping root test");
-        return false;
+        lr_testkit::unavailable!(return false; "LR_ROOT_TESTS != 1 - root test");
     }
     let uid = Command::new("id")
         .arg("-u")
@@ -30,8 +29,7 @@ fn root_tests_enabled() -> bool {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
         .unwrap_or_default();
     if uid != "0" {
-        eprintln!("not running as root (uid {uid}); skipping root test");
-        return false;
+        lr_testkit::unavailable!(return false; "not running as root (uid {uid}) - root test");
     }
     true
 }
@@ -82,9 +80,12 @@ impl LoopDisk {
         let dir = tempfile::tempdir().expect("tempdir");
         let backing = dir.path().join("disk.img");
         sparse(&backing, size);
-        let free = Command::new("losetup").arg("-f").output().ok()?;
+        let free = Command::new("losetup")
+            .arg("-f")
+            .output()
+            .expect("run losetup -f");
         if !free.status.success() {
-            return None;
+            lr_testkit::fixture_failed!("losetup -f found no free loop device");
         }
         let device = PathBuf::from(String::from_utf8_lossy(&free.stdout).trim().to_owned());
         if !run(
@@ -95,7 +96,7 @@ impl LoopDisk {
                 &backing.display().to_string(),
             ],
         ) {
-            return None;
+            lr_testkit::fixture_failed!("losetup could not attach {}", backing.display());
         }
         Some(Self { device, _dir: dir })
     }
@@ -118,7 +119,7 @@ struct Mount {
 
 impl Mount {
     fn btrfs(device: &Path, at: &Path, subvol: Option<&str>) -> Option<Self> {
-        std::fs::create_dir_all(at).ok()?;
+        std::fs::create_dir_all(at).expect("mount point");
         let option = match subvol {
             Some(path) => format!("subvol={path}"),
             None => "subvolid=5".to_owned(),
@@ -185,8 +186,7 @@ fn btrfs_full_then_incremental_round_trips() {
     }
     for tool in ["btrfs", "mkfs.btrfs", "diff"] {
         if !have(tool) {
-            eprintln!("{tool} missing; skipping");
-            return;
+            lr_testkit::unavailable!("{tool} missing");
         }
     }
 
@@ -195,8 +195,7 @@ fn btrfs_full_then_incremental_round_trips() {
     if !run("mkfs.btrfs", &["-q", "-f", &source.path()])
         || !run("mkfs.btrfs", &["-q", "-f", &target.path()])
     {
-        eprintln!("mkfs.btrfs failed; skipping");
-        return;
+        lr_testkit::fixture_failed!("mkfs.btrfs failed");
     }
 
     let work = tempfile::tempdir().expect("workdir");

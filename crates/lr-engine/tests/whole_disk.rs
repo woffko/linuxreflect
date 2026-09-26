@@ -65,8 +65,7 @@ fn read_at(path: &Path, offset: u64, len: usize) -> Vec<u8> {
 /// Build a GPT disk image: bios_grub, ESP, ext4 and swap.
 fn build_disk(path: &Path) -> bool {
     if !have("sgdisk") || !have("mkfs.vfat") || !have("mkfs.ext4") || !have("mkswap") {
-        eprintln!("partition or filesystem tools missing; skipping");
-        return false;
+        lr_testkit::unavailable!(return false; "partition or filesystem tools missing");
     }
     sparse(path, SRC_SIZE);
     let image = path.display().to_string();
@@ -101,8 +100,7 @@ fn build_disk(path: &Path) -> bool {
             &image,
         ],
     ) {
-        eprintln!("sgdisk failed");
-        return false;
+        lr_testkit::fixture_failed!("sgdisk failed");
     }
     // BIOS boot loader bytes in the MBR gap.
     write_at(path, CORE_IMG_OFFSET, &[0xEB, 0x63, 0x90, 0xA5, 0x5A]);
@@ -120,8 +118,7 @@ fn build_disk(path: &Path) -> bool {
         "mkfs.vfat",
         &["-F", "32", "-n", "ESP", &esp.display().to_string()],
     ) {
-        eprintln!("mkfs.vfat failed");
-        return false;
+        lr_testkit::fixture_failed!("mkfs.vfat failed");
     }
     let esp_bytes = std::fs::read(&esp).expect("read esp");
     write_at(path, offsets[1], &esp_bytes);
@@ -138,15 +135,13 @@ fn build_disk(path: &Path) -> bool {
             &image,
         ],
     ) {
-        eprintln!("mkfs.ext4 at an offset failed");
-        return false;
+        lr_testkit::fixture_failed!("mkfs.ext4 at an offset failed");
     }
 
     let swap = dir.path().join("swap.img");
     sparse(&swap, 16 * 1024 * 1024);
     if !run("mkswap", &["-L", "SWAPTEST", &swap.display().to_string()]) {
-        eprintln!("mkswap failed");
-        return false;
+        lr_testkit::fixture_failed!("mkswap failed");
     }
     let swap_bytes = std::fs::read(&swap).expect("read swap");
     write_at(path, offsets[3], &swap_bytes);

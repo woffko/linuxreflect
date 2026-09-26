@@ -175,8 +175,7 @@ fn source_image(dir: &Path) -> Option<PathBuf> {
             .map(|output| output.status.success())
             .unwrap_or(false)
         {
-            eprintln!("{tool} missing; skipping");
-            return None;
+            lr_testkit::unavailable!(return None; "{tool} missing");
         }
     }
     let source = dir.join("source.img");

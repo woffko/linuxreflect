@@ -565,8 +565,9 @@ mod tests {
     #[test]
     fn a_missing_tool_is_named() {
         if have("sgdisk") {
-            eprintln!("sgdisk is installed; the missing-tool path is exercised by the root test");
-            return;
+            lr_testkit::unavailable!(
+                "sgdisk is installed; the missing-tool path needs a host without it"
+            );
         }
         let error = super::build_media(&MediaRequest::new("/tmp/rescue.img", "/boot/vmlinuz"))
             .expect_err("no tools");

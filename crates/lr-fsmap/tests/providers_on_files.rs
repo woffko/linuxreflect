@@ -51,8 +51,7 @@ fn assert_sane(map: &ExtentMap, device_size: u64) {
 #[test]
 fn ext4_provider_maps_a_real_image_file() {
     if !have("mkfs.ext4") || !have("dumpe2fs") {
-        eprintln!("mkfs.ext4 or dumpe2fs missing; skipping");
-        return;
+        lr_testkit::unavailable!("mkfs.ext4 or dumpe2fs missing");
     }
     let dir = tempfile::tempdir().expect("tempdir");
     let size = 64 * 1024 * 1024;
@@ -79,8 +78,7 @@ fn ext4_provider_maps_a_real_image_file() {
 #[test]
 fn xfs_provider_maps_a_real_image_file() {
     if !have("mkfs.xfs") || !have("xfs_db") {
-        eprintln!("mkfs.xfs or xfs_db missing; skipping");
-        return;
+        lr_testkit::unavailable!("mkfs.xfs or xfs_db missing");
     }
     let dir = tempfile::tempdir().expect("tempdir");
     // mkfs.xfs refuses to build a filesystem smaller than 300 MiB.

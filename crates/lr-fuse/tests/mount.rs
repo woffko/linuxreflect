@@ -25,16 +25,13 @@ fn have(program: &str) -> bool {
 
 fn fuse_available() -> bool {
     if !Path::new("/dev/fuse").exists() {
-        eprintln!("/dev/fuse is missing; skipping the FUSE test");
-        return false;
+        lr_testkit::unavailable!(return false; "/dev/fuse is missing - the FUSE test");
     }
     if !have("fusermount3") && !have("fusermount") {
-        eprintln!("fusermount3 is missing; skipping the FUSE test");
-        return false;
+        lr_testkit::unavailable!(return false; "fusermount3 is missing - the FUSE test");
     }
     if !have("sha256sum") {
-        eprintln!("sha256sum is missing; skipping the FUSE test");
-        return false;
+        lr_testkit::unavailable!(return false; "sha256sum is missing - the FUSE test");
     }
     true
 }

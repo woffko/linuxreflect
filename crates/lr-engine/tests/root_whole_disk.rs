@@ -32,8 +32,7 @@ const OVMF_VARS: &str = "/usr/share/OVMF/OVMF_VARS_4M.fd";
 
 fn root_tests_enabled() -> bool {
     if std::env::var("LR_ROOT_TESTS").as_deref() != Ok("1") {
-        eprintln!("LR_ROOT_TESTS != 1; skipping root test");
-        return false;
+        lr_testkit::unavailable!(return false; "LR_ROOT_TESTS != 1 - root test");
     }
     let uid = Command::new("id")
         .arg("-u")
@@ -41,8 +40,7 @@ fn root_tests_enabled() -> bool {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
         .unwrap_or_default();
     if uid != "0" {
-        eprintln!("not running as root (uid {uid}); skipping root test");
-        return false;
+        lr_testkit::unavailable!(return false; "not running as root (uid {uid}) - root test");
     }
     true
 }
@@ -93,9 +91,12 @@ impl LoopDisk {
     fn attach(dir: &Path, name: &str, size: u64) -> Option<Self> {
         let backing = dir.join(name);
         sparse(&backing, size);
-        let free = Command::new("losetup").arg("-f").output().ok()?;
+        let free = Command::new("losetup")
+            .arg("-f")
+            .output()
+            .expect("run losetup -f");
         if !free.status.success() {
-            return None;
+            lr_testkit::fixture_failed!("losetup -f found no free loop device");
         }
         let device = PathBuf::from(String::from_utf8_lossy(&free.stdout).trim().to_owned());
         if !run(
@@ -106,7 +107,7 @@ impl LoopDisk {
                 &backing.display().to_string(),
             ],
         ) {
-            return None;
+            lr_testkit::fixture_failed!("losetup could not attach {}", backing.display());
         }
         Some(Self {
             device,
@@ -142,8 +143,7 @@ fn build_bootable_disk(disk: &LoopDisk, work: &Path) -> bool {
         "gzip",
     ] {
         if !have(tool) {
-            eprintln!("{tool} missing; skipping the boot test");
-            return false;
+            lr_testkit::unavailable!(return false; "{tool} missing - the boot test");
         }
     }
     let label = disk.label();
@@ -172,8 +172,7 @@ fn build_bootable_disk(disk: &LoopDisk, work: &Path) -> bool {
             &label,
         ],
     ) {
-        eprintln!("sgdisk failed");
-        return false;
+        lr_testkit::fixture_failed!("sgdisk failed");
     }
     // Re-read the table so the partition nodes appear.
     let _ = run("blockdev", &["--rereadpt", &label]);
@@ -195,8 +194,7 @@ fn build_bootable_disk(disk: &LoopDisk, work: &Path) -> bool {
             &disk.partition(2).display().to_string(),
         ],
     ) {
-        eprintln!("mkfs.vfat failed");
-        return false;
+        lr_testkit::fixture_failed!("mkfs.vfat failed");
     }
     if !run(
         "mkfs.ext4",
@@ -208,8 +206,7 @@ fn build_bootable_disk(disk: &LoopDisk, work: &Path) -> bool {
             &disk.partition(3).display().to_string(),
         ],
     ) {
-        eprintln!("mkfs.ext4 failed");
-        return false;
+        lr_testkit::fixture_failed!("mkfs.ext4 failed");
     }
 
     // ESP contents: kernel, initramfs and grub.cfg (GRUB reads them from FAT
@@ -225,8 +222,7 @@ fn build_bootable_disk(disk: &LoopDisk, work: &Path) -> bool {
             &esp.display().to_string(),
         ],
     ) {
-        eprintln!("mounting the ESP failed");
-        return false;
+        lr_testkit::fixture_failed!("mounting the ESP failed");
     }
     if !run(
         "mount",
@@ -235,24 +231,21 @@ fn build_bootable_disk(disk: &LoopDisk, work: &Path) -> bool {
             &root.display().to_string(),
         ],
     ) {
-        eprintln!("mounting the root partition failed");
         let _ = run("umount", &[&esp.display().to_string()]);
-        return false;
+        lr_testkit::fixture_failed!("mounting the root partition failed");
     }
 
     let kernel = newest_kernel();
     let Some(kernel) = kernel else {
-        eprintln!("no /boot/vmlinuz-* found; skipping");
         let _ = run("umount", &[&root.display().to_string()]);
         let _ = run("umount", &[&esp.display().to_string()]);
-        return false;
+        lr_testkit::unavailable!(return false; "no /boot/vmlinuz-* found");
     };
     let initramfs = work.join("initramfs.cpio.gz");
     if !build_initramfs(&initramfs, work) {
-        eprintln!("building the initramfs failed");
         let _ = run("umount", &[&root.display().to_string()]);
         let _ = run("umount", &[&esp.display().to_string()]);
-        return false;
+        lr_testkit::fixture_failed!("building the initramfs failed");
     }
     std::fs::copy(&kernel, esp.join("vmlinuz")).expect("copy the kernel");
     std::fs::copy(&initramfs, esp.join("initramfs.cpio.gz")).expect("copy the initramfs");
@@ -299,12 +292,12 @@ fn build_bootable_disk(disk: &LoopDisk, work: &Path) -> bool {
     let _ = run("umount", &[&root.display().to_string()]);
     let _ = run("umount", &[&esp.display().to_string()]);
     if !bios_ok {
-        eprintln!("grub-install for i386-pc failed");
+        lr_testkit::fixture_failed!("grub-install for i386-pc failed");
     }
     if !uefi_ok {
-        eprintln!("grub-install for x86_64-efi failed");
+        lr_testkit::fixture_failed!("grub-mkstandalone for x86_64-efi failed");
     }
-    bios_ok && uefi_ok
+    true
 }
 
 fn newest_kernel() -> Option<PathBuf> {
@@ -332,8 +325,7 @@ fn build_initramfs(destination: &Path, work: &Path) -> bool {
         }
     }
     if std::fs::copy("/bin/busybox", staged.join("bin/busybox")).is_err() {
-        eprintln!("static busybox not available");
-        return false;
+        lr_testkit::unavailable!(return false; "static busybox not available");
     }
     for tool in ["sh", "mount", "poweroff", "echo"] {
         let link = staged.join("bin").join(tool);
@@ -464,13 +456,11 @@ fn a_bootable_disk_survives_a_whole_disk_round_trip() {
         return;
     }
     if !have("qemu-system-x86_64") || !Path::new(OVMF_CODE).exists() {
-        eprintln!("qemu or OVMF missing; skipping");
-        return;
+        lr_testkit::unavailable!("qemu or OVMF missing");
     }
     let work = tempfile::tempdir().expect("workdir");
     let Some(source) = LoopDisk::attach(work.path(), "boot-src.img", SRC_SIZE) else {
-        eprintln!("could not attach a loop device");
-        return;
+        lr_testkit::fixture_failed!("could not attach a loop device");
     };
     if !build_bootable_disk(&source, work.path()) {
         return;
@@ -583,8 +573,7 @@ fn an_mbr_disk_round_trips_and_boots() {
         return;
     }
     if !have("qemu-system-x86_64") || !have("sfdisk") {
-        eprintln!("qemu or sfdisk missing; skipping");
-        return;
+        lr_testkit::unavailable!("qemu or sfdisk missing");
     }
     let work = tempfile::tempdir().expect("workdir");
     let Some(source) = LoopDisk::attach(work.path(), "mbr-src.img", SRC_SIZE) else {
@@ -630,8 +619,7 @@ fn an_mbr_disk_round_trips_and_boots() {
             &label,
         ],
     ) {
-        eprintln!("grub-install (MBR) failed; skipping");
-        return;
+        lr_testkit::fixture_failed!("grub-install (MBR) failed");
     }
 
     let outcome = work.path().join("mbr-out");
