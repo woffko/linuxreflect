@@ -15,6 +15,7 @@ they land.
 
 ## Contents
 
+- [Goal: v0.1.0-alpha.2](#goal-v010-alpha2)
 - [Ground rules](#ground-rules)
 - [Phase 0 — immediately](#phase-0--immediately)
 - [Phase 1 — data destruction, false guarantees, cryptography](#phase-1--data-destruction-false-guarantees-cryptography)
@@ -25,6 +26,25 @@ they land.
 - [Decisions to record](#decisions-to-record)
 - [Sequence and effort](#sequence-and-effort)
 - [Finding index](#finding-index)
+
+## Goal: v0.1.0-alpha.2
+
+Complete phases 0 and 1 and publish `v0.1.0-alpha.2`. Done when all hold:
+
+1. The `v0.1.0-alpha.1` release carries a "Known critical issues" section.
+2. R40 is fixed: the root run reports executed, ignored and unavailable tests
+   separately, and a fixture failure is a test failure, not a skip.
+3. Every phase 1 finding (A1, A2, A3, R01, R02, R03, R04, R05, R06, R11, R14)
+   has a regression test that failed before its fix and passes after it.
+4. D-110 and D-115 are recorded in `docs/decisions.md`.
+5. `cargo xtask ci` exits 0 and every root suite is green with no
+   unavailable scenarios.
+6. Installation and the GNOME/polkit check pass on the Ubuntu test host.
+7. The finding index below is ticked for the completed items, and
+   `v0.1.0-alpha.2` is published as a pre-release with artifacts and
+   checksums.
+
+Stop only on a genuine blocker.
 
 ## Ground rules
 
