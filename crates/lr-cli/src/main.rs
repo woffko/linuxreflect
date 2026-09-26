@@ -28,7 +28,30 @@ use lr_engine::{ImageReport, backup_image};
 use lr_export::BlockBackend;
 use lr_store::{DestinationOptions, SetHandle};
 
+/// Exit quietly when stdout is closed early (`linuxreflect disk list | head`).
+///
+/// `println!` panics on `EPIPE`, and the release profile aborts on panic, so
+/// a closed pipe used to end with "Aborted". Resetting `SIGPIPE` instead would
+/// also kill the process on a daemon socket that closes, so only this one
+/// panic is turned into the conventional exit status of a SIGPIPE death.
+fn exit_quietly_on_closed_stdout() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let message = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        if message.starts_with("failed printing to stdout") && message.contains("Broken pipe") {
+            std::process::exit(141);
+        }
+        default(info);
+    }));
+}
+
 fn main() -> ExitCode {
+    exit_quietly_on_closed_stdout();
     let cli = Cli::parse();
     init_tracing(cli.verbose, cli.quiet);
     match run(&cli) {

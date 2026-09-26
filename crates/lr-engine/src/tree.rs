@@ -101,6 +101,12 @@ pub struct WalkedTree {
 }
 
 impl WalkedTree {
+    /// Close the pinned root. A walk of a snapshot must release it before
+    /// the snapshot is unmounted, or the unmount fails as busy.
+    pub fn release_root(&mut self) {
+        self.root = None;
+    }
+
     /// Open a regular file the walk recorded, beneath the pinned root and
     /// without following symlinks, and check that it is still that file.
     ///
@@ -583,6 +589,22 @@ impl PinnedDir {
             std::process::id(),
             self.fd.as_raw_fd()
         ))
+    }
+
+    /// The path of `name` in this directory for a child process.
+    ///
+    /// # Errors
+    /// Refuses a `name` that is not one plain component.
+    pub fn child_entry(&self, name: &std::ffi::OsStr) -> Result<PathBuf> {
+        use std::os::fd::AsRawFd;
+        // Checks that `name` is one plain component.
+        self.entry(name)?;
+        Ok(PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            self.fd.as_raw_fd()
+        ))
+        .join(name))
     }
 }
 

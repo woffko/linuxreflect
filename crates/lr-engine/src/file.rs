@@ -297,7 +297,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
     if consistency == Consistency::None {
         sb_flags |= flags::INCONSISTENT;
     }
-    let walk = tree::walk(
+    let mut walk = tree::walk(
         &walk_root,
         &WalkOptions {
             one_file_system: options.one_file_system,
@@ -505,6 +505,9 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
     drop(writer);
     destination.finalize(&set, &image_name, &image_name)?;
     guard.disarm();
+    // The walk pins a directory inside the snapshot; close it first so the
+    // snapshot's private mount can be released.
+    walk.release_root();
     drop(snapshot);
 
     {

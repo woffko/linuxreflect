@@ -889,7 +889,7 @@ pub fn restore_stream(request: &StreamRestoreRequest) -> Result<StreamRestoreRep
             let parent = root.dir(parent, 0o755)?;
             let _ = std::process::Command::new("btrfs")
                 .args(["subvolume", "delete"])
-                .arg(parent.for_child().with_file_name(name))
+                .arg(parent.child_entry(std::ffi::OsStr::new(name))?)
                 .output();
         }
         let Some((parent, name)) = received.last() else {
@@ -929,6 +929,9 @@ pub fn restore_stream(request: &StreamRestoreRequest) -> Result<StreamRestoreRep
     }
 
     reporter.finish(received_bytes);
+    // The pinned root is a descriptor inside the mount; close it first so
+    // the mount can be released.
+    drop(root);
     drop(mounted);
     Ok(StreamRestoreReport {
         target: request.target.clone(),

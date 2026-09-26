@@ -232,7 +232,32 @@ fn root() -> anyhow::Result<()> {
     for binary in &failed {
         println!("  - failed: {binary}");
     }
-    if !failed.is_empty() || unavailable > 0 {
+    // Every root test creates and removes its own loop devices and mounts; a
+    // leftover means a teardown that failed silently (a busy unmount, say).
+    let mut leak_check = Command::new(runner.first().map_or("sh", String::as_str));
+    if !runner.is_empty() {
+        leak_check.args(&runner[1..]).arg("sh");
+    }
+    let leaks = leak_check
+        .args([
+            "-c",
+            // Tests work in `tempfile` directories (`/tmp/.tmpXXXX`); other
+            // loop devices, such as snaps, are not theirs.
+            "grep -E ' /tmp/\\.tmp| /run/linuxreflect/' /proc/mounts; \
+             losetup -a | grep '/tmp/\\.tmp'",
+        ])
+        .output()
+        .map_err(|error| anyhow::anyhow!("check for leftover loop devices and mounts: {error}"))?;
+    let leaks = String::from_utf8_lossy(&leaks.stdout).trim().to_owned();
+    if leaks.is_empty() {
+        println!("leftovers:   none");
+    } else {
+        println!("leftovers:");
+        for line in leaks.lines() {
+            println!("  - {line}");
+        }
+    }
+    if !failed.is_empty() || unavailable > 0 || !leaks.is_empty() {
         anyhow::bail!("the root run is not clean");
     }
     Ok(())
