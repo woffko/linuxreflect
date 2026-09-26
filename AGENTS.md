@@ -93,7 +93,9 @@ is split into `actions`, `models`, `callbacks` and `script_runner`.
 The installed-Ubuntu/GNOME acceptance is done (real GNOME notifications,
 the GUI on GNOME Wayland, the update handoff), the graphical rescue medium
 boots to the GUI with its own daemon under SeaBIOS and Secure Boot, and
-`v0.1.0-alpha.1` is published as a GitHub pre-release. Deferred by the
+`v0.1.0-alpha.1` is published as a GitHub pre-release. Phases 0 and 1 of
+`docs/remediation-plan.md` are complete (D-110..D-119) and `v0.1.0-alpha.2`
+is published; phases 2 to 4 of that plan are open. Deferred by the
 maintainer: completing a backup from the GUI inside GNOME (needs an
 administrator at the polkit dialog). The test host (Ubuntu 22.04, GNOME 42;
 now `192.168.189.142`, a DHCP lease on VMnet8, so check it with

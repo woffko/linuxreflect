@@ -46,6 +46,12 @@ Complete phases 0 and 1 and publish `v0.1.0-alpha.2`. Done when all hold:
 
 Stop only on a genuine blocker.
 
+**Done (2026-09-26).** `v0.1.0-alpha.2` is published from `6aa8bdb`:
+`cargo xtask ci` exits 0, and `cargo xtask root` ran 60 scenarios with 60
+passed, none unavailable and nothing left behind. The install and polkit check
+passed on the Ubuntu 22.04 GNOME host, and the rescue medium boots under
+SeaBIOS and Secure Boot. Phases 2 to 4 remain.
+
 ## Ground rules
 
 1. **Test first.** Every finding gets a regression test that fails on the
