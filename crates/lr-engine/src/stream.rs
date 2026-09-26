@@ -277,13 +277,19 @@ pub fn backup_stream(request: &BackupRequest) -> Result<StreamReport> {
     let tree_opts = TreeSnapshotOpts {
         set_name: request.set_name.clone(),
         image_uuid: *request.image_uuid.inner(),
-        // A `--type full` starts a new chain and must not reuse the previous
-        // snapshot as a send parent.
-        incremental: if request.member_type == MemberType::Full {
+        // The send parent follows the *resolved* member kind (R04): an image
+        // without a catalog parent (a `--type full`, or a rollover at
+        // `max_incrementals_per_chain`) is sent without `-p`, and an
+        // incremental must be sent relative to exactly its catalog parent's
+        // snapshots, or it is refused.
+        incremental: if parent.is_none() {
             btrfs::Incremental::Never
         } else {
-            btrfs::Incremental::Auto
+            btrfs::Incremental::Require
         },
+        parent_image: parent
+            .as_ref()
+            .map(|parent| *parent.member.image_uuid.inner()),
         mount_root: PathBuf::from(btrfs::DEFAULT_MOUNT_ROOT),
         general: crate::backup::snapshot_opts(request),
     };

@@ -98,6 +98,7 @@ fn snapshot_source(
         set_name: request.set_name.clone(),
         image_uuid: *request.image_uuid.inner(),
         incremental: lr_snapshot::btrfs::Incremental::Never,
+        parent_image: None,
         mount_root: PathBuf::from(lr_snapshot::btrfs::DEFAULT_MOUNT_ROOT),
         general: crate::backup::snapshot_opts(request),
     };

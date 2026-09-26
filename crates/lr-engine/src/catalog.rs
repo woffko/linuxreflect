@@ -318,14 +318,36 @@ pub fn chain_files(catalog: &Catalog, chain_id: lr_core::ChainId) -> Result<Vec<
 }
 
 /// The latest member of the newest complete chain (for `--parent latest`).
-#[must_use]
-pub fn latest_member(catalog: &Catalog) -> Option<&MemberRecord> {
-    catalog
+///
+/// # Errors
+/// Returns [`Error::Unsupported`] when two complete chains share the newest
+/// creation second. The catalog records whole seconds only, so which one is
+/// newer cannot be known, and a guess could extend the wrong chain (D-116).
+pub fn latest_member(catalog: &Catalog) -> Result<Option<&MemberRecord>> {
+    let complete: Vec<&ChainRecord> = catalog
         .chains
         .iter()
         .filter(|chain| chain.is_complete())
-        .max_by_key(|chain| chain.created_unix)
-        .and_then(ChainRecord::latest_member)
+        .collect();
+    let Some(newest) = complete.iter().map(|chain| chain.created_unix).max() else {
+        return Ok(None);
+    };
+    let tied: Vec<&&ChainRecord> = complete
+        .iter()
+        .filter(|chain| chain.created_unix == newest)
+        .collect();
+    if let [only] = tied.as_slice() {
+        return Ok(only.latest_member());
+    }
+    let ids: Vec<String> = tied
+        .iter()
+        .map(|chain| chain.chain_id.to_string())
+        .collect();
+    Err(Error::unsupported(format!(
+        "--parent latest is ambiguous: chains {} were started in the same second; \
+         name the parent image with --parent <uuid>",
+        ids.join(" and ")
+    )))
 }
 
 /// Resolve a `--parent` value against a catalog.
@@ -335,7 +357,7 @@ pub fn latest_member(catalog: &Catalog) -> Option<&MemberRecord> {
 /// member of its chain, or its chain is incomplete.
 pub fn resolve_parent(catalog: &Catalog, parent: &str) -> Result<MemberRecord> {
     if parent == "latest" {
-        return latest_member(catalog).cloned().ok_or_else(|| {
+        return latest_member(catalog)?.cloned().ok_or_else(|| {
             Error::unsupported("--parent latest: the set has no complete chain yet")
         });
     }
@@ -588,6 +610,40 @@ mod tests {
         let error = resolve_parent(&loaded.catalog, &Id::from_bytes([3; 16]).to_string())
             .expect_err("must refuse");
         assert!(error.to_string().contains("newer member"), "{error}");
+    }
+
+    #[test]
+    fn parent_latest_refuses_chains_started_in_the_same_second() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let destination = LocalDestination::new(dir.path(), "set");
+        let set = set(&destination);
+        let first = ChainId::new(Id::from_bytes([0x01; 16]));
+        let second = ChainId::new(Id::from_bytes([0x02; 16]));
+        write_image(
+            &destination,
+            &set,
+            "a/000-full.lrimg",
+            &superblock(first, 1, 0, false, 10),
+        );
+        write_image(
+            &destination,
+            &set,
+            "a/001-incr.lrimg",
+            &superblock(first, 2, 1, true, 10),
+        );
+        write_image(
+            &destination,
+            &set,
+            "b/000-full.lrimg",
+            &superblock(second, 5, 0, false, 10),
+        );
+        let loaded = super::load(&destination, &set, "set", 1).expect("load");
+        let error = resolve_parent(&loaded.catalog, "latest").expect_err("ambiguous");
+        assert!(error.to_string().contains("ambiguous"), "{error}");
+        // An explicit parent still works.
+        let explicit = resolve_parent(&loaded.catalog, &Id::from_bytes([5; 16]).to_string())
+            .expect("explicit parent");
+        assert_eq!(explicit.seq_in_chain, 0);
     }
 
     #[test]

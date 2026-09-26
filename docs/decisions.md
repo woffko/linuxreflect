@@ -1296,3 +1296,44 @@ sentinel beside the destination), the provider's unit tests (refusal before
 mounting, and pruning that ignores foreign names and plain files) and the
 root test `btrfs_cleanup_stays_inside_its_own_snapshots` on a loop-backed
 Btrfs. The root test fails without the change.
+
+## D-116 — Btrfs send parents follow the catalog; an ambiguous `--parent latest` is refused
+
+The engine resolves an image's parent from the destination catalog, but the
+Btrfs provider chose the `btrfs send -p` parent from the source-side
+`.linuxreflect/<set>/latest` record and from the *requested* member type
+(R04). Two sequences produced images that could not be restored. In the
+first, a `max_incrementals_per_chain` rollover turned a requested
+incremental into a full without a parent, which was still sent relative to
+the old chain. In the second, a full to destination A, a full to destination
+B with the same set name, and then an incremental to A produced an
+incremental that A's catalog linked to A's full while its send stream
+depended on B's snapshot.
+
+- **Resolved kind.** The provider sees the resolved parent. No catalog
+  parent means `Incremental::Never` and no `-p`. A catalog parent means
+  `Incremental::Require` with that parent's image UUID.
+- **Binding.** With a parent image P, every snapshot in `latest` must lie in
+  `<set>/<P>/` and must still exist. Otherwise the backup is refused with
+  `E_STREAM_PARENT_MISSING`, whose message tells the user to run a new full.
+  A subvolume that has no record at all was mounted after P and is sent in
+  full, which restores correctly.
+- **Serialised source state.** The provider holds an exclusive lock on
+  `<set>/lock` for the lifetime of a snapshot, so two backups of one set name
+  never interleave their `latest` records. The lock is released before the
+  private top-level mount is unmounted.
+- **Cleanup on every exit.** The provider builds its snapshot guard right
+  after mounting, so every early error deletes what it created and releases
+  the mount. Before, several `?` exits left the private mount behind.
+- **Ambiguous `latest` (A13).** The catalog orders chains by their creation
+  time in whole seconds. Two complete chains started in the same second
+  (for example a rollover right after its predecessor) used to be picked in
+  arbitrary order. `--parent latest` now refuses that case and asks for
+  `--parent <uuid>`, instead of possibly extending the wrong chain.
+
+Regression tests: the provider's `a_send_parent_must_belong_to_the_catalog_parent`,
+the catalog's `parent_latest_refuses_chains_started_in_the_same_second`, and
+the root test `btrfs_send_parents_follow_the_catalog`. The root test checks
+that a rollover full has no send parent and restores on its own, that an
+incremental after another destination's full is refused, and that a new full
+resumes the chain. The rollover assertion fails without the fix.

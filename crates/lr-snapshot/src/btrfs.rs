@@ -44,6 +44,12 @@ pub struct TreeSnapshotOpts {
     pub image_uuid: Id,
     /// Incremental policy.
     pub incremental: Incremental,
+    /// The image this one is an incremental of, as the catalog resolved it.
+    ///
+    /// When set, the recorded snapshots must be exactly that image's: a
+    /// snapshot left by another image (another destination with the same set
+    /// name, or an older chain) is never used as a send parent (R04).
+    pub parent_image: Option<Id>,
     /// Where the top-level subvolume is mounted.
     pub mount_root: PathBuf,
     /// Generic snapshot options (destination, opt-ins).
@@ -58,6 +64,7 @@ impl TreeSnapshotOpts {
             set_name: set_name.into(),
             image_uuid,
             incremental: Incremental::Auto,
+            parent_image: None,
             mount_root: PathBuf::from(DEFAULT_MOUNT_ROOT),
             general: SnapshotOpts::default(),
         }
@@ -116,8 +123,14 @@ pub struct TreeSnapshot {
     top: PathBuf,
     /// State directory of this set.
     set_dir: PathBuf,
+    /// This image's snapshot directory, once created.
+    image_dir: Option<PathBuf>,
     /// `true` once the image is complete and retention has run.
     committed: bool,
+    /// Exclusive lock on the set's state directory, held until drop, so two
+    /// backups of one set never interleave their `latest` records. It lives
+    /// on the private mount, so it is closed before that is unmounted.
+    state_lock: Option<std::fs::File>,
 }
 
 impl TreeSnapshot {
@@ -188,10 +201,9 @@ impl TreeSnapshot {
     }
 
     fn image_prefix(&self) -> String {
-        self.subvolumes
-            .first()
-            .and_then(|snapshot| snapshot.snapshot_path.parent())
-            .and_then(|parent| parent.file_name())
+        self.image_dir
+            .as_deref()
+            .and_then(Path::file_name)
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default()
     }
@@ -208,15 +220,13 @@ impl Drop for TreeSnapshot {
                     &["subvolume", "delete", &path_text(&snapshot.snapshot_path)],
                 );
             }
-            if let Some(parent) = self
-                .subvolumes
-                .first()
-                .and_then(|s| s.snapshot_path.parent())
-            {
-                let _ = std::fs::remove_dir(parent);
+            if let Some(image_dir) = &self.image_dir {
+                let _ = std::fs::remove_dir(image_dir);
             }
         }
-        // The private top-level mount is always released.
+        // The private top-level mount is always released; the state lock is
+        // an open file on it, so it goes first.
+        drop(self.state_lock.take());
         let _ = run_ok("umount", &[&path_text(&self.mountpoint)]);
         let _ = std::fs::remove_dir(&self.mountpoint);
     }
@@ -361,17 +371,32 @@ impl BtrfsProvider {
             .mount_root
             .join(format!("btrfs-{}", &fs_uuid[..8.min(fs_uuid.len())]));
         mount_top_level(&src.device, &mountpoint)?;
-        let top = mountpoint.clone();
-        let set_dir = top.join(STATE_DIR).join(&opts.set_name);
-        std::fs::create_dir_all(&set_dir).map_err(Error::Io)?;
-        let image_dir = set_dir.join(opts.image_uuid.to_string());
+        // From here on every exit, including `?`, goes through the
+        // snapshot's `Drop`: it deletes whatever this call created, closes
+        // the state lock and releases the private mount.
+        let mut tree = TreeSnapshot {
+            fs_uuid: fs_uuid.clone(),
+            label,
+            default_subvolid: TOP_LEVEL_SUBVOLID,
+            mount_options: String::new(),
+            consistency: Consistency::PointInTime,
+            subvolumes: Vec::new(),
+            top: mountpoint.clone(),
+            set_dir: mountpoint.join(STATE_DIR).join(&opts.set_name),
+            mountpoint,
+            image_dir: None,
+            committed: false,
+            state_lock: None,
+        };
+        std::fs::create_dir_all(&tree.set_dir).map_err(Error::Io)?;
+        tree.state_lock = Some(lock_state(&tree.set_dir)?);
+        let image_dir = tree.set_dir.join(opts.image_uuid.to_string());
         std::fs::create_dir_all(&image_dir).map_err(Error::Io)?;
+        tree.image_dir = Some(image_dir.clone());
 
         // 2. Which subvolumes are mounted? (spec §E.1)
         let mounted = self.mounted_subvolumes(&fs_uuid)?;
         if mounted.is_empty() {
-            let _ = run_ok("umount", &[&path_text(&mountpoint)]);
-            let _ = std::fs::remove_dir(&mountpoint);
             return Err(Error::unsupported(
                 "btrfs provider: no mounted subvolume of this filesystem; mount a subvolume \
                  (not the top level) and retry",
@@ -379,32 +404,18 @@ impl BtrfsProvider {
         }
 
         // 3. Snapshot each one, reusing the recorded parent when it exists.
-        let mount_options = mounted
+        tree.mount_options = mounted
             .first()
             .map(|entry| entry.options.clone())
             .unwrap_or_default();
-        let latest = read_latest(&set_dir)?;
-        let mut subvolumes = Vec::with_capacity(mounted.len());
+        let latest = read_latest(&tree.set_dir)?;
+        if opts.incremental != Incremental::Never
+            && let Some(parent_image) = &opts.parent_image
+        {
+            check_parent_binding(&latest, &tree.set_dir, parent_image)?;
+        }
         for subvol in mounted {
             let escaped = escape_path(&subvol.subvol_path);
-            let snapshot_path =
-                image_dir.join(snapshot_name(&subvol.subvol_path, &opts.image_uuid));
-            let source_path = if subvol.subvol_path == "/" {
-                top.clone()
-            } else {
-                top.join(subvol.subvol_path.trim_start_matches('/'))
-            };
-            run(
-                "btrfs",
-                &[
-                    "subvolume",
-                    "snapshot",
-                    "-r",
-                    &path_text(&source_path),
-                    &path_text(&snapshot_path),
-                ],
-            )?;
-
             let (parent_snapshot, parent_snapshot_uuid) = if opts.incremental == Incremental::Never
             {
                 (None, None)
@@ -414,6 +425,9 @@ impl BtrfsProvider {
                         Some(previous.snapshot_path.clone()),
                         previous.parent_snapshot_uuid,
                     ),
+                    // A subvolume mounted since the parent image has no
+                    // parent snapshot; a full stream of it is correct.
+                    None if opts.parent_image.is_some() => (None, None),
                     _ if opts.incremental == Incremental::Require => {
                         return Err(Error::stream_parent_missing(&subvol.subvol_path));
                     }
@@ -425,7 +439,24 @@ impl BtrfsProvider {
                 None => None,
             };
 
-            subvolumes.push(SubvolSnapshot {
+            let snapshot_path =
+                image_dir.join(snapshot_name(&subvol.subvol_path, &opts.image_uuid));
+            let source_path = if subvol.subvol_path == "/" {
+                tree.top.clone()
+            } else {
+                tree.top.join(subvol.subvol_path.trim_start_matches('/'))
+            };
+            run(
+                "btrfs",
+                &[
+                    "subvolume",
+                    "snapshot",
+                    "-r",
+                    &path_text(&source_path),
+                    &path_text(&snapshot_path),
+                ],
+            )?;
+            tree.subvolumes.push(SubvolSnapshot {
                 mount_target: subvol.target,
                 subvol_path: subvol.subvol_path,
                 subvolid: subvol.subvolid,
@@ -435,19 +466,8 @@ impl BtrfsProvider {
             });
         }
 
-        let default_subvolid = default_subvolid(&top).unwrap_or(TOP_LEVEL_SUBVOLID);
-        Ok(TreeSnapshot {
-            fs_uuid,
-            label,
-            default_subvolid,
-            mount_options,
-            consistency: Consistency::PointInTime,
-            subvolumes,
-            mountpoint,
-            top,
-            set_dir,
-            committed: false,
-        })
+        tree.default_subvolid = default_subvolid(&tree.top).unwrap_or(TOP_LEVEL_SUBVOLID);
+        Ok(tree)
     }
 
     /// Mounted subvolumes of `fs_uuid`, top level excluded.
@@ -751,6 +771,56 @@ fn subvolume_uuid(path: &Path) -> Result<Option<Id>> {
         }
     }
     Ok(None)
+}
+
+/// Refuse recorded snapshots that do not belong to `parent_image`.
+///
+/// `latest` is shared by every destination that uses this set name, and it
+/// is rewritten by every image. An incremental whose catalog parent is image
+/// P may only be sent relative to P's own snapshots, which live in
+/// `<set_dir>/<P>/`; anything else would produce an image that cannot be
+/// restored after P (R04).
+fn check_parent_binding(
+    latest: &BTreeMap<String, SubvolSnapshot>,
+    set_dir: &Path,
+    parent_image: &Id,
+) -> Result<()> {
+    let parent_dir = set_dir.join(parent_image.to_string());
+    if latest.is_empty() {
+        return Err(Error::stream_parent_missing(format!(
+            "(none is recorded for parent image {parent_image})"
+        )));
+    }
+    for previous in latest.values() {
+        if previous.snapshot_path.parent() != Some(parent_dir.as_path()) {
+            // Another destination or an older chain used this set name.
+            return Err(Error::stream_parent_missing(format!(
+                "{} (the recorded snapshot belongs to another image than the parent {parent_image})",
+                previous.subvol_path
+            )));
+        }
+        if !previous.snapshot_path.exists() {
+            return Err(Error::stream_parent_missing(&previous.subvol_path));
+        }
+    }
+    Ok(())
+}
+
+/// Take the set's state lock without waiting.
+fn lock_state(set_dir: &Path) -> Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(set_dir.join("lock"))
+        .map_err(Error::Io)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(Error::SetLocked {
+            owner: format!("another backup using {}", set_dir.display()),
+        }),
+        Err(std::fs::TryLockError::Error(error)) => Err(Error::Io(error)),
+    }
 }
 
 /// Delete the snapshots of every earlier image of this set.
@@ -1074,6 +1144,49 @@ mod tests {
             Support::No(reason) => assert!(reason.contains("not mounted"), "{reason}"),
             Support::Yes => panic!("must refuse an unmounted btrfs"),
         }
+    }
+
+    #[test]
+    fn a_send_parent_must_belong_to_the_catalog_parent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let set_dir = dir.path();
+        let parent = Id::from_bytes([0xa0; 16]);
+        let other = Id::from_bytes([0xb0; 16]);
+        let record = |image: &Id| {
+            let snapshot_path = set_dir.join(image.to_string()).join("@.snap");
+            std::fs::create_dir_all(&snapshot_path).expect("snapshot dir");
+            let mut latest = std::collections::BTreeMap::new();
+            latest.insert(
+                "@".to_owned(),
+                super::SubvolSnapshot {
+                    mount_target: std::path::PathBuf::from("/"),
+                    subvol_path: "/@".to_owned(),
+                    subvolid: 256,
+                    snapshot_path,
+                    parent_snapshot: None,
+                    parent_snapshot_uuid: None,
+                },
+            );
+            latest
+        };
+        assert!(super::check_parent_binding(&record(&parent), set_dir, &parent).is_ok());
+
+        // Another destination with the same set name wrote `latest` last.
+        let error = super::check_parent_binding(&record(&other), set_dir, &parent)
+            .expect_err("a snapshot of another image must be refused");
+        assert!(error.to_string().contains("another image"), "{error}");
+
+        let error =
+            super::check_parent_binding(&std::collections::BTreeMap::new(), set_dir, &parent)
+                .expect_err("no recorded snapshot must be refused");
+        assert!(
+            matches!(error, lr_core::Error::StreamParentMissing { .. }),
+            "{error}"
+        );
+
+        let latest = record(&parent);
+        std::fs::remove_dir(&latest["@"].snapshot_path).expect("remove");
+        assert!(super::check_parent_binding(&latest, set_dir, &parent).is_err());
     }
 
     #[test]

@@ -425,3 +425,4 @@ P3 = cleanup.
 | A10 | P2 | The GUI cannot restore files into a non-empty folder | 2.8 | ☐ |
 | A11 | P2 | Restore tokens are reusable and not bound to the caller | 3 | ☐ |
 | A12 | P3 | NBD socket chmod after bind, failure ignored | 2.6 | ☐ |
+| A13 | P1 | `--parent latest` picks an arbitrary chain when two chains start in the same second (found while fixing R04, D-116) | 1.5 | ☑ |

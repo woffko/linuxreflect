@@ -485,3 +485,146 @@ fn btrfs_cleanup_stays_inside_its_own_snapshots() {
         assert!(kept.exists(), "{} was removed by cleanup", kept.display());
     }
 }
+
+fn stream_report(report: ImageReport) -> lr_engine::stream::StreamReport {
+    match report {
+        ImageReport::Stream(report) => report,
+        other => panic!("expected a stream image, got {other:?}"),
+    }
+}
+
+/// The `btrfs send` parent follows the catalog (R04): a full started by a
+/// `max_incrementals_per_chain` rollover is sent without a parent and restores
+/// on its own, and an incremental whose recorded source snapshot belongs to
+/// another destination's image is refused.
+#[test]
+#[ignore = "needs root, loop devices and btrfs-progs"]
+fn btrfs_send_parents_follow_the_catalog() {
+    if !root_tests_enabled() {
+        return;
+    }
+    for tool in ["btrfs", "mkfs.btrfs", "diff"] {
+        if !have(tool) {
+            lr_testkit::unavailable!("{tool} missing");
+        }
+    }
+    let source = LoopDisk::attach(512 * 1024 * 1024).expect("source loop device");
+    let target = LoopDisk::attach(512 * 1024 * 1024).expect("target loop device");
+    if !run("mkfs.btrfs", &["-q", "-f", &source.path()])
+        || !run("mkfs.btrfs", &["-q", "-f", &target.path()])
+    {
+        lr_testkit::fixture_failed!("mkfs.btrfs failed");
+    }
+    let work = tempfile::tempdir().expect("workdir");
+    let top = Mount::btrfs(&source.device, &work.path().join("top"), None).expect("mount top");
+    assert!(run(
+        "btrfs",
+        &[
+            "subvolume",
+            "create",
+            &top.path().join("@").display().to_string()
+        ]
+    ));
+    let root_subvol =
+        Mount::btrfs(&source.device, &work.path().join("src-root"), Some("/@")).expect("mount @");
+    write_file(&root_subvol.path().join("etc/f1"), "one\n");
+
+    let dest_a = work.path().join("dest-a");
+    let dest_b = work.path().join("dest-b");
+    std::fs::create_dir_all(&dest_a).expect("dest a");
+    std::fs::create_dir_all(&dest_b).expect("dest b");
+    let request = |dest: &Path, member_type: MemberType| {
+        let mut request = BackupRequest::new(&source.device, dest, "set", Encryption::NoEncrypt)
+            .expect("request");
+        request.compression = Compression::None;
+        request.member_type = member_type;
+        if member_type == MemberType::Incremental {
+            request.parent = Some("latest".to_owned());
+        }
+        request.max_incrementals_per_chain = Some(1);
+        request
+    };
+
+    // 1. Rollover: full, one incremental, then a requested incremental that
+    //    exceeds the limit and becomes a new full.
+    stream_report(backup_image(&request(&dest_a, MemberType::Full)).expect("full"));
+    write_file(&root_subvol.path().join("etc/f2"), "two\n");
+    let first_incremental =
+        stream_report(backup_image(&request(&dest_a, MemberType::Incremental)).expect("incr"));
+    assert_eq!(first_incremental.seq_in_chain, 1);
+    write_file(&root_subvol.path().join("etc/f3"), "three\n");
+    // The catalog orders chains by their creation second, and a tie makes
+    // `--parent latest` ambiguous (D-116): start each new chain on A in a
+    // later second.
+    let next_second = || std::thread::sleep(std::time::Duration::from_millis(1100));
+    next_second();
+    let rollover =
+        stream_report(backup_image(&request(&dest_a, MemberType::Incremental)).expect("rollover"));
+    assert_eq!(rollover.seq_in_chain, 0, "the rollover starts a new chain");
+    assert!(
+        rollover
+            .subvolumes
+            .iter()
+            .all(|subvol| subvol.parent_snapshot_uuid.is_none()),
+        "a rollover full must be sent without a parent: {:?}",
+        rollover.subvolumes
+    );
+
+    // The rollover full restores on its own.
+    let set_root = dest_a.join("set");
+    let name = rollover
+        .image_path
+        .strip_prefix(&set_root)
+        .expect("set-relative name")
+        .to_string_lossy()
+        .into_owned();
+    let mount_root = work.path().join("restore-mnt");
+    std::fs::create_dir_all(&mount_root).expect("mount root");
+    restore_stream(&StreamRestoreRequest {
+        dest: dest_a.to_string_lossy().into_owned(),
+        set: "set".to_owned(),
+        images: vec![name],
+        destination_options: lr_store::DestinationOptions::new("set"),
+        target: target.device.clone(),
+        encryption: Encryption::NoEncrypt,
+        mount_root,
+        confirm: true,
+        accept_inconsistent: false,
+        context: lr_engine::progress::EngineContext::silent(),
+    })
+    .expect("the rollover full restores by itself");
+    let restored = Mount::btrfs(&target.device, &work.path().join("restored"), Some("/@"))
+        .expect("mount restored @");
+    assert!(
+        diff_dirs(root_subvol.path(), restored.path()),
+        "the restored rollover full must match the source"
+    );
+    drop(restored);
+
+    // 2. Alternating destinations with one set name: the source-side record
+    //    now belongs to B's full, so an incremental to A is refused.
+    stream_report(backup_image(&request(&dest_b, MemberType::Full)).expect("full to B"));
+    write_file(&root_subvol.path().join("etc/f4"), "four\n");
+    let error = match backup_image(&request(&dest_a, MemberType::Incremental)) {
+        Err(error) => error,
+        Ok(report) => panic!(
+            "an incremental relative to another destination's snapshot must be refused: \
+             {report:?}"
+        ),
+    };
+    assert!(
+        matches!(error, lr_core::Error::StreamParentMissing { .. }),
+        "{error}"
+    );
+    // A new full to A re-establishes the chain, and an incremental follows.
+    next_second();
+    stream_report(backup_image(&request(&dest_a, MemberType::Full)).expect("full to A"));
+    let resumed =
+        stream_report(backup_image(&request(&dest_a, MemberType::Incremental)).expect("incr"));
+    assert!(
+        resumed
+            .subvolumes
+            .iter()
+            .all(|subvol| subvol.parent_snapshot_uuid.is_some())
+    );
+}
