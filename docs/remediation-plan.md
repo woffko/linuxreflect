@@ -87,6 +87,14 @@ Complete phases 2 to 4. Publish `v0.1.0-beta.1` after phase 2 and
 
 Stop only on a genuine blocker.
 
+**beta.1 done (2026-09-27).** `v0.1.0-beta.1` is published from `ab84a97`
+with phase 2 complete and A11, R10 and A14 fixed early: `cargo xtask ci`
+exits 0 (572 tests), and `cargo xtask root` ran 65 scenarios with 65 passed,
+none unavailable and nothing left behind. On the Ubuntu 22.04 GNOME host the
+tarball installs, polkit behaves as the policy says, `restore apply` raises
+GNOME Shell's administrator dialog (R32), and the rescue medium boots under
+SeaBIOS and Secure Boot. Its release notes list no P0 or P1 issue.
+
 ## Ground rules
 
 1. **Test first.** Every finding gets a regression test that fails on the
@@ -430,10 +438,10 @@ P3 = cleanup.
 | R07 | P1 | Catalog temporary-file symlink redirects root writes | 2.1 | ☑ |
 | R08 | P1 | Shared scratch spool permits manifest substitution | 2.1 | ☑ |
 | R09 | P1 | NBD inspection mounts keep setuid and device nodes | 2.6 | ☑ |
-| R10 | P2 | Read permission can cancel another user's job | 3 | ☐ |
+| R10 | P2 | Read permission can cancel another user's job | 3 | ☑ |
 | R11 | P2 | Unauthenticated Argon2 parameters choose resource use | 1.2 | ☑ |
-| R12 | P2 | A passphrase FIFO blocks request threads | 3 | ☐ |
-| R13 | P2 | `known_hosts` negations and revocations not enforced | 3 | ☐ |
+| R12 | P2 | A passphrase FIFO blocks request threads | 3 | ☑ |
+| R13 | P2 | `known_hosts` negations and revocations not enforced | 3 | ☑ |
 | R14 | P2 | Live file backup can follow replaced ancestors | 1.6 | ☑ |
 | R15 | P1 | Requested encryption ignored on a plaintext chain | 2.2 | ☑ |
 | R16 | P1 | Live file backups lack per-file stability checks | 2.2 | ☑ |
@@ -453,25 +461,25 @@ P3 = cleanup.
 | R30 | P1 | Unmounted nested Btrfs subvolumes are silently omitted | 2.2 | ☑ |
 | R31 | P1 | Backup options disappear when the CLI uses the daemon | 2.5 | ☑ |
 | R32 | P2 | Restore apply cannot request its polkit dialog | 2.8 | ☑ |
-| R33 | P2 | File restore drops metadata failures | 3 | ☐ |
+| R33 | P2 | File restore drops metadata failures | 3 | ☑ |
 | R34 | P2 | File restore reports success without a durability barrier | 3 | ☐ |
 | R35 | P2 | Generated systemd commands are not escaped | 3 | ☐ |
 | R36 | P2 | Accepted scheduling fields are ignored | 3 | ☐ |
 | R37 | P2 | Whole-disk backup rejects legal partition numbering | 3 | ☐ |
-| R38 | P2 | Filesystem-tool parse errors can deadlock a job | 3 | ☐ |
+| R38 | P2 | Filesystem-tool parse errors can deadlock a job | 3 | ☑ |
 | R39 | P3 | Block-backup failure cleanup targets the wrong spool | 2.1 | ☑ |
 | R40 | P2 | Integration tests pass when setup fails | 0.2 | ☑ |
 | A1 | P0 | Restore writes over a filesystem mounted in another mount namespace (no `O_EXCL`) | 1.1 | ☑ |
 | A2 | P0 | A device mounted elsewhere is backed up as `consistency: offline` | 1.1 | ☑ |
 | A3 | P0 | Image kind and target kind are not matched | 1.7 | ☑ |
-| A4 | P2 | `VerifyImage` makes root read client-named secret files and skip host keys | 3 | ☐ |
+| A4 | P2 | `VerifyImage` makes root read client-named secret files and skip host keys | 3 | ☑ |
 | A5 | P1 | All verifications share one job set | 2.7 | ☑ |
 | A6 | P1 | SFTP unusable through the daemon from the GUI; list calls drop SSH options | 2.5 | ☑ |
 | A7 | P1 | Infinite stop timeout can hang shutdown | 2.7 | ☑ |
 | A8 | P1 | One panic ends every job, including a running restore | 2.7 | ☑ |
 | A9 | P2 | Read-only operations create set directories | 2.1 | ☑ |
 | A10 | P2 | The GUI cannot restore files into a non-empty folder | 2.8 | ☑ |
-| A11 | P2 | Restore tokens are reusable and not bound to the caller | 3 | ☐ |
+| A11 | P2 | Restore tokens are reusable and not bound to the caller | 3 | ☑ |
 | A12 | P3 | NBD socket chmod after bind, failure ignored | 2.6 | ☑ |
 | A13 | P1 | `--parent latest` picks an arbitrary chain when two chains start in the same second (found while fixing R04, D-116) | 1.5 | ☑ |
 | A14 | P2 | Disks with 4096-byte logical blocks are misread: the GPT is looked for at byte 512, MBR and sysfs offsets count 512-byte units, and a whole-disk image of such a disk is refused (found in the beta.1 acceptance) | 3 | ☑ |

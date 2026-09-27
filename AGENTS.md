@@ -95,7 +95,9 @@ the GUI on GNOME Wayland, the update handoff), the graphical rescue medium
 boots to the GUI with its own daemon under SeaBIOS and Secure Boot, and
 `v0.1.0-alpha.1` is published as a GitHub pre-release. Phases 0 and 1 of
 `docs/remediation-plan.md` are complete (D-110..D-119) and `v0.1.0-alpha.2`
-is published; phases 2 to 4 of that plan are open. Deferred by the
+is published. Phase 2 is complete as well (D-111..D-113, D-120..D-122) and
+`v0.1.0-beta.1` is published from `ab84a97`; phases 3 and 4 are in progress
+toward `v0.1.0-beta.2` (D-114, D-123). Deferred by the
 maintainer: completing a backup from the GUI inside GNOME (needs an
 administrator at the polkit dialog). The test host (Ubuntu 22.04, GNOME 42;
 now `192.168.189.142`, a DHCP lease on VMnet8, so check it with
