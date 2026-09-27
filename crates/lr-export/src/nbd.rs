@@ -465,6 +465,41 @@ fn write_u64<S: Write>(stream: &mut S, value: u64) -> Result<()> {
     stream.write_all(&value.to_be_bytes()).map_err(Error::Io)
 }
 
+/// Bind the listening socket so it is never reachable with a wider mode
+/// than 0600 (A12): it is bound inside a fresh 0700 directory, its mode is
+/// set (a failure is fatal), and only then is it renamed to `socket`.
+fn bind_private(socket: &std::path::Path) -> Result<std::os::unix::net::UnixListener> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let parent = socket
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let staging = parent.join(format!(
+        ".lr-nbd-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default()
+    ));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&staging)
+        .map_err(Error::Io)?;
+    let staged = staging.join("socket");
+    let bound = std::os::unix::net::UnixListener::bind(&staged)
+        .map_err(Error::Io)
+        .and_then(|listener| {
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))
+                .map_err(Error::Io)?;
+            std::fs::rename(&staged, socket).map_err(Error::Io)?;
+            Ok(listener)
+        });
+    let _ = std::fs::remove_file(&staged);
+    let _ = std::fs::remove_dir(&staging);
+    bound
+}
+
 /// Accept loop over a Unix socket; returns when `stop` is set.
 ///
 /// # Errors
@@ -475,9 +510,8 @@ pub fn serve_unix(
     config: ExportConfig,
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
-    let listener = std::os::unix::net::UnixListener::bind(socket).map_err(Error::Io)?;
+    let listener = bind_private(socket)?;
     listener.set_nonblocking(true).map_err(Error::Io)?;
-    let _ = std::fs::set_permissions(socket, std::os::unix::fs::PermissionsExt::from_mode(0o600));
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -496,4 +530,31 @@ pub fn serve_unix(
     }
     let _ = std::fs::remove_file(socket);
     Ok(())
+}
+
+#[cfg(test)]
+mod private_socket {
+    /// The export socket is reachable only at its final path, mode 0600, and
+    /// the private staging directory is gone (A12).
+    #[test]
+    fn the_socket_is_bound_privately() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("export.sock");
+        let listener = super::bind_private(&socket).expect("bind");
+        let mode = std::fs::metadata(&socket)
+            .expect("socket")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        std::os::unix::net::UnixStream::connect(&socket).expect("a client connects");
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(entries, ["export.sock"], "no staging directory is left");
+        drop(listener);
+    }
 }
