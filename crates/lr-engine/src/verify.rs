@@ -444,6 +444,16 @@ fn verify_whole_disk(
     let mut reader = ImageReader::open(destination.open_ro(set, name)?)?;
     let keys = keys::unlock_image(encryption, reader.superblock())?;
     let superblock: Superblock = reader.superblock().clone();
+    // The restore plan's checks: counts, kinds, bounds, geometry and complete
+    // consumption (R24), and recorded bad sectors (R26).
+    let summary = crate::plan::whole_disk(&mut reader, &keys.meta_key, &superblock)?;
+    report.recorded_bad_chunks += summary.bad;
+    if summary.bad > 0 {
+        report.warnings.push(crate::plan::bad_sector_message(
+            summary.bad,
+            summary.first_bad,
+        ));
+    }
     let kind = superblock.aead_kind()?;
     let chunk_size = u64::from(superblock.chunk_size);
     let mut chunks = reader.chunk_reader_with(destination.open_ro(set, name)?);

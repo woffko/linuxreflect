@@ -621,6 +621,12 @@ pub(crate) fn restore_whole_disk<R: std::io::Read + std::io::Seek>(
     if target.size_bytes() < superblock.source_size_bytes {
         return Err(Error::NoSpace);
     }
+    // The same plan check as `prepare`, before the first write (R24, R26).
+    crate::plan::refuse_bad_sectors(&crate::plan::whole_disk(
+        reader,
+        &keys.meta_key,
+        superblock,
+    )?)?;
     let mut buffer = target.buffer(chunk_size as usize)?;
     let mut zeros = target.buffer(chunk_size as usize)?;
     zeros.clear();
@@ -652,10 +658,11 @@ pub(crate) fn restore_whole_disk<R: std::io::Read + std::io::Seek>(
             ));
         }
         let expected = region.chunk_count(chunk_size)?;
-        if header.chunk_count != expected {
+        if header.chunk_count != expected || header.entry_count != expected {
             return Err(Error::corrupt(format!(
-                "region {} declares {expected} chunks but its manifest has {}",
-                region.index, header.chunk_count
+                "region {} needs {expected} entries, its manifest declares {} chunks and {} \
+                 entries",
+                region.index, header.chunk_count, header.entry_count
             )));
         }
         let region_start = region.start_lba * lbs;

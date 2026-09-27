@@ -522,6 +522,11 @@ pub fn prepare_restore(request: &PrepareRequest) -> Result<RestorePlan> {
     // A whole-disk image is always a full image; block and stream images may be
     // chain members, and applying one needs every ancestor.
     let members: Vec<String> = if superblock.is_whole_disk() {
+        // The whole manifest is read and validated before a token exists:
+        // a malformed manifest or a recorded bad sector is refused here
+        // (R24, R26).
+        let summary = crate::plan::whole_disk(&mut reader, &keys.meta_key, &superblock)?;
+        crate::plan::refuse_bad_sectors(&summary)?;
         vec![location.name.clone()]
     } else {
         let files = crate::chain::resolve_chain(&*destination, &set, &location.name)?;

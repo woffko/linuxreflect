@@ -333,8 +333,13 @@ impl DiskHeader {
             )));
         }
         for region in &self.regions {
-            let end = region.start_lba * u64::from(self.logical_block_size) + region.size_bytes;
-            if end > self.disk_size + u64::from(self.logical_block_size) {
+            let end = region
+                .start_lba
+                .checked_mul(u64::from(self.logical_block_size))
+                .and_then(|start| start.checked_add(region.size_bytes))
+                .ok_or_else(|| Error::corrupt(format!("region {} overflows", region.index)))?;
+            // The same bound `validate` applies on reading (R24).
+            if end > self.disk_size {
                 return Err(Error::corrupt(format!(
                     "region {} ends at {end}, past the disk size {}",
                     region.index, self.disk_size
@@ -422,6 +427,12 @@ impl DiskHeader {
     /// Returns [`Error::Corrupt`] when regions overlap, are out of order, or a
     /// leading region exceeds the spec's cap.
     pub fn validate(&self) -> Result<()> {
+        if !matches!(self.logical_block_size, 512 | 1024 | 2048 | 4096) {
+            return Err(Error::corrupt(format!(
+                "logical block size {} is not 512, 1024, 2048 or 4096",
+                self.logical_block_size
+            )));
+        }
         let mut previous_end = 0u64;
         for region in &self.regions {
             if region.kind == RegionKind::Leading && region.size_bytes > MAX_LEADING_BYTES {
@@ -430,14 +441,51 @@ impl DiskHeader {
                     region.size_bytes
                 )));
             }
-            let start = region.start_lba * u64::from(self.logical_block_size);
+            let start = region
+                .start_lba
+                .checked_mul(u64::from(self.logical_block_size))
+                .ok_or_else(|| {
+                    Error::corrupt(format!("region {} start overflows", region.index))
+                })?;
             if start < previous_end {
                 return Err(Error::corrupt(format!(
                     "region {} starts at {start}, before the previous region ends at {previous_end}",
                     region.index
                 )));
             }
-            previous_end = start + region.size_bytes;
+            let end = start
+                .checked_add(region.size_bytes)
+                .ok_or_else(|| Error::corrupt(format!("region {} end overflows", region.index)))?;
+            // Regions lie on the disk (R24).
+            if end > self.disk_size {
+                return Err(Error::corrupt(format!(
+                    "region {} ends at {end}, past the end of the {}-byte disk",
+                    region.index, self.disk_size
+                )));
+            }
+            previous_end = end;
+        }
+        Ok(())
+    }
+
+    /// Check that the header describes the disk the superblock records
+    /// (R24).
+    ///
+    /// # Errors
+    /// Returns [`Error::Corrupt`] when the disk size or the logical block
+    /// size disagree.
+    pub fn validate_geometry(&self, disk_size: u64, logical_block_size: u32) -> Result<()> {
+        if self.disk_size != disk_size {
+            return Err(Error::corrupt(format!(
+                "the disk header records {} bytes, the superblock {disk_size}",
+                self.disk_size
+            )));
+        }
+        if self.logical_block_size != logical_block_size {
+            return Err(Error::corrupt(format!(
+                "the disk header records {}-byte sectors, the superblock {logical_block_size}",
+                self.logical_block_size
+            )));
         }
         Ok(())
     }
