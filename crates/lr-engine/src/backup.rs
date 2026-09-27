@@ -709,11 +709,15 @@ pub fn backup_block_with(
     guard.disarm();
 
     // 11. Catalog update, still under the lock (spec §D.3).
-    lock.verify()?;
-    update_catalog(&*destination, &set, &request.set_name, now_unix())?;
+    let catalog_warning =
+        crate::catalog::record_published(&*destination, &set, &request.set_name, &lock, now_unix());
 
     Ok(BackupReport {
-        warnings: durability.warning("the image").into_iter().collect(),
+        warnings: durability
+            .warning("the image")
+            .into_iter()
+            .chain(catalog_warning)
+            .collect(),
         image_path: local_image_path(&set_root, &image_name),
         image_uri: request.image_uri(&image_name),
         image_uuid: request.image_uuid,
@@ -809,18 +813,6 @@ pub(crate) fn spool_location(
             Ok((PathBuf::new(), dir))
         }
     }
-}
-
-/// Rewrite the catalog from the superblocks and refresh the source labels.
-fn update_catalog(
-    destination: &dyn Destination,
-    set: &lr_store::SetHandle,
-    set_name: &str,
-    now: u64,
-) -> Result<()> {
-    let mut loaded = crate::catalog::load(destination, set, set_name, now)?;
-    loaded.catalog.updated_unix = now;
-    crate::catalog::write_catalog(destination, set, &loaded.catalog)
 }
 
 /// The parent chain of an incremental or differential member.

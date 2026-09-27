@@ -265,6 +265,34 @@ pub fn write_catalog(
     published.map(|_| ())
 }
 
+/// Record a just-published image in the set's catalog, under `lock`.
+///
+/// The image is already published and the catalog is a cache rebuilt from
+/// the images' superblocks (D-120), so a failure here, a lost lease
+/// included, comes back as a warning: the backup succeeded, and failing it
+/// would invite a second, duplicate member. The next read of the set
+/// rebuilds the catalog.
+pub(crate) fn record_published(
+    destination: &dyn Destination,
+    set: &SetHandle,
+    set_name: &str,
+    lock: &lr_store::SetLock,
+    now: u64,
+) -> Option<String> {
+    let recorded = (|| {
+        let mut loaded = load(destination, set, set_name, now)?;
+        loaded.catalog.updated_unix = now;
+        lock.verify()?;
+        write_catalog(destination, set, &loaded.catalog)
+    })();
+    recorded.err().map(|error| {
+        format!(
+            "the image is published, but the set's catalog was not updated ({error}); it is \
+             rebuilt from the images the next time the set is read"
+        )
+    })
+}
+
 /// Load the catalog, validating it against the members' superblocks.
 ///
 /// # Errors

@@ -585,14 +585,11 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
     walk.release_root();
     drop(snapshot);
 
-    {
-        let mut loaded = crate::catalog::load(&*destination, &set, &request.set_name, now_unix())?;
-        loaded.catalog.updated_unix = now_unix();
-        lock.verify()?;
-        crate::catalog::write_catalog(&*destination, &set, &loaded.catalog)?;
-    }
+    let catalog_warning =
+        crate::catalog::record_published(&*destination, &set, &request.set_name, &lock, now_unix());
 
     let mut warnings = walk.warnings;
+    warnings.extend(catalog_warning);
     warnings.append(&mut read_warnings);
     warnings.extend(crate::stream::excluded_warning(&excluded_subvolumes));
     warnings.extend(durability.warning("the image"));

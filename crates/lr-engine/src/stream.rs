@@ -508,18 +508,15 @@ pub fn backup_stream(request: &BackupRequest) -> Result<StreamReport> {
     snapshot.commit()?;
 
     // The catalog write still happens under the set lock (spec §D.3).
-    {
-        let mut loaded = crate::catalog::load(&*destination, &set, &request.set_name, now_unix())?;
-        loaded.catalog.updated_unix = now_unix();
-        lock.verify()?;
-        crate::catalog::write_catalog(&*destination, &set, &loaded.catalog)?;
-    }
+    let catalog_warning =
+        crate::catalog::record_published(&*destination, &set, &request.set_name, &lock, now_unix());
 
     Ok(StreamReport {
         warnings: durability
             .warning("the image")
             .into_iter()
             .chain(excluded_warning(&snapshot.excluded))
+            .chain(catalog_warning)
             .collect(),
         excluded_subvolumes: snapshot.excluded.clone(),
         image_path: crate::backup::local_image_path(&set_root, &image_name),

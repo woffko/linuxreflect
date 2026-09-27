@@ -12,6 +12,7 @@
 //! | writing the image | `a_failed_write_publishes_nothing` |
 //! | flushing it (sync) | `a_failed_flush_publishes_nothing` |
 //! | publishing it (rename) | `a_failed_publication_publishes_nothing` |
+//! | recording it in the catalog | `a_failed_catalog_write_keeps_the_published_image` |
 //! | the set lock's lease | `a_lost_lease_stops_the_job_before_publication` |
 //! | reading an image back | `a_failed_read_fails_verify_and_restore` |
 //! | a snapshot that times out | `tests/snapshot_health.rs` (R29) |
@@ -20,7 +21,7 @@
 
 use std::path::{Path, PathBuf};
 
-use lr_engine::backup::BackupRequest;
+use lr_engine::backup::{BackupRequest, MemberType};
 use lr_engine::file::{FileBackupOptions, FileReport, backup_file};
 use lr_engine::keys::Encryption;
 use lr_engine::restore::{ApplyRequest, PrepareRequest, apply_restore, prepare_restore};
@@ -168,6 +169,35 @@ fn a_failed_publication_publishes_nothing() {
         "{error}"
     );
     assert_nothing_published(&f.source, &f.dest, "publish");
+}
+
+/// The catalog is a cache rebuilt from the images (D-120): once the image is
+/// published, failing to record it is a warning, not a failed backup that a
+/// user would repeat, and the next backup finds the image anyway.
+#[test]
+fn a_failed_catalog_write_keeps_the_published_image() {
+    let f = fixture();
+    let report = backup(&f.source, &f.dest, fault("replace", &f.dest))
+        .expect("the published image is a successful backup");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("catalog") && warning.contains("injected fault")),
+        "{:?}",
+        report.warnings
+    );
+    assert_eq!(images(&f.dest).len(), 1);
+    verify(&report.image_path.display().to_string()).expect("the image verifies");
+
+    // The next incremental finds its parent without the catalog entry.
+    let mut request =
+        BackupRequest::new(&f.source, &f.dest, SET, Encryption::NoEncrypt).expect("request");
+    request.member_type = MemberType::Incremental;
+    request.parent = Some("latest".to_owned());
+    let incremental =
+        backup_file(&request, &FileBackupOptions::default()).expect("the next incremental");
+    assert_eq!(incremental.parent_uuid, report.image_uuid);
 }
 
 /// A holder whose lease is lost stops before it publishes (R21).
