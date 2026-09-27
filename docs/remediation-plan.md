@@ -10,8 +10,8 @@ Together they report 52 findings. Many share a root cause, so the plan is
 organised around the mechanisms that fix them rather than by finding number.
 The [finding index](#finding-index) at the end maps every ID to its work item.
 
-Status of this document: **plan, not started**. Tick items off in the index as
-they land.
+Status of this document: **phases 0–2 done, phases 3–4 open**. Tick items off
+in the index as they land.
 
 ## Contents
 
@@ -429,7 +429,7 @@ P3 = cleanup.
 | R06 | P1 | File and Stream restores are not confined to the target | 1.6 | ☑ |
 | R07 | P1 | Catalog temporary-file symlink redirects root writes | 2.1 | ☑ |
 | R08 | P1 | Shared scratch spool permits manifest substitution | 2.1 | ☑ |
-| R09 | P1 | NBD inspection mounts keep setuid and device nodes | 2.6 | ☐ |
+| R09 | P1 | NBD inspection mounts keep setuid and device nodes | 2.6 | ☑ |
 | R10 | P2 | Read permission can cancel another user's job | 3 | ☐ |
 | R11 | P2 | Unauthenticated Argon2 parameters choose resource use | 1.2 | ☑ |
 | R12 | P2 | A passphrase FIFO blocks request threads | 3 | ☐ |
@@ -451,8 +451,8 @@ P3 = cleanup.
 | R28 | P1 | Apostrophes in mountpoints break both thaw deadmen | 2.4 | ☑ |
 | R29 | P2 | The final source read can outlive snapshot health | 2.4 | ☑ |
 | R30 | P1 | Unmounted nested Btrfs subvolumes are silently omitted | 2.2 | ☑ |
-| R31 | P1 | Backup options disappear when the CLI uses the daemon | 2.5 | ☐ |
-| R32 | P2 | Restore apply cannot request its polkit dialog | 2.8 | ☐ |
+| R31 | P1 | Backup options disappear when the CLI uses the daemon | 2.5 | ☑ |
+| R32 | P2 | Restore apply cannot request its polkit dialog | 2.8 | ☑ |
 | R33 | P2 | File restore drops metadata failures | 3 | ☐ |
 | R34 | P2 | File restore reports success without a durability barrier | 3 | ☐ |
 | R35 | P2 | Generated systemd commands are not escaped | 3 | ☐ |
@@ -465,12 +465,12 @@ P3 = cleanup.
 | A2 | P0 | A device mounted elsewhere is backed up as `consistency: offline` | 1.1 | ☑ |
 | A3 | P0 | Image kind and target kind are not matched | 1.7 | ☑ |
 | A4 | P2 | `VerifyImage` makes root read client-named secret files and skip host keys | 3 | ☐ |
-| A5 | P1 | All verifications share one job set | 2.7 | ☐ |
-| A6 | P1 | SFTP unusable through the daemon from the GUI; list calls drop SSH options | 2.5 | ☐ |
-| A7 | P1 | Infinite stop timeout can hang shutdown | 2.7 | ☐ |
-| A8 | P1 | One panic ends every job, including a running restore | 2.7 | ☐ |
+| A5 | P1 | All verifications share one job set | 2.7 | ☑ |
+| A6 | P1 | SFTP unusable through the daemon from the GUI; list calls drop SSH options | 2.5 | ☑ |
+| A7 | P1 | Infinite stop timeout can hang shutdown | 2.7 | ☑ |
+| A8 | P1 | One panic ends every job, including a running restore | 2.7 | ☑ |
 | A9 | P2 | Read-only operations create set directories | 2.1 | ☑ |
-| A10 | P2 | The GUI cannot restore files into a non-empty folder | 2.8 | ☐ |
+| A10 | P2 | The GUI cannot restore files into a non-empty folder | 2.8 | ☑ |
 | A11 | P2 | Restore tokens are reusable and not bound to the caller | 3 | ☐ |
-| A12 | P3 | NBD socket chmod after bind, failure ignored | 2.6 | ☐ |
+| A12 | P3 | NBD socket chmod after bind, failure ignored | 2.6 | ☑ |
 | A13 | P1 | `--parent latest` picks an arbitrary chain when two chains start in the same second (found while fixing R04, D-116) | 1.5 | ☑ |
