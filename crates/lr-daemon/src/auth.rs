@@ -36,6 +36,8 @@ pub enum Action {
     DestinationConfigure,
     /// Mount or unmount exports.
     ExportManage,
+    /// Cancel a job another user started (R10).
+    JobCancelOther,
 }
 
 impl Action {
@@ -51,6 +53,7 @@ impl Action {
             Self::ScheduleManage => "org.linuxreflect.schedule.manage",
             Self::DestinationConfigure => "org.linuxreflect.destination.configure",
             Self::ExportManage => "org.linuxreflect.export.manage",
+            Self::JobCancelOther => "org.linuxreflect.job.cancel-other",
         }
     }
 
@@ -69,6 +72,7 @@ impl Action {
                 | Self::ScheduleManage
                 | Self::DestinationConfigure
                 | Self::ExportManage
+                | Self::JobCancelOther
         )
     }
 }
@@ -127,6 +131,18 @@ impl PeerIdentity {
         }
 
         Ok(identity)
+    }
+
+    /// A peer with only a uid, for tests of per-user decisions.
+    #[cfg(test)]
+    pub(crate) fn for_uid(uid: u32) -> Self {
+        Self {
+            uid,
+            gid: uid,
+            pid: None,
+            start_time: None,
+            _pidfd: None,
+        }
     }
 
     /// A short description for logs and error messages.
@@ -493,12 +509,24 @@ mod tests {
             Action::ScheduleManage,
             Action::DestinationConfigure,
             Action::ExportManage,
+            Action::JobCancelOther,
         ]
         .into_iter()
         .map(Action::id)
         .collect();
+        // Every action the daemon asks for is defined in the installed
+        // policy; polkit refuses an unknown action.
+        let policy = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../contrib/polkit/org.linuxreflect.policy"),
+        )
+        .expect("policy");
         for id in ids {
             assert!(id.starts_with("org.linuxreflect."), "{id}");
+            assert!(
+                policy.contains(&format!("<action id=\"{id}\">")),
+                "{id} is not in the polkit policy"
+            );
         }
         // A fresh administrator challenge needs the dialog (R32).
         assert!(Action::RestoreApply.allows_interaction());

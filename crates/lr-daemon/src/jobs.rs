@@ -104,6 +104,9 @@ impl JobEvent {
 
 struct Entry {
     set: String,
+    /// The uid that started the job; only it (or root) may cancel it
+    /// without the administrator action (R10).
+    owner: u32,
     state: JobState,
     cancel: Arc<AtomicBool>,
     summary_json: Option<String>,
@@ -210,6 +213,19 @@ impl Jobs {
     /// Returns [`Error::TargetBusy`] when the same `job_id` is already running
     /// or when another job holds the set.
     pub fn register(&self, job_id: &str, set: &str) -> Result<(Sink, Arc<AtomicBool>)> {
+        self.register_for(job_id, set, 0)
+    }
+
+    /// [`Jobs::register`] for a job that `owner` starts.
+    ///
+    /// # Errors
+    /// As [`Jobs::register`].
+    pub fn register_for(
+        &self,
+        job_id: &str,
+        set: &str,
+        owner: u32,
+    ) -> Result<(Sink, Arc<AtomicBool>)> {
         let mut entries = self.lock();
         // Checked under the lock, so a job is either refused or counted by
         // `active` before the drain can conclude that nothing runs.
@@ -244,6 +260,7 @@ impl Jobs {
             job_id.to_owned(),
             Entry {
                 set: set.to_owned(),
+                owner,
                 state: JobState::Running,
                 cancel: Arc::clone(&cancel),
                 summary_json: None,
@@ -315,6 +332,17 @@ impl Jobs {
         })
     }
 
+    /// The uid that started `job_id`.
+    ///
+    /// # Errors
+    /// Returns [`Error::Unsupported`] for an unknown job.
+    pub fn owner(&self, job_id: &str) -> Result<u32> {
+        self.lock()
+            .get(job_id)
+            .map(|entry| entry.owner)
+            .ok_or_else(|| Error::unsupported(format!("no job {job_id}")))
+    }
+
     /// Ask a job to stop; the engine notices on its next progress check.
     ///
     /// # Errors
@@ -377,7 +405,7 @@ pub async fn authorize_and_register(
     set: &str,
 ) -> Result<(Sink, Arc<AtomicBool>)> {
     auth.check(peer, action).await?;
-    jobs.register(job_id, set)
+    jobs.register_for(job_id, set, peer.uid)
 }
 
 /// How many jobs are registered, for tests and diagnostics.

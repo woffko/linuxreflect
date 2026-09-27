@@ -289,6 +289,7 @@ impl DaemonService {
         &self,
         job_id: String,
         set: String,
+        owner: u32,
         work: F,
     ) -> Result<ReceiverStream<std::result::Result<Progress, Status>>>
     where
@@ -297,7 +298,7 @@ impl DaemonService {
         // Registration publishes Started synchronously. Subscribe first so
         // clients always learn the ID needed to cancel or recover this job.
         let mut events = self.jobs.subscribe();
-        let (sink, cancel) = self.jobs.register(&job_id, &set)?;
+        let (sink, cancel) = self.jobs.register_for(&job_id, &set, owner)?;
         let context = EngineContext {
             progress: Some(Arc::new(sink)),
             cancel: Some(cancel),
@@ -568,7 +569,7 @@ impl LinuxReflect for DaemonService {
         &self,
         request: GrpcRequest<BackupSpec>,
     ) -> std::result::Result<Response<Self::CreateBackupStream>, Status> {
-        self.authorize(&request, Action::BackupCreate).await?;
+        let peer = self.authorize(&request, Action::BackupCreate).await?;
         let spec = request.get_ref().clone();
         // The same conversion the CLI's direct route uses (R31).
         let job = lr_request::backup_job(&spec).map_err(status::status_of)?;
@@ -578,7 +579,7 @@ impl LinuxReflect for DaemonService {
             spec.job_id.clone()
         };
         let stream = self
-            .run_job(job_id, spec.set.clone(), move |context| {
+            .run_job(job_id, spec.set.clone(), peer.uid, move |context| {
                 let report = lr_request::run_backup(job, context)?;
                 serde_json::to_string(&report)
                     .map_err(|error| Error::corrupt(format!("report json: {error}")))
@@ -591,7 +592,7 @@ impl LinuxReflect for DaemonService {
         &self,
         request: GrpcRequest<VerifySpec>,
     ) -> std::result::Result<Response<Self::VerifyImageStream>, Status> {
-        self.authorize(&request, Action::DiskRead).await?;
+        let peer = self.authorize(&request, Action::DiskRead).await?;
         let spec = request.get_ref().clone();
         let encryption = lr_engine::options::restore_encryption(
             (!spec.passphrase_file.is_empty())
@@ -621,7 +622,7 @@ impl LinuxReflect for DaemonService {
         );
         let slots = Arc::clone(&self.verifications);
         let stream = self
-            .run_job(id.clone(), id, move |context| {
+            .run_job(id.clone(), id, peer.uid, move |context| {
                 let _slot = slots.acquire();
                 let mut verify = verify;
                 verify.context = context;
@@ -708,7 +709,7 @@ impl LinuxReflect for DaemonService {
             spec.job_id.clone()
         };
         let stream = self
-            .run_job(job_id, "restore".to_owned(), move |context| {
+            .run_job(job_id, "restore".to_owned(), uid, move |context| {
                 // Only the user who prepared the token may use it, once (A11).
                 let outcome = lr_engine::restore::apply_restore_as(
                     &lr_engine::restore::ApplyRequest { context, ..apply },
@@ -771,11 +772,15 @@ impl LinuxReflect for DaemonService {
         &self,
         request: GrpcRequest<JobRef>,
     ) -> std::result::Result<Response<JobState>, Status> {
-        self.authorize(&request, Action::DiskRead).await?;
-        let snapshot = self
-            .jobs
-            .cancel(&request.get_ref().job_id)
-            .map_err(status::status_of)?;
+        let peer = self.authorize(&request, Action::DiskRead).await?;
+        let job_id = &request.get_ref().job_id;
+        // A user cancels their own jobs; another user's job needs the
+        // administrator action (R10). Root may always cancel.
+        let owner = self.jobs.owner(job_id).map_err(status::status_of)?;
+        if peer.uid != owner && peer.uid != 0 {
+            self.authorize(&request, Action::JobCancelOther).await?;
+        }
+        let snapshot = self.jobs.cancel(job_id).map_err(status::status_of)?;
         Ok(Response::new(job_state_of(&snapshot)))
     }
 
@@ -1064,7 +1069,7 @@ mod panicking_jobs {
             .expect("auth");
         let service = DaemonService::new(auth, Arc::new(Jobs::new()), true);
         let panicking = service
-            .run_job("boom".to_owned(), "boom".to_owned(), |_| {
+            .run_job("boom".to_owned(), "boom".to_owned(), 0, |_| {
                 panic!("a deliberate panic in a job")
             })
             .expect("start");
@@ -1077,7 +1082,7 @@ mod panicking_jobs {
             "{failed:?}"
         );
         let healthy = service
-            .run_job("after".to_owned(), "after".to_owned(), |_| {
+            .run_job("after".to_owned(), "after".to_owned(), 0, |_| {
                 Ok("{}".to_owned())
             })
             .expect("start");
@@ -1088,5 +1093,92 @@ mod panicking_jobs {
                 .any(|step| matches!(step, Step::Finished(_))),
             "{finished:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod job_owners {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use lr_proto::v1::JobRef;
+    use lr_proto::v1::linux_reflect_server::LinuxReflect;
+
+    use super::{DaemonService, Jobs, Peer};
+    use crate::auth::{Action, AuthBackend, PeerIdentity};
+
+    /// Every session user may read and cancel their own jobs; nobody here is
+    /// an administrator.
+    struct SessionUsers;
+
+    impl AuthBackend for SessionUsers {
+        fn check<'a>(
+            &'a self,
+            _peer: &'a PeerIdentity,
+            action: Action,
+        ) -> Pin<Box<dyn Future<Output = lr_core::Result<()>> + Send + 'a>> {
+            Box::pin(async move {
+                if action == Action::JobCancelOther {
+                    Err(lr_core::Error::denied(action.id(), "not an administrator"))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
+    fn cancel_as(uid: u32, job_id: &str) -> tonic::Request<JobRef> {
+        let mut request = tonic::Request::new(JobRef {
+            job_id: job_id.to_owned(),
+        });
+        request
+            .extensions_mut()
+            .insert(Peer(Arc::new(PeerIdentity::for_uid(uid))));
+        request
+    }
+
+    /// A job only its owner (or root) cancels; another user needs the
+    /// administrator action, and a refused cancel leaves the job running
+    /// (R10).
+    #[tokio::test]
+    async fn only_the_owner_cancels_a_job() {
+        let jobs = Arc::new(Jobs::new());
+        let service = DaemonService::new(Arc::new(SessionUsers), Arc::clone(&jobs), true);
+        let start = |id: &str, owner: u32| {
+            service
+                .run_job(id.to_owned(), id.to_owned(), owner, |context| {
+                    let cancel = context.cancel.clone().expect("a cancel flag");
+                    while !cancel.load(Ordering::SeqCst) {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(lr_core::Error::Cancelled)
+                })
+                .expect("start")
+        };
+        let _first = start("owned", 1000);
+        let refused = service
+            .cancel_job(cancel_as(1001, "owned"))
+            .await
+            .expect_err("another user must not cancel");
+        assert_eq!(refused.code(), tonic::Code::PermissionDenied, "{refused}");
+        assert!(
+            jobs.list()
+                .expect("list")
+                .iter()
+                .any(|job| job.job_id == "owned" && job.state == crate::jobs::JobState::Running),
+            "a refused cancel must leave the job running"
+        );
+        service
+            .cancel_job(cancel_as(1000, "owned"))
+            .await
+            .expect("the owner cancels");
+
+        let _second = start("by-root", 1000);
+        service
+            .cancel_job(cancel_as(0, "by-root"))
+            .await
+            .expect("root cancels");
     }
 }
