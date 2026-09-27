@@ -1127,10 +1127,25 @@ pub(crate) fn snapshot_opts(request: &BackupRequest) -> SnapshotOpts {
         allow_inconsistent: request.allow_inconsistent,
         lvm_cow_size: request.lvm_cow_size.clone(),
         deadman_grace_secs: request.deadman_grace_secs,
-        // The freeze provider proves the destination is on another filesystem.
-        // A remote destination is never on the frozen filesystem.
-        destination: request.dest.is_empty().then(|| request.dest_root.clone()),
-        destination_remote: !request.dest.is_empty(),
+        // The freeze provider proves the destination is on another
+        // filesystem. The parsed destination decides: the CLI and the daemon
+        // pass even a local path as `dest`, and only SFTP is remote (R27).
+        destination: local_destination(request),
+        destination_remote: matches!(
+            lr_store::uri::parse(&request.dest),
+            Ok(lr_store::DestinationUri::Sftp { .. })
+        ),
+    }
+}
+
+/// The local directory the backup writes to, when it is local.
+fn local_destination(request: &BackupRequest) -> Option<PathBuf> {
+    if request.dest.is_empty() {
+        return Some(request.dest_root.clone());
+    }
+    match lr_store::uri::parse(&request.dest) {
+        Ok(lr_store::DestinationUri::Local { path }) => Some(path),
+        _ => None,
     }
 }
 
@@ -1203,6 +1218,28 @@ mod tests {
     use super::{BackupRequest, Compression, backup_block_full, validate_chunk_size};
     use crate::keys::Encryption;
     use crate::keystore::Passphrase;
+
+    /// The CLI and the daemon pass even a local destination as a URI; the
+    /// freeze provider must still see it as local and check that it is not
+    /// on the filesystem being frozen (R27).
+    #[test]
+    fn a_local_destination_uri_is_checked_by_the_freeze_guard() {
+        let mut request = BackupRequest::new("/dev/null", "/unused", "set", Encryption::NoEncrypt)
+            .expect("request");
+        request.dest = "/mnt/data/backups".to_owned();
+        let opts = super::snapshot_opts(&request);
+        assert!(!opts.destination_remote, "{opts:?}");
+        assert_eq!(
+            opts.destination.as_deref(),
+            Some(std::path::Path::new("/mnt/data/backups"))
+        );
+        request.dest = "sftp://backup@nas/srv/backups".to_owned();
+        let opts = super::snapshot_opts(&request);
+        assert!(
+            opts.destination_remote && opts.destination.is_none(),
+            "{opts:?}"
+        );
+    }
 
     #[test]
     fn chunk_size_validation_follows_the_spec() {

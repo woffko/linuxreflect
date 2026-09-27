@@ -189,10 +189,15 @@ fn refusal(src: &SourceLayout, opts: &SnapshotOpts) -> Option<String> {
             "freeze needs the destination to prove it is on another filesystem".to_owned(),
         );
     };
-    let (Ok(source_metadata), Ok(destination_metadata)) = (
-        std::fs::metadata(&mountpoint),
-        std::fs::metadata(destination),
-    ) else {
+    // A destination the backup has not created yet lives on the filesystem
+    // of its nearest existing ancestor (R27).
+    let existing = destination
+        .ancestors()
+        .find(|path| path.exists())
+        .unwrap_or(destination);
+    let (Ok(source_metadata), Ok(destination_metadata)) =
+        (std::fs::metadata(&mountpoint), std::fs::metadata(existing))
+    else {
         return Some(format!(
             "cannot stat {} or {}",
             mountpoint.display(),
@@ -634,6 +639,34 @@ mod tests {
         let marker = marker_path("lr-test-marker").expect("marker path");
         assert!(marker.to_string_lossy().contains("lr-test-marker"));
         assert!(marker.parent().expect("parent").is_dir());
+    }
+
+    /// A destination that does not exist yet is judged by its nearest
+    /// existing ancestor: below the frozen filesystem it is refused, on
+    /// another filesystem it is not (R27).
+    #[test]
+    fn a_destination_that_does_not_exist_yet_is_judged_by_its_ancestor() {
+        // A separate filesystem, so no other refusal applies first.
+        let Ok(mount) = tempfile::tempdir_in("/dev/shm") else {
+            lr_testkit::unavailable!("/dev/shm is not usable - the destination ancestor test");
+        };
+        let mountpoint = mount.path().display().to_string();
+        let inside = format!("{mountpoint}/not/yet");
+        let support = FreezeProvider.supports(&layout(&mountpoint), &opts(&inside));
+        assert!(
+            support
+                .reason()
+                .is_some_and(|reason| reason.contains("on the filesystem being frozen")),
+            "{support:?}"
+        );
+        // /proc is always another filesystem.
+        let support = FreezeProvider.supports(&layout(&mountpoint), &opts("/proc/not/yet"));
+        assert!(
+            support
+                .reason()
+                .is_none_or(|reason| !reason.contains("destination")),
+            "{support:?}"
+        );
     }
 
     #[test]
