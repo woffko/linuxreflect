@@ -58,11 +58,13 @@ impl Action {
     #[must_use]
     pub const fn allows_interaction(self) -> bool {
         // `auth_admin_keep` actions may prompt; `restore.apply` is `auth_admin`
-        // (no keep) and is still allowed to prompt, but never to be skipped.
+        // (no keep): it must prompt every time, so it needs the dialog too
+        // (R32). The policy, not this flag, keeps it from being cached.
         matches!(
             self,
             Self::BackupCreate
                 | Self::RestorePrepare
+                | Self::RestoreApply
                 | Self::SnapshotManage
                 | Self::ScheduleManage
                 | Self::DestinationConfigure
@@ -498,10 +500,8 @@ mod tests {
         for id in ids {
             assert!(id.starts_with("org.linuxreflect."), "{id}");
         }
-        assert!(
-            !Action::RestoreApply.allows_interaction(),
-            "auth_admin, no keep"
-        );
+        // A fresh administrator challenge needs the dialog (R32).
+        assert!(Action::RestoreApply.allows_interaction());
         assert!(Action::BackupCreate.allows_interaction());
     }
 
