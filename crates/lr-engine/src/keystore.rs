@@ -65,6 +65,16 @@ pub fn load_passphrase_file(path: &Path) -> Result<Passphrase> {
             path.display()
         ))
     })?;
+    read_passphrase(fd, path)
+}
+
+/// Read a passphrase from a descriptor someone else opened (the daemon pins
+/// a client-named file this way, A4), with the checks of
+/// [`load_passphrase_file`]; `path` only names it in messages.
+///
+/// # Errors
+/// As [`load_passphrase_file`].
+pub fn read_passphrase(fd: std::os::fd::OwnedFd, path: &Path) -> Result<Passphrase> {
     if !lr_unsafe::fd_is_regular_file(&fd).map_err(Error::Io)? {
         return Err(Error::unsupported(format!(
             "{} is not a regular file",

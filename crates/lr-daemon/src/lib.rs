@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod client_files;
 pub mod jobs;
 pub mod notify;
 pub mod progress_bridge;

@@ -23,6 +23,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request as GrpcRequest, Response, Status};
 
 use crate::auth::{Action, PeerIdentity, SharedAuth};
+use crate::client_files::{self, ClientFiles};
 use crate::jobs::{JobEvent, JobState as JobStateInner, Jobs};
 use crate::status;
 use lr_export::session::ExportState;
@@ -516,8 +517,8 @@ impl LinuxReflect for DaemonService {
         &self,
         request: GrpcRequest<SetRef>,
     ) -> std::result::Result<Response<SetInfo>, Status> {
-        self.authorize(&request, Action::DiskRead).await?;
-        Ok(Response::new(self.set_info(request.get_ref())?))
+        let peer = self.authorize(&request, Action::DiskRead).await?;
+        Ok(Response::new(self.set_info(request.get_ref(), peer.uid)?))
     }
 
     async fn list_destinations(
@@ -574,8 +575,8 @@ impl LinuxReflect for DaemonService {
         &self,
         request: GrpcRequest<SetRef>,
     ) -> std::result::Result<Response<SetInfo>, Status> {
-        self.authorize(&request, Action::DiskRead).await?;
-        Ok(Response::new(self.set_info(request.get_ref())?))
+        let peer = self.authorize(&request, Action::DiskRead).await?;
+        Ok(Response::new(self.set_info(request.get_ref(), peer.uid)?))
     }
 
     async fn create_backup(
@@ -584,9 +585,24 @@ impl LinuxReflect for DaemonService {
     ) -> std::result::Result<Response<Self::CreateBackupStream>, Status> {
         let peer = self.authorize(&request, Action::BackupCreate).await?;
         let spec = request.get_ref().clone();
-        // The same conversion the CLI's direct route uses (R31).
+        client_files::check_host_key_policy(spec.insecure_ignore_host_key, self.dev_mode)
+            .map_err(status::status_of)?;
+        // The same conversion the CLI's direct route uses (R31), for files
+        // the caller owns (A4).
         let described = spec.clone();
-        let job = Self::off_thread(move || lr_request::backup_job(&described)).await?;
+        let uid = peer.uid;
+        let job = Self::off_thread(move || {
+            client_files::check(
+                uid,
+                &[
+                    &described.passphrase_file,
+                    &described.identity,
+                    &described.known_hosts,
+                ],
+            )?;
+            lr_request::backup_job(&described)
+        })
+        .await?;
         let job_id = if spec.job_id.is_empty() {
             format!("backup-{}", job.request.image_uuid)
         } else {
@@ -608,10 +624,21 @@ impl LinuxReflect for DaemonService {
     ) -> std::result::Result<Response<Self::VerifyImageStream>, Status> {
         let peer = self.authorize(&request, Action::DiskRead).await?;
         let spec = request.get_ref().clone();
-        let passphrase_file =
-            (!spec.passphrase_file.is_empty()).then(|| PathBuf::from(&spec.passphrase_file));
-        let encryption = Self::off_thread(move || {
-            lr_engine::options::restore_encryption(passphrase_file.as_deref())
+        client_files::check_host_key_policy(spec.insecure_ignore_host_key, self.dev_mode)
+            .map_err(status::status_of)?;
+        // Any session user may verify, so the named files must be the
+        // caller's own; they stay pinned until the job ends (A4).
+        let uid = peer.uid;
+        let named = spec.clone();
+        let (encryption, files, identity, known_hosts) = Self::off_thread(move || {
+            let encryption = match ClientFiles::passphrase(uid, &named.passphrase_file)? {
+                Some(passphrase) => lr_engine::keys::Encryption::Passphrase(passphrase),
+                None => lr_engine::options::restore_encryption(None)?,
+            };
+            let mut files = ClientFiles::new();
+            let identity = files.pin(uid, &named.identity)?;
+            let known_hosts = files.pin(uid, &named.known_hosts)?;
+            Ok((encryption, files, identity, known_hosts))
         })
         .await?;
         let verify = lr_engine::verify::VerifyRequest {
@@ -620,9 +647,8 @@ impl LinuxReflect for DaemonService {
             chain: spec.chain,
             destination_options: lr_store::DestinationOptions {
                 set_name: String::new(),
-                identity: (!spec.identity.is_empty()).then(|| PathBuf::from(&spec.identity)),
-                known_hosts: (!spec.known_hosts.is_empty())
-                    .then(|| PathBuf::from(&spec.known_hosts)),
+                identity,
+                known_hosts,
                 insecure_ignore_host_key: spec.insecure_ignore_host_key,
             },
             context: EngineContext::silent(),
@@ -640,7 +666,8 @@ impl LinuxReflect for DaemonService {
                 let _slot = slots.acquire();
                 let mut verify = verify;
                 verify.context = context;
-                let mut report = lr_engine::verify::verify_image(&verify)?;
+                let mut report =
+                    lr_engine::verify::verify_image(&verify).map_err(|error| files.named(error))?;
                 // A whole-chain verification is recorded for retention
                 // (R20).
                 if let Some(note) = lr_engine::verify::record_verification(&verify, &report)? {
@@ -659,10 +686,17 @@ impl LinuxReflect for DaemonService {
     ) -> std::result::Result<Response<RestorePlanInfo>, Status> {
         let peer = self.authorize(&request, Action::RestorePrepare).await?;
         let spec = request.get_ref().clone();
+        client_files::check_host_key_policy(spec.insecure_ignore_host_key, self.dev_mode)
+            .map_err(status::status_of)?;
         let uid = peer.uid;
         // Reading the passphrase, the image and the target is file I/O
-        // (R12); the plan's token is bound to this caller (A11).
+        // (R12); the named files must be the caller's own (A4), and the
+        // plan's token is bound to this caller (A11).
         let plan = Self::off_thread(move || {
+            client_files::check(
+                uid,
+                &[&spec.passphrase_file, &spec.identity, &spec.known_hosts],
+            )?;
             let encryption = lr_engine::options::restore_encryption(
                 (!spec.passphrase_file.is_empty())
                     .then(|| PathBuf::from(&spec.passphrase_file))
@@ -707,12 +741,15 @@ impl LinuxReflect for DaemonService {
         let peer = self.authorize(&request, Action::RestoreApply).await?;
         let uid = peer.uid;
         let spec = request.get_ref().clone();
-        let passphrase_file =
-            (!spec.passphrase_file.is_empty()).then(|| PathBuf::from(&spec.passphrase_file));
-        let encryption = Self::off_thread(move || {
-            lr_engine::options::restore_encryption(passphrase_file.as_deref())
-        })
-        .await?;
+        let passphrase_file = spec.passphrase_file.clone();
+        let encryption =
+            Self::off_thread(
+                move || match ClientFiles::passphrase(uid, &passphrase_file)? {
+                    Some(passphrase) => Ok(lr_engine::keys::Encryption::Passphrase(passphrase)),
+                    None => lr_engine::options::restore_encryption(None),
+                },
+            )
+            .await?;
         let apply = lr_engine::restore::ApplyRequest {
             token: spec.token.clone(),
             confirm: spec.confirm,
@@ -837,14 +874,22 @@ impl LinuxReflect for DaemonService {
         &self,
         request: GrpcRequest<lr_proto::v1::ExportSpec>,
     ) -> std::result::Result<Response<Progress>, Status> {
-        self.authorize(&request, Action::ExportManage).await?;
+        let peer = self.authorize(&request, Action::ExportManage).await?;
         let spec = request.get_ref().clone();
+        client_files::check_host_key_policy(spec.insecure_ignore_host_key, self.dev_mode)
+            .map_err(status::status_of)?;
         let exports = Arc::clone(&self.exports);
-        let state =
-            tokio::task::spawn_blocking(move || DaemonService::export_with(&exports, &spec))
-                .await
-                .map_err(|error| Status::internal(format!("export task failed: {error}")))?
-                .map_err(status::status_of)?;
+        let uid = peer.uid;
+        let state = tokio::task::spawn_blocking(move || {
+            client_files::check(
+                uid,
+                &[&spec.passphrase_file, &spec.identity, &spec.known_hosts],
+            )?;
+            DaemonService::export_with(&exports, &spec)
+        })
+        .await
+        .map_err(|error| Status::internal(format!("export task failed: {error}")))?
+        .map_err(status::status_of)?;
         Ok(Response::new(finished_progress(&state)?))
     }
 
@@ -936,9 +981,11 @@ impl LinuxReflect for DaemonService {
         &self,
         request: GrpcRequest<lr_proto::v1::RetentionSpec>,
     ) -> std::result::Result<Response<Progress>, Status> {
-        self.authorize(&request, Action::ScheduleManage).await?;
+        let peer = self.authorize(&request, Action::ScheduleManage).await?;
         let spec = request.get_ref().clone();
+        let uid = peer.uid;
         let report = tokio::task::spawn_blocking(move || {
+            client_files::check(uid, &[&spec.passphrase_file])?;
             let options = lr_store::DestinationOptions {
                 set_name: spec.set.clone(),
                 identity: None,
@@ -977,20 +1024,29 @@ impl LinuxReflect for DaemonService {
 
 impl DaemonService {
     /// Load and validate a set's catalog for `ListSets`/`ListChains`.
-    fn set_info(&self, spec: &SetRef) -> std::result::Result<SetInfo, Status> {
+    fn set_info(&self, spec: &SetRef, uid: u32) -> std::result::Result<SetInfo, Status> {
         // The caller's SSH options reach the destination (A6); a named
-        // destination replaces them with its own.
+        // destination replaces them with its own. The files must be the
+        // caller's own and stay pinned while they are used (A4).
+        client_files::check_host_key_policy(spec.insecure_ignore_host_key, self.dev_mode)
+            .map_err(status::status_of)?;
+        let mut files = ClientFiles::new();
         let options = lr_store::DestinationOptions {
             set_name: spec.set.clone(),
-            identity: (!spec.identity.is_empty()).then(|| PathBuf::from(&spec.identity)),
-            known_hosts: (!spec.known_hosts.is_empty()).then(|| PathBuf::from(&spec.known_hosts)),
+            identity: files.pin(uid, &spec.identity).map_err(status::status_of)?,
+            known_hosts: files
+                .pin(uid, &spec.known_hosts)
+                .map_err(status::status_of)?,
             insecure_ignore_host_key: spec.insecure_ignore_host_key,
         };
-        let destination = lr_store::open(&spec.dest, &options).map_err(status::status_of)?;
+        let destination = lr_store::open(&spec.dest, &options)
+            .map_err(|error| status::status_of(files.named(error)))?;
         if spec.set.is_empty() {
             // No set named: list the sets instead of opening (and creating)
             // an unnamed one.
-            let sets = destination.list_set_names().map_err(status::status_of)?;
+            let sets = destination
+                .list_set_names()
+                .map_err(|error| status::status_of(files.named(error)))?;
             return Ok(SetInfo {
                 sets,
                 ..SetInfo::default()
@@ -998,14 +1054,14 @@ impl DaemonService {
         }
         let set = destination
             .open_existing_set(&lr_core::SetId::ZERO)
-            .map_err(status::status_of)?;
+            .map_err(|error| status::status_of(files.named(error)))?;
         let loaded = lr_engine::catalog::load(
             &*destination,
             &set,
             &spec.set,
             lr_engine::backup::now_unix(),
         )
-        .map_err(status::status_of)?;
+        .map_err(|error| status::status_of(files.named(error)))?;
         let chains = loaded
             .catalog
             .chains
@@ -1258,5 +1314,79 @@ mod request_threads {
             .expect("the request must not wait on the FIFO");
         let message = outcome.expect_err("a FIFO is not a passphrase file");
         assert!(message.contains("not a regular file"), "{message}");
+    }
+}
+
+#[cfg(test)]
+mod client_named_files {
+    use std::sync::Arc;
+
+    use lr_proto::v1::VerifySpec;
+    use lr_proto::v1::linux_reflect_server::LinuxReflect;
+
+    use super::{DaemonService, Jobs, Peer};
+    use crate::auth::PeerIdentity;
+
+    fn verify_as(uid: u32, spec: VerifySpec) -> tonic::Request<VerifySpec> {
+        let mut request = tonic::Request::new(spec);
+        request
+            .extensions_mut()
+            .insert(Peer(Arc::new(PeerIdentity::for_uid(uid))));
+        request
+    }
+
+    /// Any session user may verify, so the daemon must not read a file of
+    /// another user for them, nor skip host-key checks outside development
+    /// mode (A4).
+    #[tokio::test]
+    async fn verify_reads_only_the_callers_files() {
+        let auth = crate::auth::build(Some("static:all"), true)
+            .await
+            .expect("auth");
+        let service = DaemonService::new(auth, Arc::new(Jobs::new()), false);
+        let spec = VerifySpec {
+            image: "sftp://backup@nas.local/backups/set/chain/000-full.lrimg".to_owned(),
+            ..VerifySpec::default()
+        };
+        for (field, named) in [
+            (
+                "identity",
+                VerifySpec {
+                    identity: "/etc/hostname".to_owned(),
+                    ..spec.clone()
+                },
+            ),
+            (
+                "known_hosts",
+                VerifySpec {
+                    known_hosts: "/etc/hostname".to_owned(),
+                    ..spec.clone()
+                },
+            ),
+            (
+                "passphrase_file",
+                VerifySpec {
+                    passphrase_file: "/etc/hostname".to_owned(),
+                    ..spec.clone()
+                },
+            ),
+        ] {
+            let Err(refused) = service.verify_image(verify_as(4242, named)).await else {
+                panic!("{field}: root's file must be refused");
+            };
+            assert_eq!(refused.code(), tonic::Code::PermissionDenied, "{field}");
+            assert!(
+                refused.message().contains("belongs to uid 0"),
+                "{field}: {refused}"
+            );
+        }
+        let insecure = VerifySpec {
+            insecure_ignore_host_key: true,
+            ..spec
+        };
+        let Err(refused) = service.verify_image(verify_as(4242, insecure)).await else {
+            panic!("ignoring host keys needs development mode");
+        };
+        assert_eq!(refused.code(), tonic::Code::PermissionDenied, "{refused}");
     }
 }
