@@ -636,6 +636,9 @@ struct RemoteLease {
     lost: Mutex<Option<String>>,
     stop: std::sync::atomic::AtomicBool,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Held while this holder reads or rewrites the lock, so its own check
+    /// never reads the lock between the refresh's truncation and its write.
+    io: Mutex<()>,
 }
 
 impl RemoteLease {
@@ -677,6 +680,10 @@ impl RemoteLease {
             if self.stop.load(Ordering::SeqCst) {
                 return;
             }
+            let _io = self
+                .io
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Err(reason) = self.still_ours() {
                 self.lose(reason);
                 return;
@@ -720,8 +727,14 @@ impl RemoteLease {
         {
             return Err(crate::lease_lost(display, &reason));
         }
-        self.still_ours()
-            .map_err(|reason| crate::lease_lost(display, &reason))?;
+        {
+            let _io = self
+                .io
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.still_ours()
+                .map_err(|reason| crate::lease_lost(display, &reason))?;
+        }
         let refreshed = *self
             .refreshed
             .lock()
@@ -1065,6 +1078,7 @@ impl SftpDestination {
             refreshed: Mutex::new(std::time::Instant::now()),
             record,
             ttl,
+            io: Mutex::new(()),
             lost: Mutex::new(None),
             stop: std::sync::atomic::AtomicBool::new(false),
             thread: Mutex::new(None),

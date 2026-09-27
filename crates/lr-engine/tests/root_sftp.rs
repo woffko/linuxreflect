@@ -452,6 +452,44 @@ fn killing_the_server_mid_transfer_leaves_nothing_finalized() {
 /// A remote lock broken and replaced by another holder is never written over
 /// by the old holder's refresher, and the old holder can no longer publish
 /// or delete (R21).
+/// A holder checks its own lease while the refresher rewrites the lock: the
+/// check must never see the lock half-written and call the lease lost.
+#[test]
+#[ignore = "requires root, sshd and openssh-server"]
+fn a_lease_check_never_sees_its_own_refresh_half_done() {
+    if !root_tests_enabled() {
+        return;
+    }
+    let mut server = match Sshd::start() {
+        Some(server) => server,
+        None => return,
+    };
+    std::fs::create_dir_all(server.root()).expect("served");
+    let destination = lr_store::open(&server.destination(), &server.options(SET_NAME))
+        .expect("open sftp destination");
+    let set = destination
+        .open_set(&lr_core::SetId::ZERO)
+        .expect("open set");
+    // A one-second lease refreshes every 333 ms; checking continuously for
+    // five seconds spans about fifteen refreshes.
+    let lock = destination
+        .lock_set(&set, &lr_store::LockOwner::local(), Duration::from_secs(1))
+        .expect("take the lock");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut checks = 0u32;
+    while std::time::Instant::now() < deadline {
+        lock.verify()
+            .unwrap_or_else(|error| panic!("check {checks} lost the lease: {error}"));
+        checks += 1;
+        // A job checks before each publication, never back to back; the
+        // pause lets the refresher take its turn.
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    assert!(checks > 50, "only {checks} checks ran");
+    drop(lock);
+    server.stop();
+}
+
 #[test]
 #[ignore = "requires root, sshd and openssh-server"]
 fn a_replaced_remote_lock_fences_its_old_holder() {
