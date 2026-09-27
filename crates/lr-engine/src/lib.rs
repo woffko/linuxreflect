@@ -20,6 +20,7 @@ pub mod progress;
 pub mod restore;
 pub mod retention;
 pub mod schedule;
+mod spool;
 pub mod stream;
 pub mod target;
 pub mod tree;

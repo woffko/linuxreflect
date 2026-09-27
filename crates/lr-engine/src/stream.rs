@@ -352,7 +352,7 @@ pub fn backup_stream(request: &BackupRequest) -> Result<StreamReport> {
         wrapped_chain_key: new_keys.wrapped_chain_key,
     };
 
-    let (set_root, spool_dir) = crate::backup::spool_location(&*destination, &set)?;
+    let (set_root, _) = crate::backup::spool_location(&*destination, &set)?;
     let chain_dir = chain_id.to_string();
     let mode = if all_full { "full" } else { "incr" };
     let base_name = format!(
@@ -363,8 +363,7 @@ pub fn backup_stream(request: &BackupRequest) -> Result<StreamReport> {
     let image_name = format!("{chain_dir}/{base_name}");
     // A stream image is built in the manifest page stream directly, so the
     // guard only needs a scratch path it can remove on failure.
-    let spool_path = spool_dir.join(format!("{chain_dir}.{base_name}.stream.spool"));
-    let mut guard = TempGuard::new(std::sync::Arc::clone(&destination), set.clone(), spool_path);
+    let mut guard = TempGuard::new(std::sync::Arc::clone(&destination), set.clone());
 
     let writer_keys = WriterKeys {
         data_key: new_keys.keys.data_key.as_ref().map(|key| **key),

@@ -332,7 +332,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
         wrapped_chain_key: new_keys.wrapped_chain_key,
     };
 
-    let (set_root, spool_dir) = crate::backup::spool_location(&*destination, &set)?;
+    let (set_root, _) = crate::backup::spool_location(&*destination, &set)?;
     let chain_dir = chain_id.to_string();
     let base_name = format!(
         "{seq_in_chain:03}-{}-{}.lrimg",
@@ -340,8 +340,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
         request.image_uuid
     );
     let image_name = format!("{chain_dir}/{base_name}");
-    let spool_path = spool_dir.join(format!("{chain_dir}.{base_name}.file.spool"));
-    let mut guard = TempGuard::new(std::sync::Arc::clone(&destination), set.clone(), spool_path);
+    let mut guard = TempGuard::new(std::sync::Arc::clone(&destination), set.clone());
 
     let writer_keys = WriterKeys {
         data_key: new_keys.keys.data_key.as_ref().map(|key| **key),

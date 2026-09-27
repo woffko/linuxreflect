@@ -292,28 +292,22 @@ pub struct BackupReport {
     pub inherited_chunks: u64,
 }
 
-/// Delete the temporary image and spool unless the job succeeded.
+/// Delete the temporary image unless the job succeeded. The manifest spool
+/// needs no cleanup: it never has a name ([`crate::spool`]).
 pub(crate) struct TempGuard {
     dest: std::sync::Arc<dyn Destination>,
     set: lr_store::SetHandle,
     /// The temporary image, once [`TempGuard::track_tmp`] names it.
     tmp_name: Option<String>,
-    /// Local scratch file holding the spooled manifest.
-    spool_path: PathBuf,
     armed: bool,
 }
 
 impl TempGuard {
-    pub(crate) fn new(
-        dest: std::sync::Arc<dyn Destination>,
-        set: lr_store::SetHandle,
-        spool_path: PathBuf,
-    ) -> Self {
+    pub(crate) fn new(dest: std::sync::Arc<dyn Destination>, set: lr_store::SetHandle) -> Self {
         Self {
             dest,
             set,
             tmp_name: None,
-            spool_path,
             armed: true,
         }
     }
@@ -337,7 +331,6 @@ impl Drop for TempGuard {
         if let Some(name) = &self.tmp_name {
             let _ = self.dest.delete(&self.set, name);
         }
-        let _ = std::fs::remove_file(&self.spool_path);
     }
 }
 
@@ -484,17 +477,7 @@ pub fn backup_block_with(
         request.image_uuid
     );
     let image_name = format!("{chain_dir}/{base_name}");
-    let spool_name = format!("{chain_dir}/.{base_name}.manifest.spool");
-    let spool_path = if spool_dir == set_root {
-        set_root.join(&spool_name)
-    } else {
-        spool_dir.join(spool_name.replace('/', "_"))
-    };
-    let mut guard = TempGuard::new(
-        std::sync::Arc::clone(&destination),
-        set.clone(),
-        spool_path.clone(),
-    );
+    let mut guard = TempGuard::new(std::sync::Arc::clone(&destination), set.clone());
 
     let writer_keys = WriterKeys {
         data_key: new_keys.keys.data_key.as_ref().map(|key| **key),
@@ -516,9 +499,9 @@ pub fn backup_block_with(
     guard.track_tmp(tmp_name.clone());
     let mut image_writer = ImageWriter::create(tmp.writer, &superblock, mac_key)?;
     let mut nonce_seq = NonceSeq::new();
-    let spool_path = spool_dir.join(spool_name.replace('/', "_"));
+    let mut spool_file = crate::spool::scratch_file(&spool_dir)?;
     let counts = {
-        let mut spool = BufWriter::new(File::create(&spool_path).map_err(Error::Io)?);
+        let mut spool = BufWriter::new(&mut spool_file);
         let header = BlockManifestHeader {
             chunk_size: request.chunk_size,
             chunk_count,
@@ -644,11 +627,6 @@ pub fn backup_block_with(
             }
         };
         spool.flush().map_err(Error::Io)?;
-        spool
-            .into_inner()
-            .map_err(|e| Error::Io(e.into_error()))?
-            .sync_all()
-            .map_err(Error::Io)?;
         counts
     };
 
@@ -656,7 +634,8 @@ pub fn backup_block_with(
     // 8. Phase B: copy the spooled manifest into the page stream.
     {
         let mut manifest = image_writer.page_stream(StreamId::Manifest, request.aead, meta_key);
-        let mut spool = BufReader::new(File::open(&spool_path).map_err(Error::Io)?);
+        spool_file.rewind().map_err(Error::Io)?;
+        let mut spool = BufReader::new(&mut spool_file);
         let mut chunk = vec![0u8; 64 * 1024];
         loop {
             let read = spool.read(&mut chunk).map_err(Error::Io)?;
@@ -667,7 +646,7 @@ pub fn backup_block_with(
         }
         manifest.finish()?;
     }
-    let _ = std::fs::remove_file(&spool_path);
+    drop(spool_file);
 
     // 9. Extras: the chain member list (this member's prefix) and metadata.
     {
@@ -789,10 +768,12 @@ pub(crate) fn local_image_path(set_root: &Path, image_name: &str) -> PathBuf {
     }
 }
 
-/// Where the image lives and where a short-lived manifest spool goes.
+/// Where the image lives and where the unnamed manifest spool goes.
 ///
-/// A local destination keeps the spool next to the image (same filesystem, so
-/// the finalize rename is atomic); a remote one uses a temporary directory.
+/// A local destination keeps the spool on the destination's filesystem, not
+/// on a possibly RAM-backed `/tmp`; a remote one uses the temporary
+/// directory. Either way the spool has no name ([`crate::spool`]), so no
+/// shared scratch directory is created (R08).
 pub(crate) fn spool_location(
     destination: &dyn Destination,
     set: &lr_store::SetHandle,
@@ -801,8 +782,7 @@ pub(crate) fn spool_location(
         Ok(root) => Ok((root.clone(), root)),
         Err(_) => {
             let _ = destination;
-            let dir = std::env::temp_dir().join("linuxreflect-spool");
-            std::fs::create_dir_all(&dir).map_err(Error::Io)?;
+            let dir = std::env::temp_dir();
             // An empty set root marks a remote destination: there is no local
             // path for the image.
             Ok((PathBuf::new(), dir))
@@ -1075,7 +1055,7 @@ fn write_full_entries(
 /// The incremental pass only learns how many chunks changed after walking the
 /// parent, and re-reading the source to count first would defeat scan-and-diff.
 fn patch_entry_count(
-    spool: &mut BufWriter<File>,
+    spool: &mut BufWriter<&mut File>,
     header_offset: u64,
     entry_count: u64,
 ) -> Result<()> {

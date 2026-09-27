@@ -290,16 +290,7 @@ pub fn backup_whole_disk(request: &crate::backup::BackupRequest) -> Result<Whole
     let _lock = crate::backup::acquire_set_lock(&*destination, &set, request)?;
     let (set_root, spool_dir) = crate::backup::spool_location(&*destination, &set)?;
     let image_name = format!("{}/000-full-{}.lrimg", request.chain_id, request.image_uuid);
-    let spool_name = format!(
-        "{}.000-full-{}.manifest.spool",
-        request.chain_id, request.image_uuid
-    );
-    let spool_path = spool_dir.join(&spool_name);
-    let mut guard = crate::backup::TempGuard::new(
-        std::sync::Arc::clone(&destination),
-        set.clone(),
-        spool_path.clone(),
-    );
+    let mut guard = crate::backup::TempGuard::new(std::sync::Arc::clone(&destination), set.clone());
 
     let writer_keys = WriterKeys {
         data_key: new_keys.keys.data_key.as_ref().map(|key| **key),
@@ -327,9 +318,10 @@ pub fn backup_whole_disk(request: &crate::backup::BackupRequest) -> Result<Whole
 
     let mut reporter = request.context.clone().reporter(disk_size)?;
     reporter.phase("regions");
+    let mut spool_file = crate::spool::scratch_file(&spool_dir)?;
     // Phase A: chunk records plus the spooled manifest.
     {
-        let mut spool = BufWriter::new(File::create(&spool_path).map_err(Error::Io)?);
+        let mut spool = BufWriter::new(&mut spool_file);
         disk_header.write(&mut spool)?;
 
         for region in &disk_header.regions {
@@ -452,18 +444,14 @@ pub fn backup_whole_disk(request: &crate::backup::BackupRequest) -> Result<Whole
             });
         }
         spool.flush().map_err(Error::Io)?;
-        spool
-            .into_inner()
-            .map_err(|e| Error::Io(e.into_error()))?
-            .sync_all()
-            .map_err(Error::Io)?;
     }
 
     reporter.phase("manifest");
     // Phase B: copy the spooled manifest into the page stream.
     {
         let mut manifest = image_writer.page_stream(StreamId::Manifest, request.aead, meta_key);
-        let mut spool = BufReader::new(File::open(&spool_path).map_err(Error::Io)?);
+        spool_file.rewind().map_err(Error::Io)?;
+        let mut spool = BufReader::new(&mut spool_file);
         let mut chunk = vec![0u8; 64 * 1024];
         loop {
             let read = spool.read(&mut chunk).map_err(Error::Io)?;
@@ -474,7 +462,7 @@ pub fn backup_whole_disk(request: &crate::backup::BackupRequest) -> Result<Whole
         }
         manifest.finish()?;
     }
-    let _ = std::fs::remove_file(&spool_path);
+    drop(spool_file);
 
     // Extras: chain members and a small metadata record.
     {

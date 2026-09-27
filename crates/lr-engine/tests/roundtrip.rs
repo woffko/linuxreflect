@@ -333,3 +333,135 @@ fn a_tampered_token_is_rejected() {
     .expect_err("must reject a moved target");
     assert!(matches!(error, lr_core::Error::Corrupt { .. }), "{error}");
 }
+
+/// Every file below `root` whose name ends with one of `suffixes`.
+fn files_ending(root: &Path, suffixes: &[&str]) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return found;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            found.extend(files_ending(&path, suffixes));
+        } else if suffixes
+            .iter()
+            .any(|suffix| path.to_string_lossy().ends_with(suffix))
+        {
+            found.push(path);
+        }
+    }
+    found
+}
+
+/// Plays a user who can write the destination (or the shared scratch
+/// directory): once the manifest spool is complete and before it is read
+/// back, every spool it can see is replaced with a forged one (R08).
+struct SpoolSubstituter {
+    roots: Vec<PathBuf>,
+    replaced: std::sync::Mutex<Vec<PathBuf>>,
+}
+
+impl lr_engine::progress::ProgressSink for SpoolSubstituter {
+    fn phase(&self, name: &str) {
+        if name != "manifest" {
+            return;
+        }
+        for root in &self.roots {
+            for spool in files_ending(root, &[".spool"]) {
+                let _ = std::fs::remove_file(&spool);
+                std::fs::write(&spool, vec![0xEEu8; 4096]).expect("forged spool");
+                self.replaced.lock().expect("lock").push(spool);
+            }
+        }
+    }
+
+    fn bytes(&self, _done: u64, _total: u64) {}
+}
+
+/// The manifest spool has no name anyone else can reach, so nothing can be
+/// substituted between writing and reading it, and the image restores the
+/// source (R08).
+#[test]
+fn the_manifest_spool_cannot_be_substituted() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = dir.path().join("source.img");
+    if !make_ext4(&source, &backups()) {
+        return;
+    }
+    let dest = dir.path().join("dest");
+    let substituter = std::sync::Arc::new(SpoolSubstituter {
+        roots: vec![
+            dest.clone(),
+            std::env::temp_dir().join("linuxreflect-spool"),
+        ],
+        replaced: std::sync::Mutex::new(Vec::new()),
+    });
+    let mut backup_request = request(&source, &dest, Encryption::NoEncrypt);
+    backup_request.context.progress = Some(substituter.clone());
+    let backup = backup_block_full(&backup_request);
+    let replaced = substituter.replaced.lock().expect("lock").clone();
+    assert!(
+        replaced.is_empty(),
+        "a spool was reachable by name and was replaced: {replaced:?}"
+    );
+    let backup = backup.expect("backup");
+
+    let target = dir.path().join("target.img");
+    sparse(&target, DEVICE_SIZE);
+    let plan = prepare_restore(&PrepareRequest::from_path(
+        &backup.image_path,
+        &target,
+        Encryption::NoEncrypt,
+    ))
+    .expect("prepare");
+    apply_restore(&ApplyRequest {
+        token: plan.token,
+        confirm: true,
+        accept_inconsistent: false,
+        encryption: Encryption::NoEncrypt,
+        context: lr_engine::progress::EngineContext::silent(),
+    })
+    .expect("apply");
+    for (start, end) in used_regions(&source) {
+        assert_eq!(
+            read_region(&source, start, end),
+            read_region(&target, start, end),
+            "used region {start}..={end}"
+        );
+    }
+}
+
+/// Cancels the job as soon as it starts scanning, which is after the
+/// manifest spool and the temporary image exist.
+struct CancelOnScan(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl lr_engine::progress::ProgressSink for CancelOnScan {
+    fn phase(&self, name: &str) {
+        if name == "scan" {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn bytes(&self, _done: u64, _total: u64) {}
+}
+
+/// A job that fails after its spool and temporary image exist leaves
+/// neither behind (R39).
+#[test]
+fn a_cancelled_backup_leaves_no_spool_or_temporary_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = dir.path().join("source.img");
+    if !make_ext4(&source, &backups()) {
+        return;
+    }
+    let dest = dir.path().join("dest");
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut backup_request = request(&source, &dest, Encryption::NoEncrypt);
+    backup_request.context.progress = Some(std::sync::Arc::new(CancelOnScan(cancel.clone())));
+    backup_request.context.cancel = Some(cancel);
+    let error = backup_block_full(&backup_request).expect_err("the job was cancelled");
+    assert!(error.to_string().contains("cancel"), "{error}");
+    let leftovers = files_ending(&dest, &[".spool", ".tmp"]);
+    assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+}
