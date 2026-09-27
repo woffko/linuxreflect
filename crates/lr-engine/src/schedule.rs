@@ -438,8 +438,13 @@ pub fn resolve_destination(config: &Config, job: &JobConfig) -> Result<(String, 
         }
         return Ok((uri, destination.is_network()));
     }
-    // Not a named destination: a path or a URI written in place.
-    Ok((job.dest.clone(), job.dest.contains("://")))
+    // Not a named destination: a path or a URI written in place, or `@name`
+    // from the daemon's registry, which may well be SFTP; waiting for the
+    // network costs nothing for a local one.
+    Ok((
+        job.dest.clone(),
+        job.dest.contains("://") || job.dest.starts_with('@'),
+    ))
 }
 
 /// The rendered units of one job.
@@ -1144,6 +1149,19 @@ identity = "/etc/linuxreflect/id_ed25519"
         let removed = super::remove("nightly", Some(&systemd)).expect("remove");
         assert_eq!(removed.len(), 4, "{removed:?}");
         assert_eq!(std::fs::read_dir(&systemd).expect("units").count(), 0);
+    }
+
+    /// A job that writes to a destination from the daemon's registry waits
+    /// for the network, since that destination may be SFTP.
+    #[test]
+    fn a_registry_destination_waits_for_the_network() {
+        let text = "[[job]]\nname = \"j\"\nsource = [\"/data\"]\ndest = \"@nas\"\nset = \"s\"\n\
+                    encrypt = false\non_calendar = \"daily\"\n";
+        let config = parse(text).expect("config");
+        let units = render_job(&config, &config.jobs[0], Path::new("/usr/bin/linuxreflect"))
+            .expect("render");
+        assert!(units.service.contains("After=network-online.target"));
+        assert_eq!(units.destination, "@nas");
     }
 
     /// Values nothing would read, or that would fail only when the timer
