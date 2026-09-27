@@ -7,6 +7,8 @@
 //! it with a clear error until then.
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "fault-injection")]
+pub mod fault;
 pub mod known_hosts;
 pub mod local;
 pub mod named;
@@ -267,6 +269,14 @@ impl DestinationOptions {
 /// Returns [`Error::Unsupported`] for an unknown scheme or an SFTP option this
 /// build cannot honour, and propagates connection errors.
 pub fn open(uri: &str, options: &DestinationOptions) -> Result<std::sync::Arc<dyn Destination>> {
+    // Test builds only: `fault+<kind>:<uri>` wraps `<uri>` with a fault.
+    #[cfg(feature = "fault-injection")]
+    if let Some((fault, inner)) = fault::split(uri)? {
+        let inner = open(inner, options)?;
+        return Ok(std::sync::Arc::new(fault::FaultyDestination::new(
+            inner, fault,
+        )));
+    }
     // `@name` is a destination configured on this machine (A6).
     let (uri, options) = named::resolve(uri, options)?;
     let (uri, options) = (uri.as_str(), &options);

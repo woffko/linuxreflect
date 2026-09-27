@@ -36,7 +36,8 @@ lr-fsmap.workspace = true
 lr-snapshot.workspace = true
 lr-core.workspace = true
 lr-blocksource.workspace = true
-lr-store.workspace = true
+# Test builds only: `fault+<kind>:` destinations for tests/fault_injection.rs.
+lr-store = { workspace = true, features = ["fault-injection"] }
 
 [lints]
 workspace = true

@@ -23,6 +23,10 @@ russh-sftp.workspace = true
 hmac.workspace = true
 sha1.workspace = true
 
+[features]
+# Test builds only: `fault+<kind>:<uri>` destinations (src/fault.rs).
+fault-injection = []
+
 [dev-dependencies]
 tempfile.workspace = true
 

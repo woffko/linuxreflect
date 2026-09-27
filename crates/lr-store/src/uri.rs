@@ -153,6 +153,14 @@ pub struct ImageLocation {
 /// Returns [`Error::Unsupported`] when the URI is not deep enough to contain a
 /// set, a chain and a file name.
 pub fn split_image(uri: &str) -> Result<ImageLocation> {
+    // Test builds only: the fault stays on the destination part.
+    #[cfg(feature = "fault-injection")]
+    if let Some((_, inner)) = crate::fault::split(uri)? {
+        let prefix = &uri[..uri.len() - inner.len()];
+        let mut location = split_image(inner)?;
+        location.dest = format!("{prefix}{}", location.dest);
+        return Ok(location);
+    }
     // `@name/<set>/<chain>/<file>` names an image on a configured
     // destination (A6); the name stays the destination.
     if let Some(rest) = uri.strip_prefix('@') {
