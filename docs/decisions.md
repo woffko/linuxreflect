@@ -1584,3 +1584,34 @@ device that stopped answering) held a reboot forever, with no visible reason
 - SFTP operations already time out after 30 seconds. A mounted network
   destination blocks in the kernel on a hard mount; the documentation
   recommends `soft` mounts for NFS and SMB destinations.
+
+## D-114 — A differential has a full manifest and needs its whole chain
+
+The remediation plan asked whether differentials keep the behaviour the
+specification describes or adopt the conventional one, in which a
+differential depends on the chain's full member alone and the members between
+them may be lost or deleted.
+
+- **Kept: the specified behaviour.** A differential stores a full manifest
+  (spec §G.2): it names the state of every chunk (block mode) or every file
+  (file mode), so a restore, a mount or an export reads one manifest instead
+  of merging deltas. Deletion stays chain-granular (spec §D.3, §J.3), and a
+  differential, like an incremental, is restored, verified and mounted with
+  its whole ancestry: every earlier member of its chain.
+- **What a differential compares against.** In block mode it compares
+  positionally against the newest member (D-041), stores the chunks that
+  changed since then and refers to the others wherever an earlier member
+  stored them. In file mode it compares against the full (D-066), so it
+  re-reads every file that changed since the full. Neither mode promises that
+  a differential survives the loss of an intermediate member, and the
+  documentation does not say "changes since the full".
+- **Not adopted: the conventional differential.** Storing everything that
+  differs from the full in every differential would make it restorable from
+  the full alone, but only a selective deletion could use that, and the
+  specification defers selective deletion (it needs consolidation, post-MVP).
+  The cost would be a differential that grows with every change since the
+  full.
+- **Consequences.** Retention keeps and deletes whole chains only (R20).
+  `verify` of a differential opens its ancestry (R23). The CLI help and the
+  operator documentation describe a differential as a member with a full
+  manifest that needs every earlier member of its chain.

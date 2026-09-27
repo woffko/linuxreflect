@@ -621,7 +621,8 @@ pub(crate) enum BackupType {
     Full,
     /// Changes since the previous member (Slice S9).
     Incremental,
-    /// Changes since the chain's full (Slice S9).
+    /// A member with a full manifest; like an incremental it needs every
+    /// earlier member of its chain (D-114).
     Differential,
 }
 

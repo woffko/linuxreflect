@@ -276,9 +276,9 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
     if let Some(parent) = &parent {
         let mut members =
             crate::chain::open_chain(&*destination, &set, &parent.files, &request.encryption)?;
-        // A differential depends on the chain's full member only (spec §D.3),
-        // so it compares against the full; an incremental compares against the
-        // newest member.
+        // A differential compares against the chain's full (D-066); an
+        // incremental compares against the newest member. Both are restored
+        // with their whole ancestry (D-114).
         let against_full = request.member_type == MemberType::Differential;
         let reference = if against_full {
             members.first_mut()
