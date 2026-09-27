@@ -10,9 +10,12 @@ WatchdogSec=60
 Restart=on-failure
 RestartSec=2
 # SIGTERM makes the daemon refuse new jobs and exit once the running ones are
-# done (D-107): a stop, an update or a shutdown never cuts a restore in half.
-# A job can still be cancelled from the GUI or `linuxreflect job cancel`.
-TimeoutStopSec=infinity
+# done (D-107): a stop, an update or a shutdown does not cut a restore in half.
+# While jobs drain, the daemon extends this timeout only as long as one of them
+# makes progress, and names the job it waits for (D-113); a job stuck in I/O
+# therefore cannot hold a shutdown forever. A job can still be cancelled from
+# the GUI or `linuxreflect job cancel`.
+TimeoutStopSec=10min
 
 [Install]
 WantedBy=multi-user.target

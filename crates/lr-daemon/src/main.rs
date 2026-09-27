@@ -226,18 +226,47 @@ async fn drain_on_signal(jobs: Arc<Jobs>, stopped: Arc<tokio::sync::Notify>, sd_
         _ = terminate.recv() => {}
         _ = interrupt.recv() => {}
     }
+    // Progress is watched from before the drain starts, so a job that holds
+    // the stop is named and earns more time only while it advances (A7).
+    let mut events = jobs.subscribe();
+    let mut watch = lr_daemon::shutdown::DrainWatch::new(Instant::now());
     jobs.begin_drain();
     let mut cancelled = false;
+    let mut last_report: Option<Instant> = None;
     loop {
-        let active = jobs.active();
-        if active == 0 {
+        let active = jobs.active_jobs();
+        if active.is_empty() {
             break;
         }
-        tracing::info!(active, cancelled, "stopping: waiting for running jobs");
-        if sd_notify {
-            let _ = notify::send(&format!(
-                "STOPPING=1\nSTATUS=stopping; waiting for {active} running job(s)"
-            ));
+        while let Ok(event) = events.try_recv() {
+            watch.observe(&event, Instant::now());
+        }
+        let now = Instant::now();
+        if last_report.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(30)) {
+            last_report = Some(now);
+            let lines = watch.describe(&active, now);
+            for line in &lines {
+                tracing::info!(cancelled, "stopping: waiting for {line}");
+            }
+            if sd_notify {
+                let status = format!(
+                    "STOPPING=1\nSTATUS=stopping; waiting for {}",
+                    lines.join("; ")
+                );
+                let _ = notify::send(&status);
+                if watch.should_extend(&active, now) {
+                    let _ = notify::send(&format!(
+                        "EXTEND_TIMEOUT_USEC={}",
+                        lr_daemon::shutdown::EXTEND_BY.as_micros()
+                    ));
+                } else {
+                    tracing::warn!(
+                        "stopping: no job has made progress for {}s; systemd will end the \
+                         daemon when its stop timeout expires",
+                        lr_daemon::shutdown::STALL_LIMIT.as_secs()
+                    );
+                }
+            }
         }
         tokio::select! {
             () = tokio::time::sleep(Duration::from_millis(500)) => {}

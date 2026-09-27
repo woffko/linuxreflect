@@ -1563,3 +1563,24 @@ among them. In debug builds the panicking job stayed "running" forever (A8).
   its own scope, which would in turn escape the job drain of D-107. The panic
   isolation above covers the failure the audit observed; a process abort
   remains a whole-daemon failure.
+
+## D-113 — A stop waits for progressing jobs, not forever
+
+D-107 made SIGTERM wait for running jobs and set `TimeoutStopSec=infinity`,
+so that a stop never cuts a restore in half. Cancellation is only observed at
+progress points, so a job blocked in I/O (a stalled network destination, a
+device that stopped answering) held a reboot forever, with no visible reason
+(A7).
+
+- The unit's `TimeoutStopSec` is 10 minutes.
+- While jobs drain, the daemon watches their progress. Every 30 seconds it
+  logs, and puts into the unit's status, one line per job: its ID, set,
+  phase, share done and how long ago it last advanced. If some job advanced
+  within the last 5 minutes, it sends `EXTEND_TIMEOUT_USEC` for another 10
+  minutes; otherwise it logs that no job progresses, and systemd ends the
+  daemon when the timeout expires. A long restore that keeps writing
+  therefore finishes; a stuck one no longer blocks the shutdown.
+- New jobs, restores included, are refused while the daemon stops (D-107).
+- SFTP operations already time out after 30 seconds. A mounted network
+  destination blocks in the kernel on a hard mount; the documentation
+  recommends `soft` mounts for NFS and SMB destinations.

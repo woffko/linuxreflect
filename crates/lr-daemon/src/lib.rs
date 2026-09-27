@@ -9,5 +9,6 @@ pub mod jobs;
 pub mod notify;
 pub mod progress_bridge;
 pub mod service;
+pub mod shutdown;
 pub mod socket;
 pub mod status;

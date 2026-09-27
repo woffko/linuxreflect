@@ -164,6 +164,19 @@ impl Jobs {
             .count()
     }
 
+    /// `(job_id, set)` of every pending or running job, sorted.
+    #[must_use]
+    pub fn active_jobs(&self) -> Vec<(String, String)> {
+        let mut active: Vec<(String, String)> = self
+            .lock()
+            .iter()
+            .filter(|(_, entry)| matches!(entry.state, JobState::Pending | JobState::Running))
+            .map(|(id, entry)| (id.clone(), entry.set.clone()))
+            .collect();
+        active.sort();
+        active
+    }
+
     /// Ask every pending or running job to stop.
     pub fn cancel_all(&self) {
         for entry in self.lock().values_mut() {
