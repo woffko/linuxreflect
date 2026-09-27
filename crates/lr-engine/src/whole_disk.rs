@@ -291,7 +291,7 @@ pub fn backup_whole_disk(request: &crate::backup::BackupRequest) -> Result<Whole
 
     let destination = request.open_destination()?;
     let set = destination.open_set(&request.set_id)?;
-    let _lock = crate::backup::acquire_set_lock(&*destination, &set, request)?;
+    let lock = crate::backup::acquire_set_lock(&*destination, &set, request)?;
     let (set_root, spool_dir) = crate::backup::spool_location(&*destination, &set)?;
     let image_name = format!("{}/000-full-{}.lrimg", request.chain_id, request.image_uuid);
     let mut guard = crate::backup::TempGuard::new(std::sync::Arc::clone(&destination), set.clone());
@@ -500,6 +500,8 @@ pub fn backup_whole_disk(request: &crate::backup::BackupRequest) -> Result<Whole
     writer.flush().map_err(Error::Io)?;
     let image_bytes = writer.seek(SeekFrom::End(0)).map_err(Error::Io)?;
     drop(writer);
+    // A holder that lost its lease stops before changing the set (R21).
+    lock.verify()?;
     // A failed flush publishes nothing (R19); an unconfirmed one is reported.
     let durability = destination.publish_new(&set, &tmp_name, &image_name)?;
     guard.disarm();

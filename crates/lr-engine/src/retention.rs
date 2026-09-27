@@ -93,7 +93,7 @@ pub fn apply(
     let ttl = options
         .set_lock_ttl_secs
         .unwrap_or(crate::backup::SET_LOCK_TTL_SECS);
-    let _lock =
+    let lock =
         crate::backup::acquire_set_lock_for(destination, set, ttl, options.break_stale_lock)?;
     let now = now_unix();
     let mut loaded = crate::catalog::load(destination, set, set_name, now)?;
@@ -168,6 +168,8 @@ pub fn apply(
         }
         if !options.dry_run {
             for file in &files {
+                // A holder that lost its lease deletes nothing (R21).
+                lock.verify()?;
                 destination.delete(set, file)?;
             }
             loaded
@@ -185,6 +187,7 @@ pub fn apply(
 
     if !options.dry_run {
         loaded.catalog.updated_unix = now_unix();
+        lock.verify()?;
         crate::catalog::write_catalog(destination, set, &loaded.catalog)?;
     }
 

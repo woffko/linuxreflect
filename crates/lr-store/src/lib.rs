@@ -36,7 +36,7 @@ pub struct SetHandle {
 }
 
 /// Who holds a set lock (spec §D.3).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LockOwner {
     /// Stable identifier of the host running the job.
     pub host_id: String,
@@ -72,7 +72,7 @@ pub fn machine_id() -> String {
 }
 
 /// On-disk content of a set lock (spec §D.3).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LockRecord {
     /// Owner of the lock.
     #[serde(flatten)]
@@ -81,6 +81,10 @@ pub struct LockRecord {
     pub created: u64,
     /// Lease duration in seconds; the lock is stale after `created + ttl`.
     pub ttl_secs: u64,
+    /// Random token of this acquisition. A holder refreshes and acts only
+    /// while the lock still carries its token (R21); older records have none.
+    #[serde(default)]
+    pub token: String,
 }
 
 impl LockRecord {
@@ -155,10 +159,15 @@ pub fn temp_name(final_name: &str) -> Result<String> {
     Ok(format!("{final_name}.{random}.tmp"))
 }
 
+/// Confirms that a held lease is still its holder's.
+type LeaseCheck = Box<dyn Fn() -> Result<()> + Send + Sync>;
+
 /// A held set lock. Dropping it releases the lock.
 pub struct SetLock {
     /// Path or URL of the lock file, for diagnostics.
     pub path: String,
+    /// See [`SetLock::verify`].
+    check: LeaseCheck,
     /// Ownership token; dropping it releases the lock.
     release: Option<Box<dyn Send + Sync>>,
 }
@@ -173,10 +182,42 @@ impl Drop for SetLock {
 impl SetLock {
     /// Build a lock, keeping `release` alive until the lock is dropped.
     pub fn new(path: impl Into<String>, release: impl Send + Sync + 'static) -> Self {
+        Self::with_check(path, release, || Ok(()))
+    }
+
+    /// Build a lock whose lease `check` confirms (see [`SetLock::verify`]).
+    pub fn with_check(
+        path: impl Into<String>,
+        release: impl Send + Sync + 'static,
+        check: impl Fn() -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
         Self {
             path: path.into(),
+            check: Box::new(check),
             release: Some(Box::new(release)),
         }
+    }
+
+    /// Confirm that the lease is still this holder's: not expired, not
+    /// replaced, and still refreshed. Call it before every publication or
+    /// deletion, so a holder that was paused past its lease, or whose lock
+    /// was broken, stops before it changes the set (R21).
+    ///
+    /// # Errors
+    /// Returns [`Error::SetLocked`] naming why the lease was lost.
+    pub fn verify(&self) -> Result<()> {
+        (self.check)()
+    }
+}
+
+/// The error for a lease its holder no longer has (R21).
+#[must_use]
+pub fn lease_lost(path: &str, reason: &str) -> Error {
+    Error::SetLocked {
+        owner: format!(
+            "another job: this job's lease on {path} was lost ({reason}), so it stops before \
+             changing the set"
+        ),
     }
 }
 

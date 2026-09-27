@@ -396,7 +396,7 @@ pub fn backup_block_with(
     //    `parent=latest` resolution run under the lock (spec §D.3).
     let destination = request.open_destination()?;
     let set = destination.open_set(&request.set_id)?;
-    let _lock = acquire_set_lock(&*destination, &set, request)?;
+    let lock = acquire_set_lock(&*destination, &set, request)?;
     let now = now_unix();
     let parent = resolve_parent_chain(request, &*destination, &set, now)?;
     let set_id = parent
@@ -690,11 +690,14 @@ pub fn backup_block_with(
     writer.flush().map_err(Error::Io)?;
     let image_bytes = writer.seek(SeekFrom::End(0)).map_err(Error::Io)?;
     drop(writer);
+    // A holder that lost its lease stops before changing the set (R21).
+    lock.verify()?;
     // A failed flush publishes nothing (R19); an unconfirmed one is reported.
     let durability = destination.publish_new(&set, &tmp_name, &image_name)?;
     guard.disarm();
 
     // 11. Catalog update, still under the lock (spec §D.3).
+    lock.verify()?;
     update_catalog(&*destination, &set, &request.set_name, now_unix())?;
 
     Ok(BackupReport {

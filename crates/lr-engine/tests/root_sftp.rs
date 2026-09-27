@@ -448,3 +448,62 @@ fn killing_the_server_mid_transfer_leaves_nothing_finalized() {
     );
     restarted.stop();
 }
+
+/// A remote lock broken and replaced by another holder is never written over
+/// by the old holder's refresher, and the old holder can no longer publish
+/// or delete (R21).
+#[test]
+#[ignore = "requires root, sshd and openssh-server"]
+fn a_replaced_remote_lock_fences_its_old_holder() {
+    if !root_tests_enabled() {
+        return;
+    }
+    let Some(mut server) = Sshd::start() else {
+        return;
+    };
+    std::fs::create_dir_all(server.root()).expect("served");
+    let served = server.root().join(SET_NAME);
+    let destination = lr_store::open(&server.destination(), &server.options(SET_NAME))
+        .expect("open sftp destination");
+    let set = destination
+        .open_set(&lr_core::SetId::ZERO)
+        .expect("open set");
+    let holder = destination
+        .lock_set(&set, &lr_store::LockOwner::local(), Duration::from_secs(1))
+        .expect("take the lock");
+    holder.verify().expect("a fresh lease is held");
+
+    // Another host breaks the lock and takes the set.
+    let replacement = lr_store::LockRecord {
+        owner: lr_store::LockOwner {
+            host_id: "other-host".to_owned(),
+            pid: 4242,
+        },
+        created: lr_store::now_unix(),
+        ttl_secs: 600,
+        token: "other-token".to_owned(),
+    };
+    std::fs::remove_file(served.join("set.lock")).expect("break");
+    std::fs::write(
+        served.join("set.lock"),
+        serde_json::to_vec(&replacement).expect("serialize"),
+    )
+    .expect("replace");
+    // Several refresh intervals of the old holder.
+    std::thread::sleep(Duration::from_millis(1500));
+    let on_disk: lr_store::LockRecord =
+        serde_json::from_slice(&std::fs::read(served.join("set.lock")).expect("read"))
+            .expect("record");
+    assert_eq!(
+        on_disk.token, "other-token",
+        "the new owner's record survives"
+    );
+    let error = holder.verify().expect_err("the old holder lost its lease");
+    assert!(error.to_string().contains("lost"), "{error}");
+    drop(holder);
+    assert!(
+        served.join("set.lock").exists(),
+        "dropping the old holder leaves the new owner's lock alone"
+    );
+    server.stop();
+}

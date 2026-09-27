@@ -604,39 +604,144 @@ impl std::io::Seek for SftpReader {
     }
 }
 
-/// Keeps a remote set lock fresh and releases it on drop.
-struct RemoteLockGuard {
+/// A held remote lease. SFTP offers no compare-and-swap, so the holder
+/// re-reads the lock before every refresh and every [`SetLock::verify`] and
+/// acts only while it still carries this acquisition's token (R21). A
+/// replacement that lands between that read and the refresh's write is the
+/// one window remote storage cannot close; the replacing holder's own
+/// verification then sees the old token and stops instead.
+struct RemoteLease {
     runtime: Arc<Runtime>,
     session: Arc<SftpSession>,
     path: String,
-    owner: LockOwner,
-    stop: Arc<std::sync::atomic::AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    record: LockRecord,
+    ttl: Duration,
+    /// When the lease was last written; monotonic, so it keeps counting
+    /// while the process is paused.
+    refreshed: Mutex<std::time::Instant>,
+    lost: Mutex<Option<String>>,
+    stop: std::sync::atomic::AtomicBool,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
-impl std::fmt::Debug for RemoteLockGuard {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RemoteLockGuard")
-            .field("path", &self.path)
-            .finish_non_exhaustive()
+impl RemoteLease {
+    /// `Ok(())` while the lock still carries this holder's token.
+    fn still_ours(&self) -> std::result::Result<(), String> {
+        let bytes = self
+            .runtime
+            .block_on(self.session.read(&self.path))
+            .map_err(|error| format!("the lock cannot be read: {error}"))?;
+        let record: LockRecord = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("the lock is unreadable: {error}"))?;
+        if record.token == self.record.token {
+            Ok(())
+        } else {
+            Err(format!("the lock now belongs to {}", record.describe()))
+        }
+    }
+
+    fn lose(&self, reason: String) {
+        tracing::error!(path = %self.path, %reason, "remote set lock lease lost");
+        self.lost
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert(reason);
+    }
+
+    fn refresh_loop(&self, interval: Duration) {
+        use std::sync::atomic::Ordering;
+        let slice = Duration::from_millis(50);
+        loop {
+            let mut waited = Duration::ZERO;
+            while waited < interval {
+                if self.stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(slice.min(interval - waited));
+                waited += slice;
+            }
+            if self.stop.load(Ordering::SeqCst) {
+                return;
+            }
+            if let Err(reason) = self.still_ours() {
+                self.lose(reason);
+                return;
+            }
+            let now = now_unix();
+            let payload = serde_json::to_vec(&LockRecord {
+                created: now,
+                ..self.record.clone()
+            })
+            .unwrap_or_default();
+            // WRITE | TRUNCATE without CREATE: a removed lock is not revived.
+            let written = self.runtime.block_on(async {
+                let mut file = self
+                    .session
+                    .open_with_flags(&self.path, OpenFlags::WRITE | OpenFlags::TRUNCATE)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                file.write_all(&payload)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                file.shutdown().await.map_err(|error| error.to_string())
+            });
+            if let Err(error) = written {
+                self.lose(format!("refreshing it failed: {error}"));
+                return;
+            }
+            *self
+                .refreshed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = std::time::Instant::now();
+        }
+    }
+
+    /// See [`SetLock::verify`].
+    fn verify(&self, display: &str) -> Result<()> {
+        if let Some(reason) = self
+            .lost
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            return Err(crate::lease_lost(display, &reason));
+        }
+        self.still_ours()
+            .map_err(|reason| crate::lease_lost(display, &reason))?;
+        let refreshed = *self
+            .refreshed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.ttl.is_zero() && refreshed.elapsed() > self.ttl {
+            return Err(crate::lease_lost(
+                display,
+                "it expired while the job was not running, and another job may have broken it",
+            ));
+        }
+        Ok(())
     }
 }
 
-impl Drop for RemoteLockGuard {
+/// Stops the refresher and releases the remote lock on drop.
+struct RemoteLeaseGuard(Arc<RemoteLease>);
+
+impl Drop for RemoteLeaseGuard {
     fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Some(thread) = self.thread.take() {
+        let lease = &self.0;
+        lease.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = lease
+            .thread
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
             let _ = thread.join();
         }
-        // Remove only a lock that is still ours: a stale-breaker may have
-        // replaced it while this process was busy.
-        let still_ours = self.runtime.block_on(async {
-            let bytes = self.session.read(&self.path).await.ok()?;
-            let record: LockRecord = serde_json::from_slice(&bytes).ok()?;
-            Some(record.owner == self.owner)
-        });
-        if still_ours == Some(true) {
-            let _ = self.runtime.block_on(self.session.remove_file(&self.path));
+        // Remove only a lock that is still ours.
+        if lease.still_ours().is_ok() {
+            let _ = lease
+                .runtime
+                .block_on(lease.session.remove_file(&lease.path));
         }
     }
 }
@@ -855,6 +960,7 @@ impl SftpDestination {
             owner: owner.clone(),
             created: now_unix(),
             ttl_secs: ttl.as_secs(),
+            token: lr_core::Id::generate().map_err(Error::Io)?.to_string(),
         };
         let payload = serde_json::to_vec(&record)
             .map_err(|error| Error::corrupt(format!("set lock record: {error}")))?;
@@ -875,9 +981,13 @@ impl SftpDestination {
                         Ok::<(), std::io::Error>(())
                     });
                     written.map_err(Error::Io)?;
-                    let guard =
-                        self.spawn_refresh(Arc::clone(&session), path.clone(), record.clone(), ttl);
-                    return Ok(SetLock::new(path, guard));
+                    let lease = self.start_lease(Arc::clone(&session), path.clone(), record, ttl);
+                    let check = {
+                        let lease = Arc::clone(&lease);
+                        let path = path.clone();
+                        move || lease.verify(&path)
+                    };
+                    return Ok(SetLock::with_check(path, RemoteLeaseGuard(lease), check));
                 }
                 Err(error) => {
                     let existing = self
@@ -912,61 +1022,38 @@ impl SftpDestination {
     }
 
     /// Keep the lease fresh until the lock is dropped.
-    fn spawn_refresh(
+    fn start_lease(
         &self,
         session: Arc<SftpSession>,
         path: String,
         record: LockRecord,
         ttl: Duration,
-    ) -> RemoteLockGuard {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let owner = record.owner.clone();
-        let stop = Arc::new(AtomicBool::new(false));
-        let interval = (ttl / 3).max(Duration::from_millis(250));
-        let thread = if ttl.is_zero() {
-            None
-        } else {
-            let stop = Arc::clone(&stop);
-            let session = Arc::clone(&session);
-            let path = path.clone();
-            let runtime = Arc::clone(&self.runtime);
-            let record = record.clone();
-            std::thread::Builder::new()
-                .name("lr-sftp-lock".to_owned())
-                .spawn(move || {
-                    let slice = Duration::from_millis(50);
-                    loop {
-                        let mut waited = Duration::ZERO;
-                        while waited < interval {
-                            if stop.load(Ordering::SeqCst) {
-                                return;
-                            }
-                            std::thread::sleep(slice.min(interval - waited));
-                            waited += slice;
-                        }
-                        if stop.load(Ordering::SeqCst) {
-                            return;
-                        }
-                        let mut refreshed = record.clone();
-                        refreshed.created = now_unix();
-                        let payload = serde_json::to_vec(&refreshed).unwrap_or_default();
-                        let ok = runtime
-                            .block_on(async { session.write(&path, &payload).await.is_ok() });
-                        if !ok {
-                            return;
-                        }
-                    }
-                })
-                .ok()
-        };
-        RemoteLockGuard {
+    ) -> Arc<RemoteLease> {
+        let lease = Arc::new(RemoteLease {
             runtime: Arc::clone(&self.runtime),
             session,
             path,
-            owner,
-            stop,
-            thread,
+            refreshed: Mutex::new(std::time::Instant::now()),
+            record,
+            ttl,
+            lost: Mutex::new(None),
+            stop: std::sync::atomic::AtomicBool::new(false),
+            thread: Mutex::new(None),
+        });
+        // A zero lease never expires, so there is nothing to refresh.
+        if !ttl.is_zero() {
+            let interval = (ttl / 3).max(Duration::from_millis(250));
+            let refresher = Arc::clone(&lease);
+            let thread = std::thread::Builder::new()
+                .name("lr-sftp-lock".to_owned())
+                .spawn(move || refresher.refresh_loop(interval))
+                .ok();
+            *lease
+                .thread
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = thread;
         }
+        lease
     }
 }
 

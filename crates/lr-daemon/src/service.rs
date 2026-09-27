@@ -647,13 +647,14 @@ impl LinuxReflect for DaemonService {
             let options = lr_store::DestinationOptions::new(&spec.set);
             let destination = lr_store::open(&spec.dest, &options)?;
             let set = destination.open_set(&lr_core::SetId::ZERO)?;
-            let _lock = lr_engine::backup::acquire_set_lock_for(&*destination, &set, 300, false)?;
+            let lock = lr_engine::backup::acquire_set_lock_for(&*destination, &set, 300, false)?;
             let loaded = lr_engine::catalog::load(
                 &*destination,
                 &set,
                 &spec.set,
                 lr_engine::backup::now_unix(),
             )?;
+            lock.verify()?;
             lr_engine::catalog::write_catalog(&*destination, &set, &loaded.catalog)?;
             serde_json::to_string(&loaded.catalog)
                 .map_err(|error| Error::corrupt(format!("catalog json: {error}")))

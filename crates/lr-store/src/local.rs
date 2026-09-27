@@ -16,9 +16,10 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use lr_core::{Error, Result, SetId};
@@ -145,6 +146,13 @@ impl LocalDestination {
     }
 
     /// Take the lock, optionally breaking an expired one first.
+    ///
+    /// The holder keeps the lock file open with an exclusive `flock` for as
+    /// long as it holds the lock. A process that is alive, even paused past
+    /// its lease, keeps that `flock`, so nobody on this host can break its
+    /// lock; the kernel drops the `flock` when the process dies. Holders on
+    /// other hosts sharing the destination are fenced by the lease token
+    /// instead ([`SetLock::verify`], R21).
     fn acquire(
         &self,
         set: &SetHandle,
@@ -159,31 +167,55 @@ impl LocalDestination {
             owner: owner.clone(),
             created: now_unix(),
             ttl_secs: ttl.as_secs(),
+            token: lr_core::Id::generate().map_err(Error::Io)?.to_string(),
         };
         loop {
             match OpenOptions::new()
+                .read(true)
                 .write(true)
                 .create_new(true)
                 .custom_flags(O_NOFOLLOW)
                 .open(&path)
             {
                 Ok(mut file) => {
+                    lock_exclusive(&file)?;
                     file.write_all(&serde_json::to_vec(&record).map_err(lock_serialize)?)
                         .map_err(Error::Io)?;
                     file.sync_all().map_err(Error::Io)?;
-                    drop(file);
-                    let guard = RefreshGuard::start(Arc::clone(&dir), path, record.clone(), ttl)?;
-                    return Ok(SetLock::new(
-                        self.lock_path().to_string_lossy().into_owned(),
-                        guard,
-                    ));
+                    let display = self.lock_path().to_string_lossy().into_owned();
+                    let lease = Arc::new(Lease::new(Arc::clone(&dir), path, file, record, ttl)?);
+                    lease.start()?;
+                    let check = {
+                        let lease = Arc::clone(&lease);
+                        let display = display.clone();
+                        move || lease.verify(&display)
+                    };
+                    return Ok(SetLock::with_check(display, LeaseGuard(lease), check));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     match read_lock(&path)? {
                         Some(existing) if existing.is_stale(now_unix()) && break_stale => {
-                            std::fs::remove_file(&path).map_err(Error::Io)?;
-                            // The lock is gone now, so the next attempt creates it.
-                            continue;
+                            let file = open_nofollow(&path).map_err(Error::Io)?;
+                            match file.try_lock() {
+                                Ok(()) => {
+                                    std::fs::remove_file(&path).map_err(Error::Io)?;
+                                    // The lock is gone now, so the next
+                                    // attempt creates it.
+                                    continue;
+                                }
+                                Err(std::fs::TryLockError::WouldBlock) => {
+                                    return Err(Error::SetLocked {
+                                        owner: format!(
+                                            "{}; its lease looks expired, but its process is \
+                                             still alive on this host, so it is not broken",
+                                            existing.describe()
+                                        ),
+                                    });
+                                }
+                                Err(std::fs::TryLockError::Error(error)) => {
+                                    return Err(Error::Io(error));
+                                }
+                            }
                         }
                         Some(existing) => {
                             return Err(Error::SetLocked {
@@ -220,94 +252,184 @@ fn read_lock(path: &Path) -> Result<Option<LockRecord>> {
     }
 }
 
-/// Keeps a set lock's lease fresh until it is dropped, then releases it.
-struct RefreshGuard {
+/// Take an exclusive `flock` on a freshly created lock file.
+fn lock_exclusive(file: &File) -> Result<()> {
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => Err(Error::SetLocked {
+            owner: "a process that opened the new lock file first".to_owned(),
+        }),
+        Err(std::fs::TryLockError::Error(error)) => Err(Error::Io(error)),
+    }
+}
+
+/// A held lease: the lock file this holder created, kept open and flocked,
+/// and refreshed until the lock is dropped.
+struct Lease {
     /// The pinned set directory; `path` names the lock file inside it and is
     /// valid only while this descriptor is open.
     _dir: Arc<OwnedFd>,
     path: PathBuf,
-    owner: LockOwner,
-    stop: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    /// The lock file this holder created. Refreshes write into this inode,
+    /// never through the path, so they cannot touch a replacement.
+    file: File,
+    ttl: Duration,
+    /// When the lease was last written; monotonic, so it keeps counting
+    /// while the process is paused.
+    refreshed: Mutex<std::time::Instant>,
+    /// Why the lease was lost, once it is.
+    lost: Mutex<Option<String>>,
+    stop: AtomicBool,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    record: LockRecord,
 }
 
-impl RefreshGuard {
-    fn start(dir: Arc<OwnedFd>, path: PathBuf, record: LockRecord, ttl: Duration) -> Result<Self> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let owner = record.owner.clone();
-        // A zero lease never expires, so there is nothing to refresh.
-        if ttl.is_zero() {
-            return Ok(Self {
-                _dir: dir,
-                path,
-                owner,
-                stop,
-                thread: None,
-            });
-        }
-        let interval = (ttl / 3).max(Duration::from_millis(250));
-        let thread_stop = Arc::clone(&stop);
-        let thread_path = path.clone();
-        let thread = std::thread::Builder::new()
-            .name("lr-set-lock".to_owned())
-            .spawn(move || refresh_loop(&thread_path, &record, interval, &thread_stop))
-            .map_err(Error::Io)?;
+impl Lease {
+    fn new(
+        dir: Arc<OwnedFd>,
+        path: PathBuf,
+        file: File,
+        record: LockRecord,
+        ttl: Duration,
+    ) -> Result<Self> {
         Ok(Self {
             _dir: dir,
             path,
-            owner,
-            stop,
-            thread: Some(thread),
+            file,
+            ttl,
+            refreshed: Mutex::new(std::time::Instant::now()),
+            lost: Mutex::new(None),
+            stop: AtomicBool::new(false),
+            thread: Mutex::new(None),
+            record,
         })
     }
-}
 
-/// Refresh the lease until asked to stop.
-///
-/// The sleep is chopped into short slices so `Drop` never waits for a whole
-/// refresh interval.
-fn refresh_loop(path: &Path, record: &LockRecord, interval: Duration, stop: &AtomicBool) {
-    let slice = Duration::from_millis(50);
-    loop {
-        let mut waited = Duration::ZERO;
-        while waited < interval {
-            if stop.load(Ordering::SeqCst) {
+    /// Start refreshing; a zero lease never expires and needs none.
+    fn start(self: &Arc<Self>) -> Result<()> {
+        if self.ttl.is_zero() {
+            return Ok(());
+        }
+        let interval = (self.ttl / 3).max(Duration::from_millis(250));
+        let lease = Arc::clone(self);
+        let thread = std::thread::Builder::new()
+            .name("lr-set-lock".to_owned())
+            .spawn(move || lease.refresh_loop(interval))
+            .map_err(Error::Io)?;
+        *self.thread.lock().unwrap_or_else(PoisonError::into_inner) = Some(thread);
+        Ok(())
+    }
+
+    /// `Ok(())` while the path still names the file this holder created.
+    fn still_ours(&self) -> std::result::Result<(), String> {
+        let at_path = std::fs::symlink_metadata(&self.path)
+            .map_err(|error| format!("the lock file is gone: {error}"))?;
+        let ours = self.file.metadata().map_err(|error| error.to_string())?;
+        if (at_path.dev(), at_path.ino()) == (ours.dev(), ours.ino()) {
+            Ok(())
+        } else {
+            Err("the lock file was replaced by another holder".to_owned())
+        }
+    }
+
+    fn lose(&self, reason: String) {
+        tracing::error!(path = %self.path.display(), %reason, "set lock lease lost");
+        self.lost
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert(reason);
+    }
+
+    /// Refresh the lease until asked to stop or until it is lost.
+    ///
+    /// The sleep is chopped into short slices so `Drop` never waits for a
+    /// whole refresh interval.
+    fn refresh_loop(&self, interval: Duration) {
+        let slice = Duration::from_millis(50);
+        loop {
+            let mut waited = Duration::ZERO;
+            while waited < interval {
+                if self.stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(slice.min(interval - waited));
+                waited += slice;
+            }
+            if self.stop.load(Ordering::SeqCst) {
                 return;
             }
-            std::thread::sleep(slice.min(interval - waited));
-            waited += slice;
+            if let Err(reason) = self.still_ours() {
+                self.lose(reason);
+                return;
+            }
+            let now = now_unix();
+            let refreshed = LockRecord {
+                created: now,
+                ..self.record.clone()
+            };
+            let written = serde_json::to_vec(&refreshed)
+                .map_err(std::io::Error::other)
+                .and_then(|bytes| {
+                    self.file.set_len(0)?;
+                    self.file.write_all_at(&bytes, 0)
+                });
+            if let Err(error) = written {
+                self.lose(format!("refreshing it failed: {error}"));
+                return;
+            }
+            *self
+                .refreshed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = std::time::Instant::now();
         }
-        if stop.load(Ordering::SeqCst) {
-            return;
+    }
+
+    /// See [`SetLock::verify`].
+    fn verify(&self, display: &str) -> Result<()> {
+        if let Some(reason) = self
+            .lost
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        {
+            return Err(crate::lease_lost(display, &reason));
         }
-        let mut refreshed = record.clone();
-        refreshed.created = now_unix();
-        let written = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .custom_flags(O_NOFOLLOW)
-            .open(path)
-            .and_then(|mut file| {
-                file.write_all(&serde_json::to_vec(&refreshed).unwrap_or_default())
-            });
-        if written.is_err() {
-            return;
+        self.still_ours()
+            .map_err(|reason| crate::lease_lost(display, &reason))?;
+        let refreshed = *self
+            .refreshed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !self.ttl.is_zero() && refreshed.elapsed() > self.ttl {
+            return Err(crate::lease_lost(
+                display,
+                "it expired while the job was not running, and another job may have broken it",
+            ));
         }
+        Ok(())
     }
 }
 
-impl Drop for RefreshGuard {
+/// Stops the refresher and releases the lock when the [`SetLock`] is
+/// dropped.
+struct LeaseGuard(Arc<Lease>);
+
+impl Drop for LeaseGuard {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(thread) = self.thread.take() {
+        let lease = &self.0;
+        lease.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = lease
+            .thread
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
             let _ = thread.join();
         }
-        // Only remove a lock that is still ours: a stale-breaker may have
+        // Only remove a lock that is still ours: another holder may have
         // replaced it while this process was busy.
-        if let Ok(Some(record)) = read_lock(&self.path)
-            && record.owner == self.owner
-        {
-            let _ = std::fs::remove_file(&self.path);
+        if lease.still_ours().is_ok() {
+            let _ = std::fs::remove_file(&lease.path);
         }
     }
 }
@@ -743,6 +865,7 @@ mod tests {
             owner: owner(1),
             created: 1_000,
             ttl_secs: 1,
+            ..LockRecord::default()
         };
         std::fs::write(
             destination.lock_path(),
@@ -759,6 +882,77 @@ mod tests {
         destination
             .lock_set_breaking_stale(&set, &owner(2), Duration::from_secs(60))
             .expect("stale lock is broken on request");
+    }
+
+    /// A holder paused past its lease still lives; on its own host nobody
+    /// may break its lock, however stale the record looks (R21).
+    #[test]
+    fn a_live_holder_is_never_broken_on_its_host() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (destination, set_id) = destination(&dir);
+        let set = destination.open_set(&set_id).expect("open set");
+        let holder = destination
+            .lock_set(&set, &owner(1), Duration::ZERO)
+            .expect("lock");
+        holder.verify().expect("a fresh lease is held");
+        // As if the holder had been paused and its lease had run out.
+        let stale = LockRecord {
+            owner: owner(1),
+            created: 1_000,
+            ttl_secs: 1,
+            ..LockRecord::default()
+        };
+        std::fs::write(
+            destination.lock_path(),
+            serde_json::to_vec(&stale).expect("serialize"),
+        )
+        .expect("age the record");
+        assert!(destination.lock_is_stale().expect("staleness"));
+        let breaker = destination.lock_set_breaking_stale(&set, &owner(2), Duration::from_secs(60));
+        assert!(
+            breaker.is_err(),
+            "a lock whose holder is alive on this host must not be broken"
+        );
+        drop(breaker);
+        drop(holder);
+    }
+
+    /// A holder whose lock was broken and replaced elsewhere (another host
+    /// sharing the destination) never writes over the new owner's record,
+    /// and learns that it lost the lease (R21).
+    #[test]
+    fn a_replaced_lock_is_never_overwritten_by_its_old_holder() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (destination, set_id) = destination(&dir);
+        let set = destination.open_set(&set_id).expect("open set");
+        let holder = destination
+            .lock_set(&set, &owner(1), Duration::from_secs(1))
+            .expect("lock");
+        let replacement = LockRecord {
+            owner: owner(2),
+            created: crate::now_unix(),
+            ttl_secs: 60,
+            ..LockRecord::default()
+        };
+        std::fs::remove_file(destination.lock_path()).expect("break");
+        std::fs::write(
+            destination.lock_path(),
+            serde_json::to_vec(&replacement).expect("serialize"),
+        )
+        .expect("replace");
+        // Several refresh intervals of the old holder.
+        std::thread::sleep(Duration::from_millis(1200));
+        let on_disk: LockRecord =
+            serde_json::from_slice(&std::fs::read(destination.lock_path()).expect("read"))
+                .expect("record");
+        assert_eq!(on_disk.owner, owner(2), "the new owner's record survives");
+        let error = holder.verify().expect_err("the old holder lost its lease");
+        assert!(error.to_string().contains("lost"), "{error}");
+        drop(holder);
+        assert!(
+            destination.lock_path().exists(),
+            "dropping the old holder leaves the new owner's lock alone"
+        );
     }
 
     #[test]
