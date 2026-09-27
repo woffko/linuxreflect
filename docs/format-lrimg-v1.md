@@ -301,6 +301,7 @@ Kind 4 (Btrfs layout) is line-oriented so a reader can ignore unknown fields:
 | `default_subvol_path=<path>` | path of the default subvolume, `-` for the top level |
 | `mount_options=<opts>` | mount options of the source filesystem |
 | `subvol=<path>TAB<subvolid>` | one line per snapshotted subvolume |
+| `excluded=<path>` | a nested subvolume that was not mounted and is not in the image (D-112) |
 
 Kind 6 (CDC parameters) is 13 bytes: `min u32`, `avg u32`, `max u32`,
 `normalization u8`. The chain member list is a sequence of

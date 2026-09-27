@@ -628,3 +628,77 @@ fn btrfs_send_parents_follow_the_catalog() {
             .all(|subvol| subvol.parent_snapshot_uuid.is_some())
     );
 }
+
+/// A subvolume nested inside a mounted one but not mounted itself is not in
+/// the mounted subvolume's snapshot. The backup names it and stops, instead
+/// of silently omitting its files (R30, D-112).
+#[test]
+#[ignore = "needs root, loop devices and btrfs-progs"]
+fn a_nested_unmounted_subvolume_is_never_omitted_silently() {
+    if !root_tests_enabled() {
+        return;
+    }
+    for tool in ["btrfs", "mkfs.btrfs"] {
+        if !have(tool) {
+            lr_testkit::unavailable!("{tool} missing");
+        }
+    }
+    let source = LoopDisk::attach(512 * 1024 * 1024).expect("source loop device");
+    if !run("mkfs.btrfs", &["-q", "-f", &source.path()]) {
+        lr_testkit::fixture_failed!("mkfs.btrfs failed");
+    }
+    let work = tempfile::tempdir().expect("workdir");
+    {
+        let top = Mount::btrfs(&source.device, &work.path().join("top"), None).expect("mount top");
+        assert!(run(
+            "btrfs",
+            &[
+                "subvolume",
+                "create",
+                &top.path().join("@").display().to_string()
+            ]
+        ));
+    }
+    let root_subvol =
+        Mount::btrfs(&source.device, &work.path().join("src-root"), Some("/@")).expect("mount @");
+    write_file(&root_subvol.path().join("etc/f1"), "one\n");
+    std::fs::create_dir_all(root_subvol.path().join("srv")).expect("srv");
+    assert!(run(
+        "btrfs",
+        &[
+            "subvolume",
+            "create",
+            &root_subvol.path().join("srv/nested").display().to_string()
+        ]
+    ));
+    write_file(&root_subvol.path().join("srv/nested/data"), "nested\n");
+
+    let dest = work.path().join("images");
+    std::fs::create_dir_all(&dest).expect("dest");
+    let mut request =
+        BackupRequest::new(&source.device, &dest, "set", Encryption::NoEncrypt).expect("request");
+    request.compression = Compression::None;
+    let error = backup_image(&request).expect_err("the nested subvolume would be omitted");
+    let text = error.to_string();
+    assert!(
+        text.contains("@/srv/nested") && text.contains("--exclude-nested-subvolumes"),
+        "{text}"
+    );
+    assert!(
+        output("find", &[&dest.display().to_string(), "-name", "*.lrimg"]).is_empty(),
+        "nothing was published"
+    );
+
+    // Accepting the exclusion backs up without it, and says so.
+    request.exclude_nested_subvolumes = true;
+    let report = stream_report(backup_image(&request).expect("backup with the exclusion"));
+    assert_eq!(report.excluded_subvolumes, ["@/srv/nested"]);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("@/srv/nested")),
+        "{:?}",
+        report.warnings
+    );
+}

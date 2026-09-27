@@ -127,6 +127,9 @@ pub struct BackupRequest {
     /// Start a new chain when the newest one already holds this many
     /// incrementals (spec §J.3); `None` or `Some(0)` means no limit.
     pub max_incrementals_per_chain: Option<u64>,
+    /// Btrfs sources: back up although subvolumes nested in an included
+    /// one are not mounted; they are named in the report (D-112).
+    pub exclude_nested_subvolumes: bool,
     /// Destination URI; empty means "use `dest_root`" (spec §J.1).
     pub dest: String,
     /// Options for reaching the destination (paths, not secrets).
@@ -176,6 +179,7 @@ impl BackupRequest {
             parent: None,
             break_stale_lock: false,
             max_incrementals_per_chain: None,
+            exclude_nested_subvolumes: false,
             set_lock_ttl_secs: None,
             context: crate::progress::EngineContext::silent(),
         })

@@ -103,6 +103,9 @@ message BackupSpec {
   // File mode: read every file instead of trusting unchanged metadata,
   // inode and ctime (D-111).
   bool verify_content = 22;
+  // Btrfs: back up although nested subvolumes are not mounted; they are
+  // named in the report (D-112).
+  bool exclude_nested_subvolumes = 23;
 }
 
 message MemberInfo {

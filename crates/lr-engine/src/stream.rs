@@ -65,6 +65,10 @@ pub struct SubvolumeReport {
 /// What a stream backup produced.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StreamReport {
+    /// Nested subvolumes that were not mounted and are not in the image
+    /// (D-112).
+    #[serde(default)]
+    pub excluded_subvolumes: Vec<String>,
     /// Non-fatal notes, such as a destination that could not confirm the
     /// image reached stable storage.
     #[serde(default)]
@@ -296,6 +300,7 @@ pub fn backup_stream(request: &BackupRequest) -> Result<StreamReport> {
             .map(|parent| *parent.member.image_uuid.inner()),
         mount_root: PathBuf::from(btrfs::DEFAULT_MOUNT_ROOT),
         general: crate::backup::snapshot_opts(request),
+        exclude_nested: request.exclude_nested_subvolumes,
     };
     request.context.phase("snapshot");
     let mut snapshot = btrfs::provider().create(&layout, &tree_opts)?;
@@ -511,7 +516,12 @@ pub fn backup_stream(request: &BackupRequest) -> Result<StreamReport> {
     }
 
     Ok(StreamReport {
-        warnings: durability.warning("the image").into_iter().collect(),
+        warnings: durability
+            .warning("the image")
+            .into_iter()
+            .chain(excluded_warning(&snapshot.excluded))
+            .collect(),
+        excluded_subvolumes: snapshot.excluded.clone(),
         image_path: crate::backup::local_image_path(&set_root, &image_name),
         image_uuid: request.image_uuid,
         chain_id: request.chain_id,
@@ -532,11 +542,24 @@ pub fn backup_stream(request: &BackupRequest) -> Result<StreamReport> {
     })
 }
 
+/// The warning for nested subvolumes left out of an image (D-112).
+pub(crate) fn excluded_warning(excluded: &[String]) -> Option<String> {
+    (!excluded.is_empty()).then(|| {
+        format!(
+            "{} nested subvolume(s) are not mounted and are not in this image, as \
+             --exclude-nested-subvolumes asked: {}",
+            excluded.len(),
+            excluded.join(", ")
+        )
+    })
+}
+
 /// The Btrfs layout extras record (spec §G.6 extras kind 4).
 ///
 /// Line-oriented, so a reader can ignore fields it does not know:
 /// `fs_uuid=`, `label=`, `default_subvolid=`, `default_subvol_path=`,
-/// `mount_options=`, then `subvol=<path>\t<subvolid>` per subvolume.
+/// `mount_options=`, then `subvol=<path>\t<subvolid>` per subvolume and
+/// `excluded=<path>` per nested subvolume left out (D-112).
 #[must_use]
 pub fn stream_layout(
     snapshot: &lr_snapshot::TreeSnapshot,
@@ -557,6 +580,10 @@ pub fn stream_layout(
             "subvol={}\t{}\n",
             subvol.subvol_path, subvol.subvolid
         ));
+    }
+    // Nested subvolumes that are not in the image (D-112); informational.
+    for path in &snapshot.excluded {
+        text.push_str(&format!("excluded={path}\n"));
     }
     text
 }

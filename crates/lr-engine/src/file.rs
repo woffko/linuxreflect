@@ -51,6 +51,8 @@ struct FileSnapshot {
     root: PathBuf,
     /// Consistency the walk provides.
     consistency: Consistency,
+    /// Nested subvolumes the snapshot does not contain (D-112).
+    excluded: Vec<String>,
     /// Read-only snapshot to release when the image is final.
     _guard: Option<lr_snapshot::TreeSnapshot>,
 }
@@ -101,6 +103,7 @@ fn snapshot_source(
         parent_image: None,
         mount_root: PathBuf::from(lr_snapshot::btrfs::DEFAULT_MOUNT_ROOT),
         general: crate::backup::snapshot_opts(request),
+        exclude_nested: request.exclude_nested_subvolumes,
     };
     request.context.phase("snapshot");
     let snapshot = lr_snapshot::btrfs::provider().create(&layout, &opts)?;
@@ -127,6 +130,7 @@ fn snapshot_source(
     Ok(Some(FileSnapshot {
         root,
         consistency: Consistency::PointInTime,
+        excluded: snapshot.excluded.clone(),
         _guard: Some(snapshot),
     }))
 }
@@ -221,6 +225,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
         Some(root) => Some(FileSnapshot {
             root,
             consistency: options.consistency,
+            excluded: Vec::new(),
             _guard: None,
         }),
         None => snapshot_source(request, options)?,
@@ -228,6 +233,10 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
     let walk_root = snapshot
         .as_ref()
         .map_or_else(|| request.source.clone(), |snapshot| snapshot.root.clone());
+    let excluded_subvolumes = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.excluded.clone())
+        .unwrap_or_default();
     let mut consistency = snapshot
         .as_ref()
         .map_or(options.consistency, |snapshot| snapshot.consistency);
@@ -576,6 +585,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
 
     let mut warnings = walk.warnings;
     warnings.append(&mut read_warnings);
+    warnings.extend(crate::stream::excluded_warning(&excluded_subvolumes));
     warnings.extend(durability.warning("the image"));
     if consistency == Consistency::PerFile {
         warnings.push(

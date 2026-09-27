@@ -248,6 +248,11 @@ pub(crate) enum BackupCommand {
         /// unchanged metadata, inode and ctime (slower, same storage).
         #[arg(long)]
         verify_content: bool,
+
+        /// Btrfs: back up although subvolumes nested in an included one are
+        /// not mounted; they are left out and named in the report.
+        #[arg(long)]
+        exclude_nested_subvolumes: bool,
     },
 
     /// List chains and members (Slice S9).

@@ -54,6 +54,10 @@ pub struct TreeSnapshotOpts {
     pub mount_root: PathBuf,
     /// Generic snapshot options (destination, opt-ins).
     pub general: SnapshotOpts,
+    /// Proceed although subvolumes nested in an included one are not
+    /// mounted and so not backed up; they are listed in
+    /// [`TreeSnapshot::excluded`] (D-112).
+    pub exclude_nested: bool,
 }
 
 impl TreeSnapshotOpts {
@@ -67,6 +71,7 @@ impl TreeSnapshotOpts {
             parent_image: None,
             mount_root: PathBuf::from(DEFAULT_MOUNT_ROOT),
             general: SnapshotOpts::default(),
+            exclude_nested: false,
         }
     }
 }
@@ -117,6 +122,9 @@ pub struct TreeSnapshot {
     pub consistency: Consistency,
     /// One entry per snapshot taken.
     pub subvolumes: Vec<SubvolSnapshot>,
+    /// Subvolumes nested in an included one but not mounted, and therefore
+    /// not in this image (D-112).
+    pub excluded: Vec<String>,
     /// Top-level mount point; unmounted when the snapshot is dropped.
     mountpoint: PathBuf,
     /// Top-level path used to build snapshot paths.
@@ -381,6 +389,7 @@ impl BtrfsProvider {
             mount_options: String::new(),
             consistency: Consistency::PointInTime,
             subvolumes: Vec::new(),
+            excluded: Vec::new(),
             top: mountpoint.clone(),
             set_dir: mountpoint.join(STATE_DIR).join(&opts.set_name),
             mountpoint,
@@ -402,6 +411,21 @@ impl BtrfsProvider {
                  (not the top level) and retry",
             ));
         }
+
+        // A snapshot does not contain the subvolumes nested in its source.
+        // Those that are not mounted themselves would be missing, so they
+        // stop the backup unless their exclusion was accepted (R30, D-112).
+        let nested = nested_unmounted(&subvolume_paths(&tree.top)?, &mounted);
+        if !nested.is_empty() && !opts.exclude_nested {
+            return Err(Error::unsupported(format!(
+                "btrfs provider: {} nested subvolume(s) are not mounted and would be missing \
+                 from the image: {}. Mount them to include them, or pass \
+                 --exclude-nested-subvolumes to back up without them",
+                nested.len(),
+                summarize(&nested)
+            )));
+        }
+        tree.excluded = nested;
 
         // 3. Snapshot each one, reusing the recorded parent when it exists.
         tree.mount_options = mounted
@@ -489,6 +513,75 @@ impl BtrfsProvider {
         }
         parse_mounted_subvolumes(&output.stdout, fs_uuid)
     }
+}
+
+/// Every subvolume path of the filesystem whose top level is mounted at
+/// `top`, relative to the top level (`btrfs subvolume list`).
+///
+/// # Errors
+/// Returns [`Error::Unsupported`] when the listing fails.
+fn subvolume_paths(top: &Path) -> Result<Vec<String>> {
+    let output = Command::new("btrfs")
+        .args(["subvolume", "list"])
+        .arg(top)
+        .output()
+        .map_err(|error| Error::unsupported(format!("btrfs could not be run: {error}")))?;
+    if !output.status.success() {
+        return Err(Error::unsupported(format!(
+            "btrfs subvolume list failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(parse_subvolume_list(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// The paths of `btrfs subvolume list` output
+/// (`ID 257 gen 8 top level 5 path @/srv/nested`).
+#[must_use]
+pub fn parse_subvolume_list(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| line.split_once(" path ").map(|(_, path)| path.to_owned()))
+        .collect()
+}
+
+/// Subvolumes inside a mounted one that are not mounted themselves, sorted;
+/// LinuxReflect's own snapshots are not counted (D-112).
+#[must_use]
+pub fn nested_unmounted(all: &[String], mounted: &[MountedSubvol]) -> Vec<String> {
+    let mounted: Vec<&str> = mounted
+        .iter()
+        .map(|subvol| subvol.subvol_path.trim_matches('/'))
+        .collect();
+    let mut nested: Vec<String> = all
+        .iter()
+        .map(|path| path.trim_matches('/'))
+        .filter(|path| !mounted.contains(path))
+        .filter(|path| *path != STATE_DIR && !path.starts_with(&format!("{STATE_DIR}/")))
+        .filter(|path| {
+            mounted
+                .iter()
+                .any(|parent| parent.is_empty() || path.starts_with(&format!("{parent}/")))
+        })
+        .map(str::to_owned)
+        .collect();
+    nested.sort();
+    nested
+}
+
+/// At most ten names, then a count of the rest.
+fn summarize(names: &[String]) -> String {
+    let mut text = names
+        .iter()
+        .take(10)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.len() > 10 {
+        text.push_str(&format!(" and {} more", names.len() - 10));
+    }
+    text
 }
 
 /// The mount entry that holds a path, as `findmnt -T` reports it.
@@ -1013,6 +1106,36 @@ pub fn set_default(top: &Path, subvolid: u64) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nested_unmounted_subvolumes_are_found() {
+        use super::{MountedSubvol, nested_unmounted, parse_subvolume_list};
+        let listing = "ID 256 gen 9 top level 5 path @\n\
+                       ID 257 gen 9 top level 256 path @/srv/nested\n\
+                       ID 258 gen 9 top level 5 path @home\n\
+                       ID 259 gen 9 top level 5 path .linuxreflect/set/u/@\n\
+                       ID 260 gen 9 top level 5 path other\n";
+        let all = parse_subvolume_list(listing);
+        assert_eq!(all.len(), 5);
+        let mounted = |path: &str| MountedSubvol {
+            target: std::path::PathBuf::from("/"),
+            source: "/dev/x".to_owned(),
+            subvol_path: path.to_owned(),
+            subvolid: 0,
+            options: String::new(),
+        };
+        // `@` and `@home` are mounted; `other` is not nested in either.
+        assert_eq!(
+            nested_unmounted(&all, &[mounted("/@"), mounted("/@home")]),
+            ["@/srv/nested"]
+        );
+        // A mounted top level contains every unmounted subvolume, but never
+        // LinuxReflect's own snapshots.
+        assert_eq!(
+            nested_unmounted(&all, &[mounted("/"), mounted("/@")]),
+            ["@/srv/nested", "@home", "other"]
+        );
+    }
+
     use super::{
         Incremental, TOP_LEVEL_SUBVOLID, TreeSnapshotOpts, escape_path, parse_mounted_subvolumes,
         parse_subvol_options,

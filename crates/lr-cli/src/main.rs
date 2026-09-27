@@ -101,6 +101,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             mode,
             one_file_system,
             verify_content,
+            exclude_nested_subvolumes,
             max_incrementals,
         }) => backup_create(
             cli.json,
@@ -129,6 +130,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
                 mode: *mode,
                 one_file_system: *one_file_system,
                 verify_content: *verify_content,
+                exclude_nested_subvolumes: *exclude_nested_subvolumes,
                 max_incrementals: *max_incrementals,
             },
         ),
@@ -502,6 +504,7 @@ struct BackupOptions<'a> {
     mode: cli::ModeChoice,
     one_file_system: bool,
     verify_content: bool,
+    exclude_nested_subvolumes: bool,
     max_incrementals: u64,
 }
 
@@ -565,6 +568,7 @@ fn backup_create(json: bool, options: &BackupOptions<'_>) -> anyhow::Result<()> 
             insecure_ignore_host_key: options.insecure_ignore_host_key,
             max_incrementals: options.max_incrementals,
             verify_content: options.verify_content,
+            exclude_nested_subvolumes: options.exclude_nested_subvolumes,
             ..lr_proto::v1::BackupSpec::default()
         };
         let summary = client.create_backup(spec, |progress| {
@@ -627,6 +631,7 @@ fn backup_create(json: bool, options: &BackupOptions<'_>) -> anyhow::Result<()> 
     request.deadman_grace_secs = Some(options.deadman_grace);
     request.max_incrementals_per_chain =
         (options.max_incrementals > 0).then_some(options.max_incrementals);
+    request.exclude_nested_subvolumes = options.exclude_nested_subvolumes;
 
     let report = match resolve_mode(options.mode, options.source)? {
         lr_engine::options::Mode::File => {

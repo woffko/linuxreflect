@@ -274,6 +274,7 @@ impl DaemonService {
         }
         request.allow_freeze = spec.allow_freeze;
         request.allow_inconsistent = spec.allow_inconsistent;
+        request.exclude_nested_subvolumes = spec.exclude_nested_subvolumes;
         request.lvm_cow_size = (!spec.lvm_cow_size.is_empty()).then(|| spec.lvm_cow_size.clone());
         request.destination_options = lr_store::DestinationOptions {
             set_name: spec.set.clone(),
