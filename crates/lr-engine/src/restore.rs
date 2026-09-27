@@ -513,7 +513,7 @@ pub fn prepare_restore(request: &PrepareRequest) -> Result<RestorePlan> {
         insecure_ignore_host_key: request.insecure_ignore_host_key,
     };
     let destination = lr_store::open(&location.dest, &options)?;
-    let set = destination.open_set(&lr_core::SetId::ZERO)?;
+    let set = destination.open_existing_set(&lr_core::SetId::ZERO)?;
     let (mut reader, keys, superblock) =
         open_image(&*destination, &set, &location.name, &request.encryption)?;
     let repeated_page_nonces = superblock.is_encrypted()
@@ -746,7 +746,7 @@ pub fn apply_restore(request: &ApplyRequest) -> Result<RestoreOutcome> {
     token.verify()?;
 
     let destination = lr_store::open(&token.dest, &token.destination_options())?;
-    let set = destination.open_set(&lr_core::SetId::ZERO)?;
+    let set = destination.open_existing_set(&lr_core::SetId::ZERO)?;
     let (mut reader, keys, superblock) =
         open_image(&*destination, &set, &token.image, &request.encryption)?;
     if superblock.image_uuid != token.image_uuid {

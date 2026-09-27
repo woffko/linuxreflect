@@ -106,7 +106,7 @@ struct ImageView {
 impl ImageView {
     fn open(request: &FuseRequest) -> Result<Self> {
         let destination = lr_store::open(&request.dest, &request.destination_options)?;
-        let set = destination.open_set(&lr_core::SetId::ZERO)?;
+        let set = destination.open_existing_set(&lr_core::SetId::ZERO)?;
         let files = request
             .images
             .iter()

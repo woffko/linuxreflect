@@ -57,7 +57,7 @@ pub fn resolve_image(
     let mut destination_options = options.clone();
     destination_options.set_name.clone_from(&location.set);
     let destination = lr_store::open(&location.dest, &destination_options)?;
-    let set = destination.open_set(&lr_core::SetId::ZERO)?;
+    let set = destination.open_existing_set(&lr_core::SetId::ZERO)?;
     let chain = lr_engine::chain::resolve_chain(&*destination, &set, &location.name)?;
     if chain.is_empty() {
         return Err(Error::unsupported(format!(

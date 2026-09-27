@@ -113,7 +113,7 @@ impl ImageBackend {
         encryption: &lr_engine::keys::Encryption,
     ) -> Result<Self> {
         let destination = lr_store::open(dest, options)?;
-        let set = destination.open_set(&lr_core::SetId::ZERO)?;
+        let set = destination.open_existing_set(&lr_core::SetId::ZERO)?;
         let files = images
             .iter()
             .map(|name| {

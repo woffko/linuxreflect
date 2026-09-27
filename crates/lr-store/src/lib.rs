@@ -210,6 +210,15 @@ impl SetLock {
     }
 }
 
+/// The error for a set that does not exist (A9).
+#[must_use]
+pub fn no_such_set(set_name: &str, root: &str) -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("no backup set '{set_name}' at {root}"),
+    ))
+}
+
 /// The error for a lease its holder no longer has (R21).
 #[must_use]
 pub fn lease_lost(path: &str, reason: &str) -> Error {
@@ -328,6 +337,14 @@ pub trait Destination: Send + Sync {
     /// # Errors
     /// Propagates I/O errors.
     fn open_set(&self, set: &SetId) -> Result<SetHandle>;
+
+    /// Open a set that must already exist, creating nothing. Read paths
+    /// (restore, verify, listing, mounting, retention) use this, so looking
+    /// at backups never changes the destination (A9).
+    ///
+    /// # Errors
+    /// Returns a not-found error naming the set when it does not exist.
+    fn open_existing_set(&self, set: &SetId) -> Result<SetHandle>;
 
     /// Take the set lock (spec §D.3).
     ///

@@ -646,7 +646,7 @@ impl LinuxReflect for DaemonService {
         let progress = tokio::task::spawn_blocking(move || -> Result<String> {
             let options = lr_store::DestinationOptions::new(&spec.set);
             let destination = lr_store::open(&spec.dest, &options)?;
-            let set = destination.open_set(&lr_core::SetId::ZERO)?;
+            let set = destination.open_existing_set(&lr_core::SetId::ZERO)?;
             let lock = lr_engine::backup::acquire_set_lock_for(&*destination, &set, 300, false)?;
             let loaded = lr_engine::catalog::load(
                 &*destination,
@@ -840,7 +840,7 @@ impl LinuxReflect for DaemonService {
                 insecure_ignore_host_key: false,
             };
             let destination = lr_store::open(&spec.dest, &options)?;
-            let set = destination.open_set(&lr_core::SetId::ZERO)?;
+            let set = destination.open_existing_set(&lr_core::SetId::ZERO)?;
             let report = lr_engine::retention::apply(
                 &*destination,
                 &set,
@@ -878,7 +878,7 @@ impl DaemonService {
             });
         }
         let set = destination
-            .open_set(&lr_core::SetId::ZERO)
+            .open_existing_set(&lr_core::SetId::ZERO)
             .map_err(status::status_of)?;
         let loaded = lr_engine::catalog::load(
             &*destination,

@@ -446,6 +446,23 @@ impl Destination for LocalDestination {
         })
     }
 
+    fn open_existing_set(&self, set: &SetId) -> Result<SetHandle> {
+        match self.set_fd(false) {
+            Ok(dir) => drop(dir),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(crate::no_such_set(
+                    &self.set_name,
+                    &self.root.display().to_string(),
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(SetHandle {
+            set_id: *set,
+            path: self.set_dir().to_string_lossy().into_owned(),
+        })
+    }
+
     fn lock_set(&self, set: &SetHandle, owner: &LockOwner, ttl: Duration) -> Result<SetLock> {
         self.acquire(set, owner, ttl, false)
     }

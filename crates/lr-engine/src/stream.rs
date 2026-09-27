@@ -789,7 +789,7 @@ pub fn restore_stream(request: &StreamRestoreRequest) -> Result<StreamRestoreRep
         return Err(Error::unsupported("no images to restore"));
     }
     let destination = lr_store::open(&request.dest, &request.destination_options)?;
-    let set = destination.open_set(&lr_core::SetId::ZERO)?;
+    let set = destination.open_existing_set(&lr_core::SetId::ZERO)?;
     let contents = request
         .images
         .iter()

@@ -839,7 +839,7 @@ fn open_set(
 ) -> anyhow::Result<(std::sync::Arc<dyn lr_store::Destination>, SetHandle)> {
     let destination = lr_store::open(dest, options).with_context(|| format!("opening {dest}"))?;
     let handle = destination
-        .open_set(&lr_core::SetId::ZERO)
+        .open_existing_set(&lr_core::SetId::ZERO)
         .with_context(|| format!("opening the set '{}'", options.set_name))?;
     Ok((destination, handle))
 }
@@ -1334,7 +1334,7 @@ fn retention_apply(
         return Ok(());
     }
     let destination = lr_store::open(dest, options)?;
-    let handle = destination.open_set(&lr_core::SetId::ZERO)?;
+    let handle = destination.open_existing_set(&lr_core::SetId::ZERO)?;
     let report = lr_engine::retention::apply(
         &*destination,
         &handle,

@@ -319,6 +319,20 @@ impl SftpDestination {
         Err(last.unwrap_or_else(|| Error::NetworkTimeout(label.to_owned())))
     }
 
+    /// The handle of this destination's set.
+    fn handle(&self, set: &SetId) -> SetHandle {
+        SetHandle {
+            set_id: *set,
+            // A URI, not a path: `local_root` must refuse it so no caller can
+            // mistake a remote set for a local directory.
+            path: format!(
+                "sftp://{}/{}",
+                self.config.host,
+                self.config.set_path().trim_start_matches('/')
+            ),
+        }
+    }
+
     /// Join a set-relative name onto the destination's set directory.
     fn path(&self, name: &str) -> String {
         self.config.file_path(name)
@@ -757,16 +771,31 @@ impl Destination for SftpDestination {
                     .map_err(|error| sftp_error("mkdir", error))
             })
         })?;
-        Ok(SetHandle {
-            set_id: *set,
-            // A URI, not a path: `local_root` must refuse it so no caller can
-            // mistake a remote set for a local directory.
-            path: format!(
-                "sftp://{}/{}",
-                self.config.host,
-                self.config.set_path().trim_start_matches('/')
-            ),
-        })
+        Ok(self.handle(set))
+    }
+
+    fn open_existing_set(&self, set: &SetId) -> Result<SetHandle> {
+        let path = self.config.set_path();
+        let is_dir = self.run("stat", |session| {
+            let path = path.clone();
+            Box::pin(async move {
+                match session.metadata(&path).await {
+                    Ok(metadata) => Ok(Some(metadata.is_dir())),
+                    Err(error) => match sftp_error("stat", error) {
+                        Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                        other => Err(other),
+                    },
+                }
+            })
+        })?;
+        match is_dir {
+            Some(true) => Ok(self.handle(set)),
+            Some(false) => Err(Error::unsupported(format!("{path} is not a directory"))),
+            None => Err(crate::no_such_set(
+                &self.config.set_name,
+                &format!("sftp://{}{}", self.config.host, self.config.root),
+            )),
+        }
     }
 
     fn lock_set(&self, set: &SetHandle, owner: &LockOwner, ttl: Duration) -> Result<SetLock> {

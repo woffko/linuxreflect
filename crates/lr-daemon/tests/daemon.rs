@@ -258,10 +258,23 @@ async fn version_is_unauthenticated_and_later_slices_are_unimplemented() {
     // S14 is implemented as well: retention on an empty set succeeds with an
     // empty report (and says so) instead of answering `unimplemented`.
     let work = tempfile::tempdir().expect("tempdir");
-    let progress = client
+    // A set that does not exist is reported, and not created (A9).
+    let missing = client
         .apply_retention(lr_proto::v1::RetentionSpec {
             dest: work.path().join("backups").display().to_string(),
             set: "missing".to_owned(),
+            keep_chains: 1,
+            dry_run: false,
+        })
+        .await
+        .expect_err("there is no such set");
+    assert_eq!(missing.code(), tonic::Code::NotFound, "{missing:?}");
+    assert!(!work.path().join("backups/missing").exists());
+    std::fs::create_dir_all(work.path().join("backups/empty")).expect("empty set");
+    let progress = client
+        .apply_retention(lr_proto::v1::RetentionSpec {
+            dest: work.path().join("backups").display().to_string(),
+            set: "empty".to_owned(),
             keep_chains: 1,
             dry_run: false,
         })

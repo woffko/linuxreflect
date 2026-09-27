@@ -684,7 +684,7 @@ pub fn restore_file(request: &FileRestoreRequest) -> Result<FileRestoreReport> {
         return Err(Error::unsupported("no images to restore"));
     }
     let destination = lr_store::open(&request.dest, &request.destination_options)?;
-    let set = destination.open_set(&SetId::ZERO)?;
+    let set = destination.open_existing_set(&SetId::ZERO)?;
     let files = request
         .images
         .iter()

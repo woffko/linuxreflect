@@ -97,7 +97,7 @@ pub fn verify_image(request: &VerifyRequest) -> Result<VerifyReport> {
     let mut options = request.destination_options.clone();
     options.set_name.clone_from(&location.set);
     let destination = lr_store::open(&location.dest, &options)?;
-    let set = destination.open_set(&lr_core::SetId::ZERO)?;
+    let set = destination.open_existing_set(&lr_core::SetId::ZERO)?;
 
     let target = crate::chain::read_superblock(&*destination, &set, &location.name)?;
 
@@ -499,7 +499,7 @@ pub fn chain_names(image: &str, options: &DestinationOptions) -> Result<Vec<Stri
     let mut options = options.clone();
     options.set_name = set_name;
     let destination = lr_store::open(&dest, &options)?;
-    let set = destination.open_set(&lr_core::SetId::ZERO)?;
+    let set = destination.open_existing_set(&lr_core::SetId::ZERO)?;
     Ok(crate::chain::resolve_chain(&*destination, &set, &name)?
         .into_iter()
         .map(|member| member.file_name)

@@ -51,6 +51,8 @@ pub fn grpc_status(error: &Error) -> Status {
         Error::Unsupported { .. } => Code::FailedPrecondition,
         Error::Corrupt { .. } | Error::Aead | Error::BadSector { .. } => Code::DataLoss,
         Error::SnapshotOverflow | Error::FreezeTimeout => Code::Aborted,
+        // A missing set, image or file is the caller's to fix (A9).
+        Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound => Code::NotFound,
         Error::NetworkTimeout(_) | Error::Io(_) => Code::Internal,
     };
     Status::new(tonic_code, format!("{code}: {message}"))
