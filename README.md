@@ -12,9 +12,11 @@ desktop notifier are unprivileged clients authorised through polkit.
 [![Release](https://img.shields.io/github/v/release/woffko/linuxreflect?include_prereleases)](https://github.com/woffko/linuxreflect/releases)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
-> **Alpha.** `v0.1.0-alpha.1` is the first public build. Backups read your
-> disks and restores overwrite them: try it on machines and disks you can
-> afford to lose, and keep another copy of anything that matters.
+> **Beta.** `v0.1.0-beta.1` fixes every P0 and P1 finding of the
+> [remediation plan](docs/remediation-plan.md); its open items are listed in
+> the release notes. Backups read your disks and restores overwrite them: test
+> a restore before you rely on a backup, and keep another copy of anything
+> that matters.
 
 ![LinuxReflect on Ubuntu 22.04 (GNOME, Wayland), showing the real disk of the machine it runs on](docs/screenshots/ubuntu-gnome.png)
 
@@ -152,13 +154,13 @@ screenshot and the rescue one are taken from running systems.
 
 ### From the release (Ubuntu 22.04 or newer, x86_64)
 
-Download `linuxreflect-0.1.0-alpha.1-x86_64-linux-gnu.tar.gz` from the
+Download `linuxreflect-0.1.0-beta.1-x86_64-linux-gnu.tar.gz` from the
 [releases page](https://github.com/woffko/linuxreflect/releases), check it
 against `SHA256SUMS`, then:
 
 ```sh
-tar xzf linuxreflect-0.1.0-alpha.1-x86_64-linux-gnu.tar.gz
-cd linuxreflect-0.1.0-alpha.1
+tar xzf linuxreflect-0.1.0-beta.1-x86_64-linux-gnu.tar.gz
+cd linuxreflect-0.1.0-beta.1
 sudo BIN=$PWD/bin ./contrib/install-host.sh
 sudo usermod -aG linuxreflect "$USER"     # then log out and in again
 ```
@@ -284,11 +286,11 @@ desktop notifications (failures are critical and carry the error code).
 
 ## Rescue medium and bare-metal recovery
 
-Write `linuxreflect-rescue-0.1.0-alpha.1.img.zst` from the release to a USB
+Write `linuxreflect-rescue-0.1.0-beta.1.img.zst` from the release to a USB
 stick (this erases the stick):
 
 ```sh
-zstd -dc linuxreflect-rescue-0.1.0-alpha.1.img.zst | sudo dd of=/dev/sdX bs=4M conv=fsync
+zstd -dc linuxreflect-rescue-0.1.0-beta.1.img.zst | sudo dd of=/dev/sdX bs=4M conv=fsync
 ```
 
 It boots on BIOS and on UEFI with Secure Boot, starts the GUI (with its own
