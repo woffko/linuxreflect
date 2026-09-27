@@ -828,8 +828,23 @@ pub struct FileRestoreRequest {
     pub accept_inconsistent: bool,
     /// Allow restoring into a directory that already has entries.
     pub merge: bool,
+    /// Fail when any metadata cannot be restored, instead of reporting it
+    /// (R33, D-123).
+    pub strict_metadata: bool,
     /// Live progress and cooperative cancellation (spec §I).
     pub context: crate::progress::EngineContext,
+}
+
+/// Metadata a file restore could not apply to one entry (R33).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MetadataLoss {
+    /// Path below the target.
+    pub path: String,
+    /// What was not restored: `ownership <uid>:<gid>`, `timestamps`, `acl`
+    /// or `xattr <name>`.
+    pub what: String,
+    /// Why, as the system reported it.
+    pub error: String,
 }
 
 /// What a file restore produced.
@@ -853,6 +868,9 @@ pub struct FileRestoreReport {
     pub restored_bytes: u64,
     /// Non-fatal notes.
     pub warnings: Vec<String>,
+    /// Every piece of metadata that could not be restored (R33).
+    #[serde(default)]
+    pub metadata_losses: Vec<MetadataLoss>,
 }
 
 /// Restore a file-mode chain into an existing directory (spec §H.1).
@@ -1044,8 +1062,9 @@ pub fn restore_file(request: &FileRestoreRequest) -> Result<FileRestoreReport> {
         .values()
         .map(|record| record.entry.clone())
         .collect();
+    let mut losses = Vec::new();
     for entry in tree::deepest_first(&entries) {
-        if let Err(error) = tree::apply_metadata(&root, entry) {
+        if let Err(error) = tree::apply_metadata(&root, entry, &mut losses) {
             if entry.file_kind == lr_format::FILE_KIND_SPECIAL {
                 warnings.push(format!(
                     "{}: {}",
@@ -1056,6 +1075,16 @@ pub fn restore_file(request: &FileRestoreRequest) -> Result<FileRestoreReport> {
             }
             return Err(error);
         }
+    }
+    if !losses.is_empty() {
+        let summary = summarize_losses(&losses);
+        if request.strict_metadata {
+            return Err(Error::unsupported(format!(
+                "the files are restored, but metadata is missing and --strict-metadata was \
+                 given: {summary}"
+            )));
+        }
+        warnings.push(format!("metadata not restored: {summary}"));
     }
 
     Ok(FileRestoreReport {
@@ -1068,7 +1097,38 @@ pub fn restore_file(request: &FileRestoreRequest) -> Result<FileRestoreReport> {
         specials: counts[4],
         restored_bytes,
         warnings,
+        metadata_losses: losses,
     })
+}
+
+/// One line about metadata losses: how many entries lost what, and the
+/// first few, with a hint when ownership needs root.
+fn summarize_losses(losses: &[MetadataLoss]) -> String {
+    let mut kinds: BTreeMap<&str, u64> = BTreeMap::new();
+    for loss in losses {
+        let kind = loss.what.split(' ').next().unwrap_or(&loss.what);
+        *kinds.entry(kind).or_default() += 1;
+    }
+    let counts: Vec<String> = kinds
+        .iter()
+        .map(|(kind, count)| format!("{kind} of {count}"))
+        .collect();
+    let first: Vec<String> = losses
+        .iter()
+        .take(3)
+        .map(|loss| format!("{} ({}: {})", loss.path, loss.what, loss.error))
+        .collect();
+    let hint = if kinds.contains_key("ownership") && lr_unsafe::effective_uid() != 0 {
+        "; ownership needs a restore as root"
+    } else {
+        ""
+    };
+    format!(
+        "{} entries ({}), for example {}{hint}",
+        losses.len(),
+        counts.join(", "),
+        first.join("; ")
+    )
 }
 
 /// Write `bytes` at `offset`, leaving the recorded sparse regions as holes.

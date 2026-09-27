@@ -147,6 +147,9 @@ pub struct RestoreToken {
     /// Whether `restore apply` may write into a non-empty target directory.
     #[serde(default)]
     pub merge: bool,
+    /// Whether a file restore fails when metadata cannot be restored (R33).
+    #[serde(default)]
+    pub strict_metadata: bool,
     /// Expiry, seconds since the Unix epoch.
     pub expires_at: u64,
     /// The user who prepared the plan; only that user may apply it (A11).
@@ -208,6 +211,7 @@ impl RestoreToken {
             target,
             target_directory: directory,
             merge,
+            strict_metadata: false,
             expires_at,
             uid,
             nonce,
@@ -215,6 +219,17 @@ impl RestoreToken {
         };
         token.mac = hex::encode(mac32(token_secret(), &token.payload()?));
         Ok(token)
+    }
+
+    /// The same token, failing a file restore on metadata loss when
+    /// `strict` (R33); the MAC is computed again.
+    ///
+    /// # Errors
+    /// Propagates serialization failures.
+    pub fn with_strict_metadata(mut self, strict: bool) -> Result<Self> {
+        self.strict_metadata = strict;
+        self.mac = hex::encode(mac32(token_secret(), &self.payload()?));
+        Ok(self)
     }
 
     /// Destination options that reach this token's images.
@@ -442,6 +457,8 @@ pub struct PrepareRequest {
     pub insecure_ignore_host_key: bool,
     /// Allow a file-mode restore into a non-empty directory.
     pub merge: bool,
+    /// Fail a file-mode restore when metadata cannot be restored (R33).
+    pub strict_metadata: bool,
     /// Acknowledge that restoring a partition image onto a whole disk
     /// replaces its partition table and every partition on it (A3).
     pub replace_partition_table: bool,
@@ -479,6 +496,7 @@ impl PrepareRequest {
             known_hosts: None,
             insecure_ignore_host_key: false,
             merge: false,
+            strict_metadata: false,
             replace_partition_table: false,
         }
     }
@@ -494,6 +512,13 @@ impl PrepareRequest {
     #[must_use]
     pub fn with_merge(mut self, merge: bool) -> Self {
         self.merge = merge;
+        self
+    }
+
+    /// Fail a file-mode restore when metadata cannot be restored (R33).
+    #[must_use]
+    pub fn with_strict_metadata(mut self, strict: bool) -> Self {
+        self.strict_metadata = strict;
         self
     }
 }
@@ -741,7 +766,8 @@ pub fn prepare_restore_as(request: &PrepareRequest, uid: u32) -> Result<RestoreP
         request.merge,
         request.ttl,
         uid,
-    )?;
+    )?
+    .with_strict_metadata(request.strict_metadata)?;
 
     Ok(RestorePlan {
         dest: location.dest,
@@ -909,6 +935,7 @@ pub fn apply_restore_as(request: &ApplyRequest, uid: u32) -> Result<RestoreOutco
             confirm: true,
             accept_inconsistent: request.accept_inconsistent,
             merge: token.merge,
+            strict_metadata: token.strict_metadata,
             context: request.context.clone(),
         })?;
         return Ok(RestoreOutcome::File(report));

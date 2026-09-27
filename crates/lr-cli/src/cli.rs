@@ -320,6 +320,11 @@ pub(crate) enum RestoreCommand {
         #[arg(long)]
         merge: bool,
 
+        /// File mode: fail when ownership, timestamps, ACLs or xattrs cannot
+        /// be restored, instead of listing them in the report.
+        #[arg(long)]
+        strict_metadata: bool,
+
         /// Allow a single-filesystem image onto a whole disk, replacing its
         /// partition table and every partition on it.
         #[arg(long)]

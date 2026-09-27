@@ -1615,3 +1615,27 @@ them may be lost or deleted.
   `verify` of a differential opens its ancestry (R23). The CLI help and the
   operator documentation describe a differential as a member with a full
   manifest that needs every earlier member of its chain.
+
+## D-123 — A file restore reports the metadata it could not restore
+
+A file restore applies ownership, mode, timestamps, the ACL and xattrs to
+every entry. Ownership refused with `EPERM`, timestamps, the ACL and some
+xattr failures were dropped without a word, so a restore by a normal user, or
+onto a filesystem without xattrs, reported success with the metadata silently
+missing (R33). The specification does not say what a restore must do then.
+
+- **Default: best effort, reported.** Every piece of metadata that cannot be
+  restored is recorded as a `MetadataLoss` (path, what, the system's error) in
+  the report's `metadata_losses`, and one warning summarises them by kind with
+  the first few paths; for ownership it adds that a restore as root is needed.
+  Only the refusals a filesystem or an unprivileged caller produce are
+  tolerated this way (`EPERM` for ownership; `EPERM`, `EACCES` and
+  `EOPNOTSUPP` for xattrs; any timestamp or ACL failure). Other errors still
+  fail the restore.
+- **Strict on request.** `restore prepare --strict-metadata` (and
+  `RestoreSpec.strict_metadata`) records the choice in the MAC'd token, and the
+  restore then fails when anything is lost. The files are already written at
+  that point; the failure says so.
+- **Not chosen: strict by default.** A normal user restoring their own backup
+  of files owned by others, or a restore onto a FAT or network filesystem,
+  would always fail, although the content is exactly what was asked for.

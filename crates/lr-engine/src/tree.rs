@@ -662,8 +662,9 @@ pub fn restore_entry(
 ) -> Result<()> {
     let relative = PathBuf::from(std::ffi::OsStr::from_bytes(&entry.path));
     if relative.as_os_str().is_empty() {
-        // The restore root itself: only its metadata is applied.
-        return apply_metadata(root, entry);
+        // The restore root itself: only its metadata is applied (its losses
+        // are recorded by the metadata pass, which applies it again).
+        return apply_metadata(root, entry, &mut Vec::new());
     }
     root.ensure_parent(&relative)?;
     let target = root.entry(&relative)?;
@@ -734,11 +735,26 @@ pub fn restore_entry(
 /// times and xattrs never follow a final symlink, and the mode is set through
 /// a descriptor of the verified non-symlink entry.
 ///
+/// What the filesystem or the caller's privileges do not allow is recorded
+/// in `losses` instead of being dropped (R33): ownership refused with
+/// `EPERM` (an unprivileged restore), timestamps, the ACL, and xattrs
+/// refused with `EPERM`, `EACCES` or `EOPNOTSUPP`.
+///
 /// # Errors
-/// Propagates `chown`/`chmod`/`utimensat` errors, except that a failure to
-/// restore ownership of a symlink is reported as unsupported only when it is
-/// `EPERM` (an unprivileged restore).
-pub fn apply_metadata(root: &RestoreRoot, entry: &FileEntry) -> Result<()> {
+/// Propagates other `chown`, `chmod` and xattr errors, and refuses an entry
+/// that became a symlink.
+pub fn apply_metadata(
+    root: &RestoreRoot,
+    entry: &FileEntry,
+    losses: &mut Vec<crate::file::MetadataLoss>,
+) -> Result<()> {
+    let mut lost = |what: String, error: &io::Error| {
+        losses.push(crate::file::MetadataLoss {
+            path: String::from_utf8_lossy(&entry.path).into_owned(),
+            what,
+            error: error.to_string(),
+        });
+    };
     let relative = PathBuf::from(std::ffi::OsStr::from_bytes(&entry.path));
     let (_pinned, path) = if relative.as_os_str().is_empty() {
         (None, lr_unsafe::beneath::self_path(&root.fd))
@@ -747,8 +763,12 @@ pub fn apply_metadata(root: &RestoreRoot, entry: &FileEntry) -> Result<()> {
         let path = target.path.clone();
         (Some(target), path)
     };
-    if let Some(error) = set_owner(&path, entry) {
-        return Err(error);
+    match lr_unsafe::filemeta::lchown(&path, entry.uid, entry.gid) {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+            lost(format!("ownership {}:{}", entry.uid, entry.gid), &error);
+        }
+        Err(error) => return Err(Error::Io(error)),
     }
     if entry.file_kind != FILE_KIND_SYMLINK {
         // chmod(2) follows symlinks, so it goes through a descriptor of the
@@ -775,15 +795,20 @@ pub fn apply_metadata(root: &RestoreRoot, entry: &FileEntry) -> Result<()> {
         )
         .map_err(Error::Io)?;
     }
-    let _ = lr_unsafe::filemeta::set_times_nofollow(
+    if let Err(error) = lr_unsafe::filemeta::set_times_nofollow(
         &path,
         entry.mtime_sec,
         entry.mtime_nsec,
         entry.mtime_sec,
         entry.mtime_nsec,
-    );
-    if !entry.acl.is_empty() {
-        let _ = lr_unsafe::filemeta::set_xattr(&path, b"system.posix_acl_access", &entry.acl);
+    ) {
+        lost("timestamps".to_owned(), &error);
+    }
+    if !entry.acl.is_empty()
+        && let Err(error) =
+            lr_unsafe::filemeta::set_xattr(&path, b"system.posix_acl_access", &entry.acl)
+    {
+        lost("acl".to_owned(), &error);
     }
     for xattr in &entry.xattrs {
         if let Err(error) = lr_unsafe::filemeta::set_xattr(&path, &xattr.name, &xattr.value) {
@@ -791,20 +816,16 @@ pub fn apply_metadata(root: &RestoreRoot, entry: &FileEntry) -> Result<()> {
                 error.raw_os_error(),
                 Some(libc::EPERM | libc::EACCES | libc::EOPNOTSUPP)
             ) {
+                lost(
+                    format!("xattr {}", String::from_utf8_lossy(&xattr.name)),
+                    &error,
+                );
                 continue;
             }
             return Err(Error::Io(error));
         }
     }
     Ok(())
-}
-
-fn set_owner(path: &Path, entry: &FileEntry) -> Option<Error> {
-    match lr_unsafe::filemeta::lchown(path, entry.uid, entry.gid) {
-        Ok(()) => None,
-        Err(error) if error.raw_os_error() == Some(libc::EPERM) => None,
-        Err(error) => Some(Error::Io(error)),
-    }
 }
 
 fn push_holes(file: &File, holes: &[(u64, u64)]) {
@@ -1096,7 +1117,7 @@ mod tests {
             restore_entry(&pinned, &below, &[], &hardlinks, &mut write).is_err(),
             "an entry below a symlink must be refused"
         );
-        assert!(super::apply_metadata(&pinned, &below).is_err());
+        assert!(super::apply_metadata(&pinned, &below, &mut Vec::new()).is_err());
 
         assert_eq!(
             std::fs::read(outside.join("sentinel")).expect("sentinel"),

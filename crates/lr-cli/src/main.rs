@@ -142,6 +142,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             known_hosts,
             insecure_ignore_host_key,
             merge,
+            strict_metadata,
             replace_partition_table,
         }) => restore_prepare(
             cli.json,
@@ -151,6 +152,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             PrepareFlags {
                 ttl: *ttl,
                 merge: *merge,
+                strict_metadata: *strict_metadata,
                 replace_partition_table: *replace_partition_table,
             },
             &DestinationOptions {
@@ -1176,6 +1178,7 @@ fn probe(
 struct PrepareFlags {
     ttl: u64,
     merge: bool,
+    strict_metadata: bool,
     replace_partition_table: bool,
 }
 
@@ -1191,6 +1194,7 @@ fn restore_prepare(
     let PrepareFlags {
         ttl,
         merge,
+        strict_metadata,
         replace_partition_table,
     } = flags;
     if ttl > lr_engine::DEFAULT_TTL.as_secs() {
@@ -1221,6 +1225,7 @@ fn restore_prepare(
             ttl_secs: ttl,
             merge,
             replace_partition_table,
+            strict_metadata,
         })?;
         if json {
             println!("{}", serde_json::to_string_pretty(&plan)?);
@@ -1254,6 +1259,7 @@ fn restore_prepare(
     request.known_hosts.clone_from(&options.known_hosts);
     request.insecure_ignore_host_key = options.insecure_ignore_host_key;
     request.merge = merge;
+    request.strict_metadata = strict_metadata;
     request.replace_partition_table = replace_partition_table;
     request.ttl = std::time::Duration::from_secs(ttl);
     let plan = prepare_restore(&request)?;

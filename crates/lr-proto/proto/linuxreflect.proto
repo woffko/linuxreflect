@@ -239,6 +239,8 @@ message RestoreSpec {
   // Acknowledge that a single-filesystem image written to a whole disk
   // replaces its partition table and every partition on it (A3).
   bool replace_partition_table = 9;
+  // File mode: fail the restore when metadata cannot be restored (R33).
+  bool strict_metadata = 10;
 }
 
 message RestorePlanInfo {

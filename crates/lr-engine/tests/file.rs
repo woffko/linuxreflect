@@ -457,6 +457,80 @@ fn verify_names_a_corrupted_file_chunk() {
     );
 }
 
+/// A user restoring a tree that root owns cannot restore its ownership:
+/// the report lists every entry that kept the user as owner instead of
+/// saying nothing, and --strict-metadata turns that into a failure (R33).
+#[test]
+fn metadata_that_cannot_be_restored_is_reported_or_refused() {
+    if lr_unsafe::effective_uid() == 0 {
+        lr_testkit::unavailable!("running as root: every owner can be restored");
+    }
+    let source = Path::new("/etc/skel");
+    let owned_by_root = std::fs::symlink_metadata(source)
+        .map(|metadata| std::os::unix::fs::MetadataExt::uid(&metadata) == 0)
+        .unwrap_or(false);
+    if !owned_by_root {
+        lr_testkit::unavailable!("/etc/skel is missing or not owned by root");
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dest = dir.path().join("backups");
+    let report = backup_file(
+        &request(source, &dest, "skel"),
+        &FileBackupOptions::default(),
+    )
+    .expect("backup");
+
+    let lenient = dir.path().join("lenient");
+    std::fs::create_dir_all(&lenient).expect("target");
+    let plan = prepare_restore(&PrepareRequest::from_path(
+        &report.image_path,
+        &lenient,
+        Encryption::NoEncrypt,
+    ))
+    .expect("prepare");
+    let restored = restore(&plan);
+    assert!(
+        restored
+            .metadata_losses
+            .iter()
+            .any(|loss| loss.what == "ownership 0:0" && loss.path.is_empty()),
+        "the root directory's owner is reported: {:?}",
+        restored.metadata_losses
+    );
+    assert_eq!(
+        restored.metadata_losses.len() as u64,
+        restored.files + restored.directories + restored.symlinks,
+        "every entry kept the restoring user as owner: {:?}",
+        restored.metadata_losses
+    );
+    assert!(
+        restored
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("metadata not restored")
+                && warning.contains("needs a restore as root")),
+        "{:?}",
+        restored.warnings
+    );
+
+    let strict = dir.path().join("strict");
+    std::fs::create_dir_all(&strict).expect("target");
+    let plan = prepare_restore(
+        &PrepareRequest::from_path(&report.image_path, &strict, Encryption::NoEncrypt)
+            .with_strict_metadata(true),
+    )
+    .expect("prepare");
+    let error = apply_restore(&ApplyRequest {
+        token: plan.token,
+        confirm: true,
+        accept_inconsistent: false,
+        encryption: Encryption::NoEncrypt,
+        context: lr_engine::progress::EngineContext::silent(),
+    })
+    .expect_err("strict metadata must fail");
+    assert!(format!("{error}").contains("--strict-metadata"), "{error}");
+}
+
 #[test]
 fn a_non_empty_target_needs_merge() {
     let dir = tempfile::tempdir().expect("tempdir");
