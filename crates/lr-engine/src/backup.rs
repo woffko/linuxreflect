@@ -296,7 +296,8 @@ pub struct BackupReport {
 pub(crate) struct TempGuard {
     dest: std::sync::Arc<dyn Destination>,
     set: lr_store::SetHandle,
-    image_name: String,
+    /// The temporary image, once [`TempGuard::track_tmp`] names it.
+    tmp_name: Option<String>,
     /// Local scratch file holding the spooled manifest.
     spool_path: PathBuf,
     armed: bool,
@@ -306,16 +307,21 @@ impl TempGuard {
     pub(crate) fn new(
         dest: std::sync::Arc<dyn Destination>,
         set: lr_store::SetHandle,
-        image_name: String,
         spool_path: PathBuf,
     ) -> Self {
         Self {
             dest,
             set,
-            image_name,
+            tmp_name: None,
             spool_path,
             armed: true,
         }
+    }
+
+    /// Delete the temporary file `name` (a [`lr_store::TempFile::name`]) on
+    /// failure.
+    pub(crate) fn track_tmp(&mut self, name: String) {
+        self.tmp_name = Some(name);
     }
 
     pub(crate) fn disarm(&mut self) {
@@ -328,9 +334,9 @@ impl Drop for TempGuard {
         if !self.armed {
             return;
         }
-        let _ = self
-            .dest
-            .delete(&self.set, &format!("{}.tmp", self.image_name));
+        if let Some(name) = &self.tmp_name {
+            let _ = self.dest.delete(&self.set, name);
+        }
         let _ = std::fs::remove_file(&self.spool_path);
     }
 }
@@ -487,7 +493,6 @@ pub fn backup_block_with(
     let mut guard = TempGuard::new(
         std::sync::Arc::clone(&destination),
         set.clone(),
-        image_name.clone(),
         spool_path.clone(),
     );
 
@@ -506,11 +511,10 @@ pub fn backup_block_with(
     };
 
     // 7. Phase A: chunk records plus a spooled manifest.
-    let mut image_writer = ImageWriter::create(
-        destination.create_tmp(&set, &image_name)?,
-        &superblock,
-        mac_key,
-    )?;
+    let tmp = destination.create_tmp(&set, &image_name)?;
+    let tmp_name = tmp.name.clone();
+    guard.track_tmp(tmp_name.clone());
+    let mut image_writer = ImageWriter::create(tmp.writer, &superblock, mac_key)?;
     let mut nonce_seq = NonceSeq::new();
     let spool_path = spool_dir.join(spool_name.replace('/', "_"));
     let counts = {
@@ -703,7 +707,7 @@ pub fn backup_block_with(
     writer.flush().map_err(Error::Io)?;
     let image_bytes = writer.seek(SeekFrom::End(0)).map_err(Error::Io)?;
     drop(writer);
-    destination.finalize(&set, &image_name, &image_name)?;
+    destination.finalize(&set, &tmp_name, &image_name)?;
     guard.disarm();
 
     // 11. Catalog update, still under the lock (spec §D.3).

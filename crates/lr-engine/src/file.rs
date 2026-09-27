@@ -341,12 +341,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
     );
     let image_name = format!("{chain_dir}/{base_name}");
     let spool_path = spool_dir.join(format!("{chain_dir}.{base_name}.file.spool"));
-    let mut guard = TempGuard::new(
-        std::sync::Arc::clone(&destination),
-        set.clone(),
-        image_name.clone(),
-        spool_path,
-    );
+    let mut guard = TempGuard::new(std::sync::Arc::clone(&destination), set.clone(), spool_path);
 
     let writer_keys = WriterKeys {
         data_key: new_keys.keys.data_key.as_ref().map(|key| **key),
@@ -361,11 +356,10 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
         },
         compress: matches!(request.compression, Compression::Zstd { .. }),
     };
-    let mut image_writer = ImageWriter::create(
-        destination.create_tmp(&set, &image_name)?,
-        &superblock,
-        mac_key,
-    )?;
+    let tmp = destination.create_tmp(&set, &image_name)?;
+    let tmp_name = tmp.name.clone();
+    guard.track_tmp(tmp_name.clone());
+    let mut image_writer = ImageWriter::create(tmp.writer, &superblock, mac_key)?;
     let mut nonce_seq = NonceSeq::new();
     let mut reporter = request.context.clone().reporter(walk.total_bytes)?;
     reporter.phase("files");
@@ -503,7 +497,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
     writer.flush().map_err(Error::Io)?;
     let image_bytes = writer.seek(std::io::SeekFrom::End(0)).map_err(Error::Io)?;
     drop(writer);
-    destination.finalize(&set, &image_name, &image_name)?;
+    destination.finalize(&set, &tmp_name, &image_name)?;
     guard.disarm();
     // The walk pins a directory inside the snapshot; close it first so the
     // snapshot's private mount can be released.

@@ -356,5 +356,13 @@ fn the_image_file_is_finalized() {
         ImageReport::File(report) => report.image_path.clone(),
     };
     assert!(path.exists(), "{} must exist", path.display());
-    assert!(!path.with_extension("lrimg.tmp").exists());
+    let leftovers: Vec<_> = std::fs::read_dir(path.parent().expect("chain directory"))
+        .expect("chain directory")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "temporary files remain: {leftovers:?}"
+    );
 }

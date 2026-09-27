@@ -31,8 +31,8 @@ use tokio::runtime::Runtime;
 use crate::known_hosts::HostKeyVerifier;
 use crate::uri::DestinationUri;
 use crate::{
-    Destination, DestinationOptions, LockOwner, LockRecord, SetHandle, SetLock, WriteSeekSync,
-    now_unix,
+    Destination, DestinationOptions, LockOwner, LockRecord, SetHandle, SetLock, TempFile,
+    WriteSeekSync, now_unix,
 };
 
 /// Connection timeout for one operation.
@@ -601,9 +601,10 @@ impl Destination for SftpDestination {
         self.acquire_lock(set, owner, ttl, true)
     }
 
-    fn create_tmp(&self, set: &SetHandle, name: &str) -> Result<Box<dyn WriteSeekSync + Send>> {
+    fn create_tmp(&self, set: &SetHandle, final_name: &str) -> Result<TempFile> {
         let _ = set;
-        let path = self.path(&format!("{name}.tmp"));
+        let name = crate::temp_name(final_name)?;
+        let path = self.path(&name);
         // A name may contain `/` (spec §D.3's `<chain_id>/<file>`); its
         // directory has to exist before the file can be created.
         if let Some((parent, _)) = path.rsplit_once('/') {
@@ -618,22 +619,26 @@ impl Destination for SftpDestination {
             })?;
         }
         let session = self.session()?;
+        // Exclusive create: a name planted on the server is never reused.
         let file = self
             .runtime
             .block_on(session.open_with_flags(
                 &path,
-                OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE,
+                OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::EXCLUDE,
             ))
             .map_err(|error| sftp_error("create", error))?;
-        Ok(Box::new(SftpWriter {
-            runtime: Arc::clone(&self.runtime),
-            file,
-        }))
+        Ok(TempFile {
+            name,
+            writer: Box::new(SftpWriter {
+                runtime: Arc::clone(&self.runtime),
+                file,
+            }),
+        })
     }
 
     fn finalize(&self, set: &SetHandle, tmp: &str, final_name: &str) -> Result<()> {
         let _ = set;
-        let from = self.path(&format!("{tmp}.tmp"));
+        let from = self.path(tmp);
         let to = self.path(final_name);
         self.run("rename", |session| {
             let (from, to) = (from.clone(), to.clone());

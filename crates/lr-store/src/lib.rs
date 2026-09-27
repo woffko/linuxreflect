@@ -100,6 +100,37 @@ impl LockRecord {
     }
 }
 
+/// A temporary file being written on a destination (R07).
+///
+/// Its name is unpredictable and the file was created exclusively, so a name
+/// planted in the destination beforehand, such as a symlink, is never
+/// followed or reused. Publish it with [`Destination::finalize`] or delete it
+/// with [`Destination::delete`], passing [`TempFile::name`].
+pub struct TempFile {
+    /// Set-relative name of the temporary file.
+    pub name: String,
+    /// The open file.
+    pub writer: Box<dyn WriteSeekSync + Send>,
+}
+
+impl std::fmt::Debug for TempFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TempFile")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The name of a new temporary file for `final_name`: in the same directory,
+/// so publication is a rename, with a random part so nobody can plant it.
+///
+/// # Errors
+/// Propagates a failure to read the system random source.
+pub fn temp_name(final_name: &str) -> Result<String> {
+    let random = lr_core::Id::generate().map_err(Error::Io)?;
+    Ok(format!("{final_name}.{random}.tmp"))
+}
+
 /// A held set lock. Dropping it releases the lock.
 pub struct SetLock {
     /// Path or URL of the lock file, for diagnostics.
@@ -260,13 +291,17 @@ pub trait Destination: Send + Sync {
         ))
     }
 
-    /// Create a temporary file inside the set.
+    /// Create a temporary file that will become `final_name`.
+    ///
+    /// The file is created exclusively under a random name next to
+    /// `final_name` (see [`TempFile`]); a symlink is never followed.
     ///
     /// # Errors
     /// Propagates I/O errors.
-    fn create_tmp(&self, set: &SetHandle, name: &str) -> Result<Box<dyn WriteSeekSync + Send>>;
+    fn create_tmp(&self, set: &SetHandle, final_name: &str) -> Result<TempFile>;
 
-    /// Flush and rename a temporary file into place (spec §L.1).
+    /// Flush and rename the temporary file `tmp` (a [`TempFile::name`]) into
+    /// place as `final_name` (spec §L.1).
     ///
     /// # Errors
     /// Propagates I/O errors.

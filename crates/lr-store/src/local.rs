@@ -3,19 +3,30 @@
 //! Images are written to `<root>/<set-name>/<chain_id>/<seq>-<kind>-<uuid>.lrimg`
 //! through a `.tmp` file that is fsynced and renamed into place, so a crash can
 //! never leave a partial file that looks complete.
+//!
+//! The root daemon may write into a directory that other users can write too.
+//! Below the destination root nothing is reached by joining path strings: the
+//! set directory and every directory under it are opened from the pinned root
+//! without following symlinks ([`lr_unsafe::beneath`]), and each file is named
+//! as one component of its pinned directory (R07). A planted symlink is
+//! refused, never followed.
 
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::path::{Component, Path, PathBuf};
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use lr_core::{Error, Result, SetId};
 
-use crate::{
-    Destination, LockOwner, LockRecord, ReadSeek, SetHandle, SetLock, WriteSeekSync, now_unix,
-};
+use crate::{Destination, LockOwner, LockRecord, ReadSeek, SetHandle, SetLock, TempFile, now_unix};
+
+/// `O_NOFOLLOW`: fail instead of opening a symlink.
+const O_NOFOLLOW: i32 = 0o400_000;
 
 /// Suffix of in-progress files.
 pub const TMP_SUFFIX: &str = ".tmp";
@@ -45,32 +56,43 @@ impl LocalDestination {
         self.root.join(&self.set_name)
     }
 
-    fn resolve(&self, handle: &SetHandle, name: &str) -> Result<PathBuf> {
-        let root = crate::local_root(handle)?;
-        let relative = Path::new(name);
-        if relative.is_absolute() {
-            return Err(Error::unsupported(format!(
-                "destination name '{name}' must be relative"
-            )));
+    /// The pinned set directory, reached from the root without following a
+    /// symlink. `create` makes it when it is missing.
+    fn set_fd(&self, create: bool) -> Result<OwnedFd> {
+        lr_core::validate_set_name(&self.set_name)?;
+        if create {
+            std::fs::create_dir_all(&self.root).map_err(Error::Io)?;
         }
-        for component in relative.components() {
-            match component {
-                Component::Normal(_) => {}
-                other => {
-                    return Err(Error::unsupported(format!(
-                        "destination name '{name}' contains {other:?}"
-                    )));
-                }
-            }
+        let root = lr_unsafe::beneath::open_root(&self.root).map_err(Error::Io)?;
+        let name = OsStr::new(&self.set_name);
+        if create {
+            mkdir_in(&root, name)?;
         }
-        Ok(root.join(relative))
+        lr_unsafe::beneath::open_dir_beneath(&root, Path::new(name))
+            .map_err(|error| refused(&self.set_dir(), &error))
     }
 
-    fn create_parents(path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(Error::Io)?;
+    /// The pinned directory holding `name` and the entry path of `name` in
+    /// it. `create` makes missing intermediate directories.
+    fn entry(&self, name: &str, create: bool) -> Result<(OwnedFd, PathBuf)> {
+        let components = lr_unsafe::beneath::normal_components(Path::new(name)).map_err(|_| {
+            Error::unsupported(format!(
+                "destination name '{name}' must be a plain relative path"
+            ))
+        })?;
+        let Some((file, directories)) = components.split_last() else {
+            return Err(Error::unsupported("empty destination name"));
+        };
+        let mut dir = self.set_fd(create)?;
+        for component in directories {
+            if create {
+                mkdir_in(&dir, component)?;
+            }
+            dir = lr_unsafe::beneath::open_dir_beneath(&dir, Path::new(component))
+                .map_err(|error| refused(&self.set_dir().join(name), &error))?;
         }
-        Ok(())
+        let path = lr_unsafe::beneath::entry_path(&dir, file).map_err(Error::Io)?;
+        Ok((dir, path))
     }
 
     /// Path of the set lock file.
@@ -98,22 +120,31 @@ impl LocalDestination {
         ttl: Duration,
         break_stale: bool,
     ) -> Result<SetLock> {
-        let path = self.resolve(set, LOCK_FILE)?;
-        Self::create_parents(&path)?;
+        let _ = set;
+        let (dir, path) = self.entry(LOCK_FILE, true)?;
+        let dir = Arc::new(dir);
         let record = LockRecord {
             owner: owner.clone(),
             created: now_unix(),
             ttl_secs: ttl.as_secs(),
         };
         loop {
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .custom_flags(O_NOFOLLOW)
+                .open(&path)
+            {
                 Ok(mut file) => {
                     file.write_all(&serde_json::to_vec(&record).map_err(lock_serialize)?)
                         .map_err(Error::Io)?;
                     file.sync_all().map_err(Error::Io)?;
                     drop(file);
-                    let guard = RefreshGuard::start(path.clone(), record.clone(), ttl)?;
-                    return Ok(SetLock::new(path.to_string_lossy().into_owned(), guard));
+                    let guard = RefreshGuard::start(Arc::clone(&dir), path, record.clone(), ttl)?;
+                    return Ok(SetLock::new(
+                        self.lock_path().to_string_lossy().into_owned(),
+                        guard,
+                    ));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     match read_lock(&path)? {
@@ -146,7 +177,11 @@ fn lock_serialize(error: serde_json::Error) -> Error {
 
 /// Read the lock file; `Ok(None)` when it does not exist.
 fn read_lock(path: &Path) -> Result<Option<LockRecord>> {
-    match std::fs::read(path) {
+    let read = open_nofollow(path).and_then(|mut file| {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes).map(|_| bytes)
+    });
+    match read {
         Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(Error::Io(error)),
@@ -155,6 +190,9 @@ fn read_lock(path: &Path) -> Result<Option<LockRecord>> {
 
 /// Keeps a set lock's lease fresh until it is dropped, then releases it.
 struct RefreshGuard {
+    /// The pinned set directory; `path` names the lock file inside it and is
+    /// valid only while this descriptor is open.
+    _dir: Arc<OwnedFd>,
     path: PathBuf,
     owner: LockOwner,
     stop: Arc<AtomicBool>,
@@ -162,12 +200,13 @@ struct RefreshGuard {
 }
 
 impl RefreshGuard {
-    fn start(path: PathBuf, record: LockRecord, ttl: Duration) -> Result<Self> {
+    fn start(dir: Arc<OwnedFd>, path: PathBuf, record: LockRecord, ttl: Duration) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let owner = record.owner.clone();
         // A zero lease never expires, so there is nothing to refresh.
         if ttl.is_zero() {
             return Ok(Self {
+                _dir: dir,
                 path,
                 owner,
                 stop,
@@ -182,6 +221,7 @@ impl RefreshGuard {
             .spawn(move || refresh_loop(&thread_path, &record, interval, &thread_stop))
             .map_err(Error::Io)?;
         Ok(Self {
+            _dir: dir,
             path,
             owner,
             stop,
@@ -210,7 +250,15 @@ fn refresh_loop(path: &Path, record: &LockRecord, interval: Duration, stop: &Ato
         }
         let mut refreshed = record.clone();
         refreshed.created = now_unix();
-        if std::fs::write(path, serde_json::to_vec(&refreshed).unwrap_or_default()).is_err() {
+        let written = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .custom_flags(O_NOFOLLOW)
+            .open(path)
+            .and_then(|mut file| {
+                file.write_all(&serde_json::to_vec(&refreshed).unwrap_or_default())
+            });
+        if written.is_err() {
             return;
         }
     }
@@ -235,13 +283,12 @@ impl Drop for RefreshGuard {
 impl Destination for LocalDestination {
     fn open_set(&self, set: &SetId) -> Result<SetHandle> {
         // Without a valid name the set directory would be the destination
-        // root or somewhere outside it (R02, D-115).
-        lr_core::validate_set_name(&self.set_name)?;
-        let dir = self.set_dir();
-        std::fs::create_dir_all(&dir).map_err(Error::Io)?;
+        // root or somewhere outside it (R02, D-115), and a symlink in its
+        // place would lead elsewhere (R07).
+        drop(self.set_fd(true)?);
         Ok(SetHandle {
             set_id: *set,
-            path: dir.to_string_lossy().into_owned(),
+            path: self.set_dir().to_string_lossy().into_owned(),
         })
     }
 
@@ -258,53 +305,67 @@ impl Destination for LocalDestination {
         self.acquire(set, owner, ttl, true)
     }
 
-    fn create_tmp(&self, set: &SetHandle, name: &str) -> Result<Box<dyn WriteSeekSync + Send>> {
-        let path = self.resolve(set, &format!("{name}{TMP_SUFFIX}"))?;
-        Self::create_parents(&path)?;
+    fn create_tmp(&self, set: &SetHandle, final_name: &str) -> Result<TempFile> {
+        let _ = set;
+        let name = crate::temp_name(final_name)?;
+        let (_dir, path) = self.entry(&name, true)?;
+        // `create_new` is `O_CREAT | O_EXCL`, which also fails on a symlink.
         let file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .write(true)
             .read(true)
+            .custom_flags(O_NOFOLLOW)
             .open(&path)
             .map_err(Error::Io)?;
-        Ok(Box::new(file))
+        Ok(TempFile {
+            name,
+            writer: Box::new(file),
+        })
     }
 
     fn finalize(&self, set: &SetHandle, tmp: &str, final_name: &str) -> Result<()> {
-        let tmp_path = self.resolve(set, &format!("{tmp}{TMP_SUFFIX}"))?;
-        let final_path = self.resolve(set, final_name)?;
-        Self::create_parents(&final_path)?;
+        let _ = set;
+        let (_tmp_dir, tmp_path) = self.entry(tmp, false)?;
+        let (final_dir, final_path) = self.entry(final_name, true)?;
         // fsync the data before the rename, then fsync the directory so the
         // rename itself is durable (spec §L.1: finalize = fsync + rename).
-        if let Ok(file) = File::open(&tmp_path) {
-            file.sync_all().map_err(Error::Io)?;
-        }
+        open_nofollow(&tmp_path)
+            .and_then(|file| file.sync_all())
+            .map_err(Error::Io)?;
+        // `rename` follows neither name, so a symlink planted at the final
+        // name is replaced, not written through.
         std::fs::rename(&tmp_path, &final_path).map_err(Error::Io)?;
-        if let Some(parent) = final_path.parent()
-            && let Ok(dir) = File::open(parent)
-        {
-            dir.sync_all().map_err(Error::Io)?;
-        }
-        Ok(())
+        File::open(lr_unsafe::beneath::self_path(&final_dir))
+            .and_then(|dir| dir.sync_all())
+            .map_err(Error::Io)
     }
 
     fn open_ro(&self, set: &SetHandle, name: &str) -> Result<Box<dyn ReadSeek + Send>> {
-        let path = self.resolve(set, name)?;
-        let file = File::open(path).map_err(Error::Io)?;
+        let _ = set;
+        let (_dir, path) = self.entry(name, false)?;
+        let file = open_nofollow(&path).map_err(Error::Io)?;
         Ok(Box::new(file))
     }
 
     fn list(&self, set: &SetHandle) -> Result<Vec<String>> {
-        let root = crate::local_root(set)?;
+        let _ = set;
+        let dir = match self.set_fd(false) {
+            Ok(dir) => dir,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(error),
+        };
         let mut found = Vec::new();
-        collect_files(&root, &root, &mut found)?;
+        collect_beneath(&dir, "", &mut found)?;
         found.sort();
         Ok(found)
     }
 
     fn delete(&self, set: &SetHandle, name: &str) -> Result<()> {
-        let path = self.resolve(set, name)?;
+        let _ = set;
+        let (_dir, path) = self.entry(name, false)?;
+        // `unlink` does not follow its final component.
         std::fs::remove_file(path).map_err(Error::Io)
     }
 
@@ -334,6 +395,62 @@ impl Destination for LocalDestination {
         names.sort();
         Ok(names)
     }
+}
+
+/// Every regular file below the pinned `dir`, entering subdirectories only
+/// through their own pinned descriptors, so a directory swapped for a symlink
+/// while the listing runs is refused rather than listed.
+fn collect_beneath(dir: &OwnedFd, prefix: &str, found: &mut Vec<String>) -> Result<()> {
+    let entries = std::fs::read_dir(lr_unsafe::beneath::self_path(dir)).map_err(Error::Io)?;
+    for entry in entries {
+        let entry = entry.map_err(Error::Io)?;
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let file_type = entry.file_type().map_err(Error::Io)?;
+        if file_type.is_dir() {
+            let sub = lr_unsafe::beneath::open_dir_beneath(dir, Path::new(&name))
+                .map_err(|error| refused(Path::new(&format!("{prefix}{name}")), &error))?;
+            collect_beneath(&sub, &format!("{prefix}{name}/"), found)?;
+        } else if file_type.is_file() {
+            found.push(format!("{prefix}{name}"));
+        }
+    }
+    Ok(())
+}
+
+/// Create the directory `name` in `dir` unless it exists; `mkdir` does not
+/// follow a symlink in its place, and opening it afterwards refuses one.
+fn mkdir_in(dir: &OwnedFd, name: &OsStr) -> Result<()> {
+    let path = lr_unsafe::beneath::entry_path(dir, name).map_err(Error::Io)?;
+    match std::fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(Error::Io(error)),
+    }
+}
+
+/// Open a file read-only, refusing a symlink.
+fn open_nofollow(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+}
+
+/// The error for a directory that is a symlink or otherwise unusable.
+fn refused(path: &Path, error: &std::io::Error) -> Error {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return Error::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{}: {error}", path.display()),
+        ));
+    }
+    Error::unsupported(format!(
+        "{} cannot be reached without following a symlink or is not a directory \
+         ({error}); refusing to use it",
+        path.display()
+    ))
 }
 
 fn collect_files(root: &Path, at: &Path, found: &mut Vec<String>) -> Result<()> {
@@ -412,19 +529,26 @@ mod tests {
         let set = destination.open_set(&set_id).expect("open set");
         let name = "chain-1/000-full-image.lrimg";
 
-        {
-            let mut writer = destination.create_tmp(&set, name).expect("tmp");
-            writer.write_all(b"image bytes").expect("write");
-            writer.sync_all().expect("fsync");
-        }
+        let mut tmp = destination.create_tmp(&set, name).expect("tmp");
+        tmp.writer.write_all(b"image bytes").expect("write");
+        tmp.writer.sync_all().expect("fsync");
+        drop(tmp.writer);
         assert!(
-            std::path::Path::new(&format!("{}/{name}{TMP_SUFFIX}", set.path)).exists(),
+            tmp.name.starts_with(name) && tmp.name.ends_with(TMP_SUFFIX),
+            "{}",
+            tmp.name
+        );
+        let tmp_path = format!("{}/{}", set.path, tmp.name);
+        assert!(
+            std::path::Path::new(&tmp_path).exists(),
             "the temporary file exists before finalize"
         );
 
-        destination.finalize(&set, name, name).expect("finalize");
+        destination
+            .finalize(&set, &tmp.name, name)
+            .expect("finalize");
         assert!(
-            !std::path::Path::new(&format!("{}/{name}{TMP_SUFFIX}", set.path)).exists(),
+            !std::path::Path::new(&tmp_path).exists(),
             "the temporary file is gone after finalize"
         );
         assert_eq!(
@@ -442,9 +566,11 @@ mod tests {
         let (destination, set_id) = destination(&dir);
         let set = destination.open_set(&set_id).expect("open set");
         for name in ["a/1.lrimg", "a/2.lrimg", "b/1.lrimg"] {
-            let mut writer = destination.create_tmp(&set, name).expect("tmp");
-            writer.write_all(b"x").expect("write");
-            destination.finalize(&set, name, name).expect("finalize");
+            let mut tmp = destination.create_tmp(&set, name).expect("tmp");
+            tmp.writer.write_all(b"x").expect("write");
+            destination
+                .finalize(&set, &tmp.name, name)
+                .expect("finalize");
         }
         assert_eq!(
             destination.list(&set).expect("list"),
@@ -457,10 +583,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let (destination, set_id) = destination(&dir);
         let set = destination.open_set(&set_id).expect("open set");
-        let mut writer = destination.create_tmp(&set, "a/1.lrimg").expect("tmp");
-        writer.write_all(b"x").expect("write");
+        let mut tmp = destination.create_tmp(&set, "a/1.lrimg").expect("tmp");
+        tmp.writer.write_all(b"x").expect("write");
         destination
-            .finalize(&set, "a/1.lrimg", "a/1.lrimg")
+            .finalize(&set, &tmp.name, "a/1.lrimg")
             .expect("finalize");
 
         destination.delete(&set, "a/1.lrimg").expect("delete");
@@ -495,6 +621,53 @@ mod tests {
         let (destination, set_id) = destination(&dir);
         let set = destination.open_set(&set_id).expect("open set");
         assert!(destination.finalize(&set, "nope", "nope").is_err());
+    }
+
+    /// A writer of the destination directory plants symlinks where the
+    /// root daemon will write, delete or look for its set (R07). Nothing
+    /// may follow them.
+    #[test]
+    fn planted_symlinks_are_never_followed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(outside.join("victim.lrimg"), b"SENTINEL").expect("sentinel");
+        let root = dir.path().join("dest");
+        std::fs::create_dir_all(&root).expect("root");
+
+        // A set directory that is a symlink is refused, not followed.
+        std::os::unix::fs::symlink(&outside, root.join("linked")).expect("set link");
+        let linked = LocalDestination::new(&root, "linked");
+        assert!(
+            linked
+                .open_set(&SetId::new(Id::from_bytes([1; 16])))
+                .is_err(),
+            "a symlinked set directory must be refused"
+        );
+
+        let destination = LocalDestination::new(&root, "laptop-root");
+        let set = destination
+            .open_set(&SetId::new(Id::from_bytes([1; 16])))
+            .expect("open set");
+        let set_dir = destination.set_dir();
+        // A chain directory that is a symlink is neither written through
+        // nor used for deleting.
+        std::os::unix::fs::symlink(&outside, set_dir.join("chain")).expect("chain link");
+        assert!(
+            destination.delete(&set, "chain/victim.lrimg").is_err(),
+            "a delete through a symlinked directory must be refused"
+        );
+        assert!(destination.open_ro(&set, "chain/victim.lrimg").is_err());
+        assert!(destination.list(&set).expect("list").is_empty());
+        assert_eq!(
+            std::fs::read(outside.join("victim.lrimg")).expect("sentinel"),
+            b"SENTINEL"
+        );
+        assert_eq!(
+            std::fs::read_dir(&outside).expect("outside").count(),
+            1,
+            "nothing is created outside the set"
+        );
     }
 
     fn owner(pid: u32) -> LockOwner {

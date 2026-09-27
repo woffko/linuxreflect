@@ -366,7 +366,10 @@ fn killing_the_server_mid_transfer_leaves_nothing_finalized() {
     let lock = destination
         .lock_set(&set, &lr_store::LockOwner::local(), Duration::from_secs(2))
         .expect("take the lock");
-    let mut writer = destination.create_tmp(&set, "big.lrimg").expect("tmp");
+    let mut writer = destination
+        .create_tmp(&set, "big.lrimg")
+        .expect("tmp")
+        .writer;
     let block = vec![0xABu8; 1024 * 1024];
     let mut write_error = None;
     for attempt in 0..64 {

@@ -247,11 +247,19 @@ pub fn write_catalog(
     use std::io::Write;
     let bytes = serde_json::to_vec_pretty(catalog)
         .map_err(|error| Error::corrupt(format!("catalog: {error}")))?;
-    let mut file = destination.create_tmp(set, CATALOG_FILE)?;
-    file.write_all(&bytes).map_err(Error::Io)?;
-    file.sync_all().map_err(Error::Io)?;
-    drop(file);
-    destination.finalize(set, CATALOG_FILE, CATALOG_FILE)
+    let mut tmp = destination.create_tmp(set, CATALOG_FILE)?;
+    let written = tmp
+        .writer
+        .write_all(&bytes)
+        .and_then(|()| tmp.writer.sync_all());
+    drop(tmp.writer);
+    let published = written
+        .map_err(Error::Io)
+        .and_then(|()| destination.finalize(set, &tmp.name, CATALOG_FILE));
+    if published.is_err() {
+        let _ = destination.delete(set, &tmp.name);
+    }
+    published
 }
 
 /// Load the catalog, validating it against the members' superblocks.
@@ -443,17 +451,36 @@ mod tests {
         // the fixed public key, so `None` is correct for them.
         let key = superblock.is_encrypted().then_some([0x5Au8; 32]);
         let bytes = superblock.encode(key.as_ref()).expect("encode");
-        let mut file = destination.create_tmp(set, name).expect("tmp");
-        file.write_all(&bytes).expect("write");
-        file.sync_all().expect("sync");
-        drop(file);
-        destination.finalize(set, name, name).expect("finalize");
+        let mut tmp = destination.create_tmp(set, name).expect("tmp");
+        tmp.writer.write_all(&bytes).expect("write");
+        tmp.writer.sync_all().expect("sync");
+        drop(tmp.writer);
+        destination
+            .finalize(set, &tmp.name, name)
+            .expect("finalize");
     }
 
     fn set(destination: &LocalDestination) -> lr_store::SetHandle {
         destination
             .open_set(&SetId::new(Id::from_bytes([0x77; 16])))
             .expect("open set")
+    }
+
+    /// A writer of the destination plants the predictable temporary name as
+    /// a symlink to a file the daemon may write (R07); the catalog update
+    /// must neither truncate nor write it.
+    #[test]
+    fn a_planted_catalog_tmp_symlink_is_not_followed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sentinel = dir.path().join("sentinel");
+        std::fs::write(&sentinel, b"SENTINEL").expect("sentinel");
+        let destination = LocalDestination::new(dir.path().join("dest"), "laptop-root");
+        let set = set(&destination);
+        std::os::unix::fs::symlink(&sentinel, destination.set_dir().join("catalog.json.tmp"))
+            .expect("plant");
+        let catalog = lr_core::catalog::Catalog::new(SetId::ZERO, "laptop-root", 1);
+        let _ = write_catalog(&destination, &set, &catalog);
+        assert_eq!(std::fs::read(&sentinel).expect("sentinel"), b"SENTINEL");
     }
 
     #[test]
@@ -552,14 +579,14 @@ mod tests {
         let destination = LocalDestination::new(dir.path(), "set");
         let set = set(&destination);
         use std::io::Write;
-        let mut file = destination
+        let mut tmp = destination
             .create_tmp(&set, "c/000-full-bad.lrimg")
             .expect("tmp");
-        file.write_all(&[0u8; 4096]).expect("write");
-        file.sync_all().expect("sync");
-        drop(file);
+        tmp.writer.write_all(&[0u8; 4096]).expect("write");
+        tmp.writer.sync_all().expect("sync");
+        drop(tmp.writer);
         destination
-            .finalize(&set, "c/000-full-bad.lrimg", "c/000-full-bad.lrimg")
+            .finalize(&set, &tmp.name, "c/000-full-bad.lrimg")
             .expect("finalize");
 
         let scan = scan_set(&destination, &set).expect("scan");

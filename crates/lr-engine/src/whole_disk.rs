@@ -298,7 +298,6 @@ pub fn backup_whole_disk(request: &crate::backup::BackupRequest) -> Result<Whole
     let mut guard = crate::backup::TempGuard::new(
         std::sync::Arc::clone(&destination),
         set.clone(),
-        image_name.clone(),
         spool_path.clone(),
     );
 
@@ -316,11 +315,13 @@ pub fn backup_whole_disk(request: &crate::backup::BackupRequest) -> Result<Whole
         compress: matches!(request.compression, Compression::Zstd { .. }),
     };
 
-    let mut image_writer = ImageWriter::create(
-        destination.create_tmp(&set, &image_name)?,
-        &superblock,
-        mac_key,
-    )?;
+    let tmp = destination.create_tmp(&set, &image_name)?;
+
+    let tmp_name = tmp.name.clone();
+
+    guard.track_tmp(tmp_name.clone());
+
+    let mut image_writer = ImageWriter::create(tmp.writer, &superblock, mac_key)?;
     let mut nonce_seq = NonceSeq::new();
     let mut reports: Vec<RegionReport> = Vec::new();
 
@@ -507,7 +508,7 @@ pub fn backup_whole_disk(request: &crate::backup::BackupRequest) -> Result<Whole
     writer.flush().map_err(Error::Io)?;
     let image_bytes = writer.seek(SeekFrom::End(0)).map_err(Error::Io)?;
     drop(writer);
-    destination.finalize(&set, &image_name, &image_name)?;
+    destination.finalize(&set, &tmp_name, &image_name)?;
     guard.disarm();
 
     Ok(WholeDiskReport {
