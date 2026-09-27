@@ -281,7 +281,12 @@ sudo linuxreflect schedule remove root-nightly
 ```
 
 `schedule set` writes `linuxreflect-job@<name>.service` and `.timer` and
-enables them. Each user's `linuxreflect-session` service turns job events into
+enables them; with `new_chain_on_calendar` it also writes
+`linuxreflect-newchain@<name>` units that start a new chain on that calendar.
+For an SFTP job, name a destination configured with `linuxreflect destination
+add` (`dest = "@nas"`) or a `[destinations.<name>]` table, so the job gets its
+key and `known_hosts`. The [operator guide](docs/operator-guide.md#scheduling)
+lists what every field does. Each user's `linuxreflect-session` service turns job events into
 desktop notifications (failures are critical and carry the error code).
 
 ## Rescue medium and bare-metal recovery
@@ -389,9 +394,12 @@ under 30 MiB of memory; bad sectors via `dm-flakey`; NFS and SMB shares that
 vanish mid-backup; polkit and socket activation; the rescue medium under
 Secure Boot; and create/restore/verify through the GUI on X11 and Wayland.
 
-More detail: the [specification](docs/spec/linuxreflect-spec-v2.1.md), the
-[decision log](docs/decisions.md), the [GUI design](docs/gui-redesign.md) and
-the [verification record](docs/gui-revision-audit.md).
+More detail: the [operator guide](docs/operator-guide.md) (what an image
+contains, chains and retention, restores, scheduling, running the daemon), the
+[specification](docs/spec/linuxreflect-spec-v2.1.md), the
+[decision log](docs/decisions.md), [memory budgets](docs/performance.md), the
+[GUI design](docs/gui-redesign.md) and the
+[verification record](docs/gui-revision-audit.md).
 
 ## License
 
