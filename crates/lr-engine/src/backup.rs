@@ -712,11 +712,18 @@ pub fn backup_block_with(
     let catalog_warning =
         crate::catalog::record_published(&*destination, &set, &request.set_name, &lock, now_unix());
 
+    let map_warning = if map.complete {
+        None
+    } else {
+        incomplete_map_warning(&fs_type, &request.source.display().to_string())
+    };
+
     Ok(BackupReport {
         warnings: durability
             .warning("the image")
             .into_iter()
             .chain(catalog_warning)
+            .chain(map_warning)
             .collect(),
         image_path: local_image_path(&set_root, &image_name),
         image_uri: request.image_uri(&image_name),
@@ -813,6 +820,29 @@ pub(crate) fn spool_location(
             Ok((PathBuf::new(), dir))
         }
     }
+}
+
+/// The warning for a known filesystem whose used-block map is incomplete.
+///
+/// Spec §F reads such a filesystem raw, which covers the whole device. What
+/// the filesystem keeps on another device, an xfs external log or realtime
+/// subvolume above all, is not on that device and so not in the image; the
+/// report says so instead of claiming a complete backup (D-124).
+#[must_use]
+pub fn incomplete_map_warning(fs_type: &str, what: &str) -> Option<String> {
+    if fs_type == lr_fsmap::RAW_FS_TYPE {
+        return None;
+    }
+    let reason = if fs_type == "xfs" {
+        " (it has an external log or a realtime subvolume)"
+    } else {
+        ""
+    };
+    Some(format!(
+        "the {fs_type} filesystem on {what} could not be mapped completely{reason}, so the \
+         whole device was read; anything the filesystem keeps on another device, such as an \
+         external log or a realtime subvolume, is not in this image"
+    ))
 }
 
 /// The parent chain of an incremental or differential member.

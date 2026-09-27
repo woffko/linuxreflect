@@ -326,6 +326,8 @@ pub fn backup_whole_disk(request: &crate::backup::BackupRequest) -> Result<Whole
     let mut reporter = request.context.clone().reporter(disk_size)?;
     reporter.phase("regions");
     let mut spool_file = crate::spool::scratch_file(&spool_dir)?;
+    // Filesystems whose map came back incomplete (D-124).
+    let mut map_warnings: Vec<String> = Vec::new();
     // Phase A: chunk records plus the spooled manifest.
     {
         let mut spool = BufWriter::new(&mut spool_file);
@@ -363,7 +365,8 @@ pub fn backup_whole_disk(request: &crate::backup::BackupRequest) -> Result<Whole
             }
             .write(&mut spool, false)?;
 
-            let (regions_of_source, map_backed) = region_source_map(&layout, region);
+            let (regions_of_source, map_backed, incomplete) = region_source_map(&layout, region);
+            map_warnings.extend(incomplete);
             if !map_backed && region.kind == RegionKind::PartitionFs {
                 tracing::warn!(
                     partition = region.index,
@@ -510,7 +513,11 @@ pub fn backup_whole_disk(request: &crate::backup::BackupRequest) -> Result<Whole
     guard.disarm();
 
     Ok(WholeDiskReport {
-        warnings: durability.warning("the image").into_iter().collect(),
+        warnings: durability
+            .warning("the image")
+            .into_iter()
+            .chain(map_warnings)
+            .collect(),
         image_path: crate::backup::local_image_path(&set_root, &image_name),
         image_uuid: request.image_uuid,
         disk_size_bytes: disk_size,
@@ -527,11 +534,12 @@ pub fn backup_whole_disk(request: &crate::backup::BackupRequest) -> Result<Whole
     })
 }
 
-/// The used-byte ranges of one region, and whether a real map was used.
+/// The used-byte ranges of one region, whether a real map was used, and the
+/// warning for a filesystem whose map came back incomplete (D-124).
 fn region_source_map(
     layout: &lr_core::SourceLayout,
     region: &RegionRecord,
-) -> (lr_fsmap::ExtentMap, bool) {
+) -> (lr_fsmap::ExtentMap, bool, Option<String>) {
     let start = region.start_lba * u64::from(layout.device_facts.logical_block_size);
     let end = start + region.size_bytes - 1;
     let whole = lr_fsmap::ExtentMap {
@@ -539,7 +547,7 @@ fn region_source_map(
         complete: false,
     };
     match region.kind {
-        RegionKind::Leading | RegionKind::PartitionRaw => (whole, false),
+        RegionKind::Leading | RegionKind::PartitionRaw => (whole, false, None),
         RegionKind::PartitionFs => {
             let partition = layout
                 .partitions
@@ -562,12 +570,21 @@ fn region_source_map(
                             complete: true,
                         },
                         true,
+                        None,
                     ),
-                    Ok(_) | Err(_) => (whole, false),
+                    Ok(_) => (
+                        whole,
+                        false,
+                        crate::backup::incomplete_map_warning(
+                            &fs_type,
+                            &format!("partition {}", region.index),
+                        ),
+                    ),
+                    Err(_) => (whole, false, None),
                 },
                 // An image file has no partition device nodes, so the map tools
                 // cannot be pointed at the partition (spec §F).
-                _ => (whole, false),
+                _ => (whole, false, None),
             }
         }
         RegionKind::Swap => (
@@ -576,6 +593,7 @@ fn region_source_map(
                 complete: true,
             },
             false,
+            None,
         ),
     }
 }

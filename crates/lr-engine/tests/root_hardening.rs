@@ -1295,3 +1295,52 @@ fn an_unaligned_tail_reads_without_direct_io() {
         4096
     );
 }
+
+/// An xfs filesystem with a realtime subvolume cannot be mapped completely:
+/// spec §F reads its data device raw, and the realtime subvolume, which
+/// holds file data on another device, is not in the image. The report must
+/// say so rather than look like a complete backup (D-124).
+#[test]
+#[ignore = "requires root, loop devices and xfsprogs"]
+fn an_xfs_realtime_subvolume_is_named_as_missing_from_the_image() {
+    if !root_tests_enabled() {
+        return;
+    }
+    if !have("mkfs.xfs") || !have("xfs_db") {
+        lr_testkit::unavailable!("xfsprogs missing");
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let Some(data) = LoopDevice::attach(dir.path(), "xfs-data.img", 320 * 1024 * 1024) else {
+        return;
+    };
+    let Some(realtime) = LoopDevice::attach(dir.path(), "xfs-rt.img", 64 * 1024 * 1024) else {
+        return;
+    };
+    if !run(
+        "mkfs.xfs",
+        &[
+            "-q",
+            "-f",
+            "-r",
+            &format!("rtdev={}", realtime.path().display()),
+            &data.path().display().to_string(),
+        ],
+    ) {
+        lr_testkit::fixture_failed!("mkfs.xfs with a realtime device failed");
+    }
+    let report = backup_image(&request(&data.path(), &dir.path().join("backups"))).expect("backup");
+    let lr_engine::ImageReport::Block(report) = &report else {
+        panic!("expected a block image, got {report:?}");
+    };
+    assert_eq!(report.fs_type, "xfs");
+    assert!(!report.map_complete, "the map cannot be complete");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("realtime subvolume")
+                && warning.contains("not in this image")),
+        "{:?}",
+        report.warnings
+    );
+}

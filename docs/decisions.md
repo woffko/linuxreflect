@@ -1639,3 +1639,23 @@ missing (R33). The specification does not say what a restore must do then.
 - **Not chosen: strict by default.** A normal user restoring their own backup
   of files owned by others, or a restore onto a FAT or network filesystem,
   would always fail, although the content is exactly what was asked for.
+
+## D-124 — An xfs external log or realtime subvolume is named as missing
+
+Spec §F maps xfs with `xfs_db` and says that a filesystem with an external
+log device or a realtime subvolume gets `complete=false` and a raw fallback:
+the data device is read whole. The log and the realtime subvolume live on
+other block devices, though, so they were not in the image, and the report
+said nothing beyond `map_complete: false`. For a realtime subvolume that is
+missing file data (A16).
+
+- **Kept: the raw fallback of the data device**, as the specification says;
+  such a filesystem is not refused.
+- **Reported:** a block or whole-disk backup of a known filesystem whose map
+  came back incomplete adds a warning that the whole device was read and that
+  anything the filesystem keeps on another device (an external log, a
+  realtime subvolume) is not in the image. For xfs the warning names those
+  two causes.
+- **Operator documentation** says to back up the log and realtime devices
+  separately, or to avoid those layouts for systems that must be restorable
+  from one image.

@@ -364,7 +364,9 @@ Release **`v0.1.0-beta.1`**.
 - **Operator documentation:**
   - Differential semantics, and that the whole chain must be kept (D-114).
   - Used-block images are not forensic copies.
-  - XFS with an external log or realtime device is refused.
+  - XFS with an external log or realtime device: spec §F reads the data
+    device raw; the log and the realtime subvolume are not in the image, and
+    the report says so (D-124).
 - **Scale:** profile million-file trees, large xattr sets and long chains,
   then set memory budgets.
 - **Fault injection** at read, sync, rename, lease renewal, snapshot timeout
@@ -484,3 +486,4 @@ P3 = cleanup.
 | A13 | P1 | `--parent latest` picks an arbitrary chain when two chains start in the same second (found while fixing R04, D-116) | 1.5 | ☑ |
 | A14 | P2 | Disks with 4096-byte logical blocks are misread: the GPT is looked for at byte 512, MBR and sysfs offsets count 512-byte units, and a whole-disk image of such a disk is refused (found in the beta.1 acceptance) | 3 | ☑ |
 | A15 | P2 | A failed catalog write after an image is published fails the backup, inviting a duplicate member (found by the fault-injection suite) | 4 | ☑ |
+| A16 | P1 | An xfs external log or realtime subvolume is missing from the image without a word (found writing the phase 4 operator documentation) | 4 | ☑ |
