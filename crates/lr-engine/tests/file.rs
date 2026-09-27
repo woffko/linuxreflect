@@ -706,3 +706,34 @@ fn a_file_that_keeps_changing_is_not_claimed_consistent() {
         report.warnings
     );
 }
+
+/// A file incremental verifies on its own and as a chain: its unchanged
+/// files reference the full's chunks, which its ancestry provides (R23).
+#[test]
+fn a_file_incremental_verifies_with_and_without_the_chain() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = dir.path().join("source");
+    let dest = dir.path().join("backups");
+    build_tree(&source);
+    let mut full = request(&source, &dest, "laptop-tree");
+    full.member_type = MemberType::Full;
+    backup_file(&full, &FileBackupOptions::default()).expect("full");
+    std::fs::write(source.join("etc/new.txt"), b"new\n").expect("change");
+    let mut incremental = request(&source, &dest, "laptop-tree");
+    incremental.member_type = MemberType::Incremental;
+    incremental.parent = Some("latest".to_owned());
+    let report = backup_file(&incremental, &FileBackupOptions::default()).expect("incremental");
+    assert!(report.unchanged_files > 0, "{report:?}");
+    for chain in [false, true] {
+        let verified = lr_engine::verify::verify_image(&lr_engine::verify::VerifyRequest {
+            image: report.image_path.display().to_string(),
+            encryption: Encryption::NoEncrypt,
+            chain,
+            destination_options: lr_store::DestinationOptions::default(),
+            context: lr_engine::progress::EngineContext::silent(),
+        })
+        .unwrap_or_else(|error| panic!("verify (chain: {chain}): {error}"));
+        assert!(verified.chunks > 0);
+        assert_eq!(verified.every_member, chain);
+    }
+}

@@ -307,7 +307,27 @@ impl ChainWalk {
     /// Returns [`Error::Corrupt`] when a manifest is short, a delta entry is
     /// out of order or out of range, or a member disagrees about the chunk
     /// count.
-    pub fn walk<F>(&mut self, mut visit: F) -> Result<()>
+    pub fn walk<F>(&mut self, visit: F) -> Result<()>
+    where
+        F: FnMut(u64, ChunkState, &mut ChunkAccess<'_>) -> Result<()>,
+    {
+        self.walk_with(false, visit)
+    }
+
+    /// Hand every payload each member stores itself to `visit`, member by
+    /// member, including payloads a later member superseded: each one is a
+    /// recovery point of its member (R22).
+    ///
+    /// # Errors
+    /// See [`ChainWalk::walk`].
+    pub fn walk_own_payloads<F>(&mut self, visit: F) -> Result<()>
+    where
+        F: FnMut(u64, ChunkState, &mut ChunkAccess<'_>) -> Result<()>,
+    {
+        self.walk_with(true, visit)
+    }
+
+    fn walk_with<F>(&mut self, own_payloads: bool, mut visit: F) -> Result<()>
     where
         F: FnMut(u64, ChunkState, &mut ChunkAccess<'_>) -> Result<()>,
     {
@@ -370,12 +390,26 @@ impl ChainWalk {
             max_plaintext,
         };
 
-        for index in 0..chunk_count {
-            let mut state = ChunkState::Unused;
-            for cursor in &mut cursors {
-                state = cursor.state_at(index, state)?;
+        if own_payloads {
+            // A member's own payloads carry its sequence number as their
+            // member index; the others are references to ancestors.
+            for (position, cursor) in cursors.iter_mut().enumerate() {
+                let own = u16::try_from(position).unwrap_or(u16::MAX);
+                for index in 0..chunk_count {
+                    let state = cursor.state_at(index, ChunkState::Unused)?;
+                    if matches!(state, ChunkState::Stored { member, .. } if member == own) {
+                        visit(index, state, &mut access)?;
+                    }
+                }
             }
-            visit(index, state, &mut access)?;
+        } else {
+            for index in 0..chunk_count {
+                let mut state = ChunkState::Unused;
+                for cursor in &mut cursors {
+                    state = cursor.state_at(index, state)?;
+                }
+                visit(index, state, &mut access)?;
+            }
         }
         for cursor in &cursors {
             if let Some(pending) = &cursor.pending {
@@ -964,6 +998,84 @@ mod tests {
             std::fs::read(&target).expect("target") == sentinel,
             "the target was written"
         );
+    }
+
+    /// A full plus an incremental that supersedes its only stored chunk, in
+    /// `<set>/chain/`, as `verify` reads an image URI.
+    fn superseding_chain(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        std::fs::create_dir(dir.join("chain")).expect("chain dir");
+        let full = dir.join("chain/000-full.lrimg");
+        let incr = dir.join("chain/001-incr.lrimg");
+        write_image(
+            &full,
+            &superblock(0, 0, 0xE1, false),
+            &[
+                Cell::Stored(b"SUPERSEDED-PAYLOAD"),
+                Cell::Stored(b"KEPT-PAYLOAD-OF-FULL"),
+                Cell::Zero,
+                Cell::Unused,
+            ],
+        );
+        write_image(
+            &incr,
+            &superblock(1, 0xE1, 0xE2, true),
+            &[
+                Cell::Stored(b"NEWER-PAYLOAD"),
+                Cell::Inherit,
+                Cell::Inherit,
+                Cell::Inherit,
+            ],
+        );
+        (full, incr)
+    }
+
+    fn verify(image: &Path, chain: bool) -> lr_core::Result<crate::verify::VerifyReport> {
+        crate::verify::verify_image(&crate::verify::VerifyRequest {
+            image: image.display().to_string(),
+            encryption: Encryption::NoEncrypt,
+            chain,
+            destination_options: lr_store::DestinationOptions::default(),
+            context: crate::progress::EngineContext::silent(),
+        })
+    }
+
+    /// Flip one byte of `needle` in the image file.
+    fn corrupt(image: &Path, needle: &[u8]) {
+        let mut bytes = std::fs::read(image).expect("image");
+        let at = bytes
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .expect("payload");
+        bytes[at] ^= 0xFF;
+        std::fs::write(image, bytes).expect("corrupt");
+    }
+
+    /// A non-full member verifies on its own: its ancestry is loaded for the
+    /// references it inherits (R23).
+    #[test]
+    fn a_single_incremental_verifies_with_its_ancestry() {
+        let dir = set_dir();
+        let (_full, incr) = superseding_chain(dir.path());
+        let report = verify(&incr, false).expect("an incremental is not corrupt");
+        assert!(report.chunks >= 2, "{report:?}");
+        verify(&incr, true).expect("the whole chain is intact");
+    }
+
+    /// A payload of an older member that a later member superseded is still
+    /// a recovery point; whole-chain verification reads it and names its
+    /// member when it is corrupt (R22).
+    #[test]
+    fn whole_chain_verification_reads_superseded_payloads() {
+        let dir = set_dir();
+        let (_full, incr) = superseding_chain(dir.path());
+        corrupt(
+            &dir.path().join("chain/000-full.lrimg"),
+            b"SUPERSEDED-PAYLOAD",
+        );
+        let error = verify(&incr, true).expect_err("the full's recovery point is broken");
+        assert!(error.to_string().contains("000-full.lrimg"), "{error}");
+        // The newest recovery point does not need that payload.
+        verify(&incr, false).expect("the incremental's own state is intact");
     }
 
     #[test]

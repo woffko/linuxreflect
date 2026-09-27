@@ -924,6 +924,14 @@ fn verify(
         return Ok(());
     }
     println!("verified:    {}", report.image_uri);
+    println!(
+        "scope:       {}",
+        if report.every_member {
+            "every recovery point of the chain (every payload of every member)"
+        } else {
+            "this image's recovery point (with the ancestry it references)"
+        }
+    );
     println!("kind:        {:?}", report.image_kind);
     println!("members:     {}", report.members);
     println!("pages:       {}", report.pages);

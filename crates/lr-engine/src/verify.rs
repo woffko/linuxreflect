@@ -63,6 +63,10 @@ pub struct VerifyReport {
     /// non-zero count means the image cannot be restored completely (R26).
     #[serde(default)]
     pub recorded_bad_chunks: u64,
+    /// Whether every recovery point of the chain was read (every payload of
+    /// every member), or only this image's own recovery point.
+    #[serde(default)]
+    pub every_member: bool,
 }
 
 impl VerifyReport {
@@ -105,22 +109,18 @@ pub fn verify_image(request: &VerifyRequest) -> Result<VerifyReport> {
 
     let target = crate::chain::read_superblock(&*destination, &set, &location.name)?;
 
-    // Which members to read: the whole ancestry, or just this image.
-    let chain = crate::chain::resolve_chain(&*destination, &set, &location.name)?;
-    let members: Vec<crate::chain::ChainMemberFile> = if request.chain {
-        chain
-    } else {
-        chain
-            .into_iter()
-            .filter(|member| member.file_name == location.name)
-            .collect()
-    };
-    if members.is_empty() {
+    // The image's whole ancestry is always opened: a non-full member's
+    // recovery point needs the payloads it inherits (R23). `--chain`
+    // additionally reads every payload every member stores, including
+    // superseded ones, which are recovery points of older members (R22).
+    let members = crate::chain::resolve_chain(&*destination, &set, &location.name)?;
+    if members.last().map(|member| member.file_name.as_str()) != Some(location.name.as_str()) {
         return Err(Error::corrupt(format!(
             "{} is not part of its own chain",
             location.name
         )));
     }
+    let every_member = request.chain;
 
     let mut reporter = request.context.clone().reporter(0)?;
     reporter.phase("structure");
@@ -133,6 +133,7 @@ pub fn verify_image(request: &VerifyRequest) -> Result<VerifyReport> {
         bytes_checked: 0,
         warnings: Vec::new(),
         recorded_bad_chunks: 0,
+        every_member: every_member || members.len() == 1,
     };
 
     // 1. Structure, MACs and page tags, member by member.
@@ -167,7 +168,7 @@ pub fn verify_image(request: &VerifyRequest) -> Result<VerifyReport> {
             verify_whole_disk(
                 &*destination,
                 &set,
-                &members[0].file_name,
+                &location.name,
                 &request.encryption,
                 &mut report,
             )?;
@@ -178,15 +179,23 @@ pub fn verify_image(request: &VerifyRequest) -> Result<VerifyReport> {
                 &set,
                 &members,
                 &request.encryption,
+                every_member,
                 &mut reporter,
                 &mut report,
             )?;
         }
         ImageKind::Stream => {
+            // Stream members carry their own payloads; one recovery point is
+            // its own member's streams.
+            let own = if every_member {
+                &members[..]
+            } else {
+                &members[members.len() - 1..]
+            };
             verify_stream(
                 &*destination,
                 &set,
-                &members,
+                own,
                 &request.encryption,
                 &mut reporter,
                 &mut report,
@@ -198,6 +207,7 @@ pub fn verify_image(request: &VerifyRequest) -> Result<VerifyReport> {
                 &set,
                 &members,
                 &request.encryption,
+                every_member,
                 &mut reporter,
                 &mut report,
             )?;
@@ -214,6 +224,7 @@ fn verify_block_chain(
     set: &SetHandle,
     members: &[crate::chain::ChainMemberFile],
     encryption: &Encryption,
+    every_member: bool,
     reporter: &mut crate::progress::Reporter,
     report: &mut VerifyReport,
 ) -> Result<()> {
@@ -258,7 +269,33 @@ fn verify_block_chain(
             .warnings
             .push(crate::plan::bad_sector_message(bad, first_bad));
     }
-    Ok(())
+    if !every_member {
+        return Ok(());
+    }
+    // Every payload every member stores, superseded ones included (R22).
+    walk.walk_own_payloads(|index, state, access| {
+        let ChunkState::Stored {
+            member,
+            offset,
+            stored_len,
+            ..
+        } = state
+        else {
+            return Ok(());
+        };
+        let member_name = members
+            .get(usize::from(member))
+            .map_or("?", |file| file.file_name.as_str());
+        let plaintext = access.read(&state).map_err(|error| {
+            Error::corrupt(format!(
+                "{member_name}: its own chunk {index} (offset {offset}, {stored_len} stored \
+                 bytes) failed: {error}"
+            ))
+        })?;
+        report.chunks += 1;
+        report.bytes_checked += plaintext.len() as u64;
+        Ok(())
+    })
 }
 
 /// Re-hash every chunk of every subvolume section of a stream image.
@@ -269,6 +306,7 @@ fn verify_file(
     set: &SetHandle,
     members: &[crate::chain::ChainMemberFile],
     encryption: &Encryption,
+    every_member: bool,
     reporter: &mut crate::progress::Reporter,
     report: &mut VerifyReport,
 ) -> Result<()> {
@@ -292,42 +330,54 @@ fn verify_file(
         }
     }
 
-    // Pass 2: every stored chunk is decoded and re-hashed; every reference in
-    // every tree must resolve, or a restore would fail later.
+    // Pass 2: every reference of every tree read must resolve, and every
+    // chunk it names is decoded and re-hashed. With every member, each tree
+    // is read and each member decodes the chunks it stores; for one recovery
+    // point, the newest tree is read and every chunk it references is decoded
+    // wherever in the ancestry it lives (R23).
     let mut restored_files = 0u64;
-    for (position, member) in opened.iter_mut().enumerate() {
-        reporter.phase(&format!("member {}", member.file_name));
-        let bytes = member.stream_bytes(StreamId::Manifest)?;
-        let records = lr_format::read_manifest(&bytes)?;
+    let last = opened.len().saturating_sub(1);
+    let trees: Vec<usize> = if every_member {
+        (0..opened.len()).collect()
+    } else {
+        vec![last]
+    };
+    for position in trees {
+        let (file_name, records) = {
+            let member = &mut opened[position];
+            let bytes = member.stream_bytes(StreamId::Manifest)?;
+            (member.file_name.clone(), lr_format::read_manifest(&bytes)?)
+        };
+        reporter.phase(&format!("member {file_name}"));
         for record in &records {
             restored_files += 1;
             for hash in &record.entry.chunk_refs_here {
                 let Some((owner, offset, _)) = index.get(hash) else {
                     return Err(Error::corrupt(format!(
-                        "{}: {} references a chunk no member of the chain stores",
-                        member.file_name,
+                        "{file_name}: {} references a chunk no member of the chain stores",
                         String::from_utf8_lossy(&record.entry.path)
                     )));
                 };
-                if *owner != position {
+                if every_member && *owner != position {
                     continue;
                 }
+                let holder = &mut opened[*owner];
                 let entry = BlockEntry::stored(
-                    u16::try_from(position).unwrap_or(u16::MAX),
+                    u16::try_from(*owner).unwrap_or(u16::MAX),
                     *hash,
                     *offset,
                     0,
                 )?;
                 let plaintext =
-                    member
+                    holder
                         .chunk_plaintext(&entry, MAX_STREAM_CHUNK)
                         .map_err(|error| {
                             Error::corrupt(format!(
                                 "{}: {} (offset {}, member {}) failed: {error}",
-                                member.file_name,
+                                holder.file_name,
                                 String::from_utf8_lossy(&record.entry.path),
                                 offset,
-                                member.superblock.image_uuid
+                                holder.superblock.image_uuid
                             ))
                         })?;
                 reporter.report(report.bytes_checked)?;
