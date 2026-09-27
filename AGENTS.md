@@ -96,8 +96,9 @@ boots to the GUI with its own daemon under SeaBIOS and Secure Boot, and
 `v0.1.0-alpha.1` is published as a GitHub pre-release. Phases 0 and 1 of
 `docs/remediation-plan.md` are complete (D-110..D-119) and `v0.1.0-alpha.2`
 is published. Phase 2 is complete as well (D-111..D-113, D-120..D-122) and
-`v0.1.0-beta.1` is published from `ab84a97`. Phase 3 is complete (D-114,
-D-123; A14..A16 were found and fixed on the way), and phase 4 added the
+`v0.1.0-beta.1` is published from `ab84a97` and `v0.1.0-beta.2` from
+`78ed1f4`: the remediation plan is complete. Phase 3 is complete (D-114,
+D-123, D-124; A14..A16 were found and fixed on the way), and phase 4 added the
 operator guide (`docs/operator-guide.md`), the permanent fault-injection suite
 (`crates/lr-engine/tests/fault_injection.rs`, lr-store's test-only
 `fault-injection` feature) and the scale profiles with memory budgets

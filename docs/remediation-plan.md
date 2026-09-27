@@ -95,6 +95,17 @@ tarball installs, polkit behaves as the policy says, `restore apply` raises
 GNOME Shell's administrator dialog (R32), and the rescue medium boots under
 SeaBIOS and Secure Boot. Its release notes list no P0 or P1 issue.
 
+**beta.2 done (2026-09-27).** `v0.1.0-beta.2` is published from `78ed1f4`
+with phases 3 and 4 complete: `cargo xtask ci` exits 0 (599 tests),
+`cargo xtask root` ran 67 scenarios with 67 passed, none unavailable and
+nothing left behind, and `cargo xtask scale` kept every profile within its
+budget. On the Ubuntu 22.04 GNOME host the tarball installs, all nine polkit
+actions behave as the policy says, the administrator dialog appears for
+`restore apply`, the installed daemon refuses another user's file (A4), and
+the rescue medium boots under SeaBIOS and Secure Boot. Every finding in the
+index is ticked (A13 to A16 were found and fixed on the way), and no release
+notes list a known P0 or P1 issue. **The goal is reached.**
+
 ## Ground rules
 
 1. **Test first.** Every finding gets a regression test that fails on the
