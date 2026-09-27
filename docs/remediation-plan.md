@@ -16,6 +16,7 @@ they land.
 ## Contents
 
 - [Goal: v0.1.0-alpha.2](#goal-v010-alpha2)
+- [Goal: v0.1.0-beta.1 / beta.2](#goal-v010-beta1--beta2)
 - [Ground rules](#ground-rules)
 - [Phase 0 — immediately](#phase-0--immediately)
 - [Phase 1 — data destruction, false guarantees, cryptography](#phase-1--data-destruction-false-guarantees-cryptography)
@@ -51,6 +52,40 @@ Stop only on a genuine blocker.
 passed, none unavailable and nothing left behind. The install and polkit check
 passed on the Ubuntu 22.04 GNOME host, and the rescue medium boots under
 SeaBIOS and Secure Boot. Phases 2 to 4 remain.
+
+## Goal: v0.1.0-beta.1 / beta.2
+
+Complete phases 2 to 4. Publish `v0.1.0-beta.1` after phase 2 and
+`v0.1.0-beta.2` after phases 3 and 4. Done when all hold:
+
+1. **Findings.** Every open finding is fixed: R07–R39 except R11 and R14,
+   and A4–A12. Each fix is its own commit with the finding's ID in the
+   message, and each has a regression test that fails before the fix. Where
+   the external review has a probe, the test is that probe with its
+   assertion inverted.
+2. **Decisions.** D-111 to D-114 are recorded in `docs/decisions.md` before
+   the behaviour they govern changes:
+   - D-111: how incrementals detect changes;
+   - D-112: nested Btrfs subvolumes;
+   - D-113: the daemon stop timeout;
+   - D-114: differential semantics.
+3. **Phase 2 → `v0.1.0-beta.1`.**
+   - Gate: `cargo xtask ci` exits 0, and `cargo xtask root` reports no
+     unavailable scenario and nothing left behind.
+   - On the Ubuntu test host: installation and the GNOME/polkit check, and
+     the rescue medium boots under SeaBIOS and under Secure Boot.
+   - A pre-release with artifacts and `SHA256SUMS`, and an updated Known
+     issues section.
+4. **Phases 3 and 4 → `v0.1.0-beta.2`.**
+   - Phase 3: the daemon boundary, metadata and scheduling.
+   - Phase 4: operator documentation, profiling of large trees with memory
+     budgets, a permanent fault-injection suite, and corrected stale
+     comments.
+   - The same gate, then `v0.1.0-beta.2` is published.
+5. **Result.** Every entry in the finding index is ticked, and no release
+   notes list a known P0 or P1 issue.
+
+Stop only on a genuine blocker.
 
 ## Ground rules
 
