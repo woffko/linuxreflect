@@ -339,6 +339,17 @@ fn an_sftp_destination_carries_a_chain() {
         other => panic!("expected a block image, got {other:?}"),
     };
     assert_eq!(report.seq_in_chain, 1);
+    // The second job replaced the catalog (R18): nothing is left aside.
+    let leftovers = std::process::Command::new("find")
+        .arg(&served)
+        .args(["-name", "*.tmp", "-o", "-name", "*.old"])
+        .output()
+        .expect("find");
+    assert!(
+        leftovers.stdout.is_empty(),
+        "left on the server: {}",
+        String::from_utf8_lossy(&leftovers.stdout)
+    );
 
     server.stop();
 }

@@ -22,9 +22,9 @@ use lr_core::{Error, Result, SetId};
 use russh::client::{self, Handle};
 use russh::keys::agent::client::AgentClient;
 use russh::keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate, load_secret_key};
-use russh_sftp::client::SftpSession;
 use russh_sftp::client::error::Error as SftpError;
-use russh_sftp::protocol::{OpenFlags, StatusCode};
+use russh_sftp::client::{RawSftpSession, SftpSession};
+use russh_sftp::protocol::{OpenFlags, Packet, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::runtime::Runtime;
 
@@ -144,7 +144,23 @@ struct Session {
     /// Keeps the SSH connection (and its channels) alive.
     _handle: Handle<ClientHandler>,
     sftp: Arc<SftpSession>,
+    /// A second SFTP channel for the `@openssh.com` extensions the high-level
+    /// session does not expose (`posix-rename`).
+    raw: Arc<RawSftpSession>,
+    /// Extensions the server announced, with their versions.
+    extensions: std::collections::HashMap<String, String>,
 }
+
+impl Session {
+    fn supports(&self, extension: &str) -> bool {
+        self.extensions
+            .get(extension)
+            .is_some_and(|version| version == "1")
+    }
+}
+
+/// The OpenSSH extension that renames over an existing file atomically.
+const POSIX_RENAME: &str = "posix-rename@openssh.com";
 
 /// Verifies the server key while the handshake runs.
 struct ClientHandler {
@@ -200,23 +216,56 @@ impl SftpDestination {
         Ok(destination)
     }
 
-    /// The current session, connecting and authenticating if needed.
-    fn session(&self) -> Result<Arc<SftpSession>> {
+    /// The current connection, connecting and authenticating if needed.
+    fn connection(&self) -> Result<Arc<Session>> {
         if let Some(session) = self
             .session
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
         {
-            return Ok(Arc::clone(&session.sftp));
+            return Ok(Arc::clone(session));
         }
-        let connected = self.runtime.block_on(connect_async(&self.config))?;
-        let sftp = Arc::clone(&connected.sftp);
+        let connected = Arc::new(self.runtime.block_on(connect_async(&self.config))?);
         *self
             .session
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(connected));
-        Ok(sftp)
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&connected));
+        Ok(connected)
+    }
+
+    /// The current SFTP session, connecting if needed.
+    fn session(&self) -> Result<Arc<SftpSession>> {
+        Ok(Arc::clone(&self.connection()?.sftp))
+    }
+
+    /// Forget the connection so the next operation reconnects.
+    fn drop_connection(&self) {
+        *self
+            .session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// One attempt of an operation that must not be blindly repeated; a
+    /// transient failure drops the connection for the next attempt.
+    fn once<T>(&self, operation: impl FnOnce(&Session) -> SftpFuture<T>) -> Result<T> {
+        let connection = self.connection()?;
+        let outcome = self.runtime.block_on(operation(&connection));
+        if let Err(error) = &outcome
+            && is_transient(error)
+        {
+            self.drop_connection();
+        }
+        outcome
+    }
+
+    fn retry() -> crate::publish::Retry {
+        crate::publish::Retry {
+            attempts: RETRY_ATTEMPTS,
+            delay: RETRY_BASE_DELAY,
+            max_delay: RETRY_MAX_DELAY,
+        }
     }
 
     /// Run one remote operation with bounded retries.
@@ -249,10 +298,7 @@ impl SftpDestination {
                     if !transient || attempt + 1 == RETRY_ATTEMPTS {
                         return Err(error);
                     }
-                    *self
-                        .session
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                    self.drop_connection();
                     std::thread::sleep(delay);
                     delay = (delay * 2).min(RETRY_MAX_DELAY);
                     last = Some(error);
@@ -344,9 +390,28 @@ async fn connect_async(config: &SftpConfig) -> Result<Session> {
         .await
         .map_err(|error| sftp_error("sftp session", error))?;
     sftp.set_timeout(OPERATION_TIMEOUT.as_secs());
+
+    let raw_channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|error| Error::NetworkTimeout(format!("opening a session: {error}")))?;
+    raw_channel
+        .request_subsystem(true, "sftp")
+        .await
+        .map_err(|error| {
+            Error::unsupported(format!("the server has no sftp subsystem: {error}"))
+        })?;
+    let raw = RawSftpSession::new(raw_channel.into_stream());
+    raw.set_timeout(OPERATION_TIMEOUT.as_secs());
+    let version = raw
+        .init()
+        .await
+        .map_err(|error| sftp_error("sftp session", error))?;
     Ok(Session {
         _handle: handle,
         sftp: Arc::new(sftp),
+        raw: Arc::new(raw),
+        extensions: version.extensions,
     })
 }
 
@@ -437,7 +502,7 @@ fn sftp_error(context: &str, error: SftpError) -> Error {
 }
 
 /// `true` when an error is worth retrying.
-fn is_transient(error: &Error) -> bool {
+pub(crate) fn is_transient(error: &Error) -> bool {
     match error {
         Error::NetworkTimeout(_) => true,
         Error::Io(io) => matches!(
@@ -500,7 +565,7 @@ impl std::io::Seek for SftpWriter {
 impl WriteSeekSync for SftpWriter {
     fn sync_all(&mut self) -> std::io::Result<()> {
         // OpenSSH servers support `fsync@openssh.com`; others answer
-        // pseudo-successfully, and the rename in `finalize` still orders the
+        // pseudo-successfully, and the rename in `publish_new` still orders the
         // data after the metadata that matters.
         self.runtime
             .block_on(self.file.sync_all())
@@ -636,30 +701,19 @@ impl Destination for SftpDestination {
         })
     }
 
-    fn finalize(&self, set: &SetHandle, tmp: &str, final_name: &str) -> Result<()> {
+    fn publish_new(&self, set: &SetHandle, tmp: &str, final_name: &str) -> Result<()> {
         let _ = set;
-        let from = self.path(tmp);
-        let to = self.path(final_name);
-        self.run("rename", |session| {
-            let (from, to) = (from.clone(), to.clone());
-            Box::pin(async move {
-                // OpenSSH's plain SSH_FXP_RENAME refuses to overwrite an
-                // existing file (only `posix-rename@openssh.com` does not), and
-                // the catalog is rewritten after every job, so the old copy is
-                // removed first. Image names carry a fresh UUID and never
-                // collide, so they keep the plain rename.
-                if session.try_exists(&to).await.unwrap_or(false) {
-                    session
-                        .remove_file(&to)
-                        .await
-                        .map_err(|error| sftp_error("replacing the target", error))?;
-                }
-                session
-                    .rename(&from, &to)
-                    .await
-                    .map_err(|error| sftp_error("rename", error))
-            })
-        })
+        crate::publish::publish_new_with(
+            self,
+            &self.path(tmp),
+            &self.path(final_name),
+            Self::retry(),
+        )
+    }
+
+    fn replace(&self, set: &SetHandle, tmp: &str, final_name: &str) -> Result<()> {
+        let _ = set;
+        crate::publish::replace_with(self, &self.path(tmp), &self.path(final_name), Self::retry())
     }
 
     fn open_ro(&self, set: &SetHandle, name: &str) -> Result<Box<dyn ReadSeek + Send>> {
@@ -902,6 +956,87 @@ impl SftpDestination {
             stop,
             thread,
         }
+    }
+}
+
+impl crate::publish::RemoteOps for SftpDestination {
+    fn size(&self, path: &str) -> Result<Option<u64>> {
+        let path = path.to_owned();
+        self.run("stat", |session| {
+            let path = path.clone();
+            Box::pin(async move {
+                match session.metadata(&path).await {
+                    Ok(metadata) => Ok(Some(metadata.size.unwrap_or(0))),
+                    Err(error) => match sftp_error("stat", error) {
+                        Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                        other => Err(other),
+                    },
+                }
+            })
+        })
+    }
+
+    fn rename(&self, from: &str, to: &str) -> Result<()> {
+        let (from, to) = (from.to_owned(), to.to_owned());
+        self.once(|connection| {
+            let sftp = Arc::clone(&connection.sftp);
+            Box::pin(async move {
+                // Plain SSH_FXP_RENAME refuses to replace an existing file.
+                sftp.rename(&from, &to)
+                    .await
+                    .map_err(|error| sftp_error("rename", error))
+            })
+        })
+    }
+
+    fn rename_over(&self, from: &str, to: &str) -> Result<bool> {
+        let (from, to) = (from.to_owned(), to.to_owned());
+        self.once(|connection| {
+            let supported = connection.supports(POSIX_RENAME);
+            let raw = Arc::clone(&connection.raw);
+            Box::pin(async move {
+                if !supported {
+                    return Ok(false);
+                }
+                posix_rename(&raw, &from, &to)
+                    .await
+                    .map(|()| true)
+                    .map_err(|error| sftp_error("posix-rename", error))
+            })
+        })
+    }
+
+    fn remove(&self, path: &str) -> Result<()> {
+        let path = path.to_owned();
+        self.run("delete", |session| {
+            let path = path.clone();
+            Box::pin(async move {
+                session
+                    .remove_file(&path)
+                    .await
+                    .map_err(|error| sftp_error("delete", error))
+            })
+        })
+    }
+}
+
+/// `posix-rename@openssh.com`: rename over an existing file atomically.
+async fn posix_rename(
+    raw: &RawSftpSession,
+    from: &str,
+    to: &str,
+) -> std::result::Result<(), SftpError> {
+    let mut data = Vec::with_capacity(8 + from.len() + to.len());
+    for text in [from, to] {
+        let length = u32::try_from(text.len())
+            .map_err(|_| SftpError::UnexpectedBehavior("path too long".to_owned()))?;
+        data.extend_from_slice(&length.to_be_bytes());
+        data.extend_from_slice(text.as_bytes());
+    }
+    match raw.extended(POSIX_RENAME, data).await? {
+        Packet::Status(status) if status.status_code == StatusCode::Ok => Ok(()),
+        Packet::Status(status) => Err(SftpError::Status(status)),
+        _ => Err(SftpError::UnexpectedPacket),
     }
 }
 

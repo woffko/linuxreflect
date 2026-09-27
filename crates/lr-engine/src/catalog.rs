@@ -235,7 +235,7 @@ pub fn read_cached(destination: &dyn Destination, set: &SetHandle) -> Result<Opt
     Ok(serde_json::from_slice(&bytes).ok())
 }
 
-/// Write the catalog atomically (`create_tmp` + `finalize`).
+/// Write the catalog atomically (`create_tmp` + `replace`).
 ///
 /// # Errors
 /// Propagates serialization and destination errors.
@@ -255,7 +255,7 @@ pub fn write_catalog(
     drop(tmp.writer);
     let published = written
         .map_err(Error::Io)
-        .and_then(|()| destination.finalize(set, &tmp.name, CATALOG_FILE));
+        .and_then(|()| destination.replace(set, &tmp.name, CATALOG_FILE));
     if published.is_err() {
         let _ = destination.delete(set, &tmp.name);
     }
@@ -456,7 +456,7 @@ mod tests {
         tmp.writer.sync_all().expect("sync");
         drop(tmp.writer);
         destination
-            .finalize(set, &tmp.name, name)
+            .publish_new(set, &tmp.name, name)
             .expect("finalize");
     }
 
@@ -586,8 +586,8 @@ mod tests {
         tmp.writer.sync_all().expect("sync");
         drop(tmp.writer);
         destination
-            .finalize(&set, &tmp.name, "c/000-full-bad.lrimg")
-            .expect("finalize");
+            .publish_new(&set, &tmp.name, "c/000-full-bad.lrimg")
+            .expect("publish");
 
         let scan = scan_set(&destination, &set).expect("scan");
         assert!(scan.members.is_empty());

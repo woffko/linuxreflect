@@ -9,6 +9,7 @@
 
 pub mod known_hosts;
 pub mod local;
+mod publish;
 pub mod sftp;
 pub mod uri;
 
@@ -104,7 +105,7 @@ impl LockRecord {
 ///
 /// Its name is unpredictable and the file was created exclusively, so a name
 /// planted in the destination beforehand, such as a symlink, is never
-/// followed or reused. Publish it with [`Destination::finalize`] or delete it
+/// followed or reused. Publish it with [`Destination::publish_new`] or [`Destination::replace`], or delete it
 /// with [`Destination::delete`], passing [`TempFile::name`].
 pub struct TempFile {
     /// Set-relative name of the temporary file.
@@ -300,12 +301,24 @@ pub trait Destination: Send + Sync {
     /// Propagates I/O errors.
     fn create_tmp(&self, set: &SetHandle, final_name: &str) -> Result<TempFile>;
 
-    /// Flush and rename the temporary file `tmp` (a [`TempFile::name`]) into
-    /// place as `final_name` (spec §L.1).
+    /// Publish the temporary file `tmp` (a [`TempFile::name`]) as the new,
+    /// immutable `final_name` (spec §L.1): flushed to stable storage, then
+    /// renamed into place.
+    ///
+    /// An existing `final_name` is never replaced or deleted. A retry after
+    /// a lost reply recognises the earlier success instead of repeating the
+    /// rename (R18).
+    ///
+    /// # Errors
+    /// Refuses an existing `final_name` and propagates I/O errors.
+    fn publish_new(&self, set: &SetHandle, tmp: &str, final_name: &str) -> Result<()>;
+
+    /// Replace the replaceable file `final_name` (the catalog) with the
+    /// temporary file `tmp`, as atomically as the destination allows.
     ///
     /// # Errors
     /// Propagates I/O errors.
-    fn finalize(&self, set: &SetHandle, tmp: &str, final_name: &str) -> Result<()>;
+    fn replace(&self, set: &SetHandle, tmp: &str, final_name: &str) -> Result<()>;
 
     /// Open an existing file read-only.
     ///

@@ -156,6 +156,47 @@ pub fn open_dir_readonly(path: &std::path::Path) -> io::Result<OwnedFd> {
     Ok(OwnedFd::from(file))
 }
 
+/// Rename `from` to `to` unless `to` already exists (`renameat2` with
+/// `RENAME_NOREPLACE`), so publishing a file can never replace another one.
+///
+/// Neither name is followed if it is a symlink. On a filesystem without
+/// `RENAME_NOREPLACE` (NFS, CIFS) this checks for `to` and then renames,
+/// which is only as exclusive as the caller's own lock.
+///
+/// # Errors
+/// Returns `AlreadyExists` when `to` exists, and other raw errors.
+pub fn rename_noreplace(from: &std::path::Path, to: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let cfrom = std::ffi::CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+    let cto = std::ffi::CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+    // SAFETY: both strings are NUL-terminated and outlive the call;
+    // `renameat2` only reads them.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            cfrom.as_ptr(),
+            libc::AT_FDCWD,
+            cto.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if !matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS)) {
+        return Err(error);
+    }
+    match std::fs::symlink_metadata(to) {
+        Ok(_) => Err(io::Error::from(io::ErrorKind::AlreadyExists)),
+        Err(missing) if missing.kind() == io::ErrorKind::NotFound => std::fs::rename(from, to),
+        Err(other) => Err(other),
+    }
+}
+
 /// Open a file with `O_DIRECT`, returning an error when unsupported.
 pub fn open_o_direct(path: &std::path::Path, write: bool) -> io::Result<OwnedFd> {
     use std::ffi::CString;
@@ -360,6 +401,21 @@ pub fn adopt_fd(fd: std::os::fd::RawFd) -> io::Result<OwnedFd> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rename_noreplace_never_replaces() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::fs::write(&a, b"new").expect("a");
+        std::fs::write(&b, b"published").expect("b");
+        let error = super::rename_noreplace(&a, &b).expect_err("b exists");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&b).expect("b"), b"published");
+        std::fs::remove_file(&b).expect("remove");
+        super::rename_noreplace(&a, &b).expect("rename");
+        assert_eq!(std::fs::read(&b).expect("b"), b"new");
+        assert!(!a.exists());
+    }
+
     use super::{BLKGETSIZE64, BLKSSZGET, FIFREEZE, FITHAW, ioc};
 
     #[test]

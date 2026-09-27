@@ -496,7 +496,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
     writer.flush().map_err(Error::Io)?;
     let image_bytes = writer.seek(std::io::SeekFrom::End(0)).map_err(Error::Io)?;
     drop(writer);
-    destination.finalize(&set, &tmp_name, &image_name)?;
+    destination.publish_new(&set, &tmp_name, &image_name)?;
     guard.disarm();
     // The walk pins a directory inside the snapshot; close it first so the
     // snapshot's private mount can be released.

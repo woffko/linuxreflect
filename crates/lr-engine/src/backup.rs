@@ -686,7 +686,7 @@ pub fn backup_block_with(
     writer.flush().map_err(Error::Io)?;
     let image_bytes = writer.seek(SeekFrom::End(0)).map_err(Error::Io)?;
     drop(writer);
-    destination.finalize(&set, &tmp_name, &image_name)?;
+    destination.publish_new(&set, &tmp_name, &image_name)?;
     guard.disarm();
 
     // 11. Catalog update, still under the lock (spec §D.3).

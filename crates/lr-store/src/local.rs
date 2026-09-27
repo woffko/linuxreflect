@@ -95,6 +95,34 @@ impl LocalDestination {
         Ok((dir, path))
     }
 
+    /// fsync `tmp`, rename it to `final_name` (replacing it only when
+    /// `replace`), then fsync the directory so the rename itself is durable
+    /// (spec §L.1: finalize = fsync + rename).
+    fn publish(&self, tmp: &str, final_name: &str, replace: bool) -> Result<()> {
+        let (_tmp_dir, tmp_path) = self.entry(tmp, false)?;
+        let (final_dir, final_path) = self.entry(final_name, true)?;
+        open_nofollow(&tmp_path)
+            .and_then(|file| file.sync_all())
+            .map_err(Error::Io)?;
+        // Neither rename follows a symlink at either name.
+        if replace {
+            std::fs::rename(&tmp_path, &final_path).map_err(Error::Io)?;
+        } else {
+            lr_unsafe::rename_noreplace(&tmp_path, &final_path).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    Error::unsupported(format!(
+                        "{final_name} already exists; a published image is never replaced"
+                    ))
+                } else {
+                    Error::Io(error)
+                }
+            })?;
+        }
+        File::open(lr_unsafe::beneath::self_path(&final_dir))
+            .and_then(|dir| dir.sync_all())
+            .map_err(Error::Io)
+    }
+
     /// Path of the set lock file.
     #[must_use]
     pub fn lock_path(&self) -> PathBuf {
@@ -323,21 +351,14 @@ impl Destination for LocalDestination {
         })
     }
 
-    fn finalize(&self, set: &SetHandle, tmp: &str, final_name: &str) -> Result<()> {
+    fn publish_new(&self, set: &SetHandle, tmp: &str, final_name: &str) -> Result<()> {
         let _ = set;
-        let (_tmp_dir, tmp_path) = self.entry(tmp, false)?;
-        let (final_dir, final_path) = self.entry(final_name, true)?;
-        // fsync the data before the rename, then fsync the directory so the
-        // rename itself is durable (spec §L.1: finalize = fsync + rename).
-        open_nofollow(&tmp_path)
-            .and_then(|file| file.sync_all())
-            .map_err(Error::Io)?;
-        // `rename` follows neither name, so a symlink planted at the final
-        // name is replaced, not written through.
-        std::fs::rename(&tmp_path, &final_path).map_err(Error::Io)?;
-        File::open(lr_unsafe::beneath::self_path(&final_dir))
-            .and_then(|dir| dir.sync_all())
-            .map_err(Error::Io)
+        self.publish(tmp, final_name, false)
+    }
+
+    fn replace(&self, set: &SetHandle, tmp: &str, final_name: &str) -> Result<()> {
+        let _ = set;
+        self.publish(tmp, final_name, true)
     }
 
     fn open_ro(&self, set: &SetHandle, name: &str) -> Result<Box<dyn ReadSeek + Send>> {
@@ -523,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn tmp_write_finalize_then_read_back() {
+    fn tmp_write_publish_then_read_back() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (destination, set_id) = destination(&dir);
         let set = destination.open_set(&set_id).expect("open set");
@@ -545,12 +566,19 @@ mod tests {
         );
 
         destination
-            .finalize(&set, &tmp.name, name)
-            .expect("finalize");
+            .publish_new(&set, &tmp.name, name)
+            .expect("publish");
         assert!(
             !std::path::Path::new(&tmp_path).exists(),
-            "the temporary file is gone after finalize"
+            "the temporary file is gone after publication"
         );
+        let mut again = destination.create_tmp(&set, name).expect("tmp");
+        again.writer.write_all(b"other bytes").expect("write");
+        let error = destination
+            .publish_new(&set, &again.name, name)
+            .expect_err("a published image is never replaced");
+        assert!(error.to_string().contains("never replaced"), "{error}");
+        destination.delete(&set, &again.name).expect("discard");
         assert_eq!(
             read_to_vec(&destination, &set, name).expect("read"),
             b"image bytes"
@@ -569,7 +597,7 @@ mod tests {
             let mut tmp = destination.create_tmp(&set, name).expect("tmp");
             tmp.writer.write_all(b"x").expect("write");
             destination
-                .finalize(&set, &tmp.name, name)
+                .publish_new(&set, &tmp.name, name)
                 .expect("finalize");
         }
         assert_eq!(
@@ -586,7 +614,7 @@ mod tests {
         let mut tmp = destination.create_tmp(&set, "a/1.lrimg").expect("tmp");
         tmp.writer.write_all(b"x").expect("write");
         destination
-            .finalize(&set, &tmp.name, "a/1.lrimg")
+            .publish_new(&set, &tmp.name, "a/1.lrimg")
             .expect("finalize");
 
         destination.delete(&set, "a/1.lrimg").expect("delete");
@@ -616,11 +644,11 @@ mod tests {
     }
 
     #[test]
-    fn finalizing_a_missing_tmp_fails() {
+    fn publishing_a_missing_tmp_fails() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (destination, set_id) = destination(&dir);
         let set = destination.open_set(&set_id).expect("open set");
-        assert!(destination.finalize(&set, "nope", "nope").is_err());
+        assert!(destination.publish_new(&set, "nope", "nope").is_err());
     }
 
     /// A writer of the destination directory plants symlinks where the

@@ -496,7 +496,7 @@ pub fn backup_whole_disk(request: &crate::backup::BackupRequest) -> Result<Whole
     writer.flush().map_err(Error::Io)?;
     let image_bytes = writer.seek(SeekFrom::End(0)).map_err(Error::Io)?;
     drop(writer);
-    destination.finalize(&set, &tmp_name, &image_name)?;
+    destination.publish_new(&set, &tmp_name, &image_name)?;
     guard.disarm();
 
     Ok(WholeDiskReport {
