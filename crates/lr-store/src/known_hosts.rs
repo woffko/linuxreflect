@@ -5,6 +5,12 @@
 //! format is OpenSSH's: `host[,host] keytype base64`, with `[host]:port` for
 //! non-default ports and `|1|salt|hash` (HMAC-SHA1) for hashed host names,
 //! which is what `HashKnownHosts yes` writes by default on Debian and Ubuntu.
+//!
+//! As in OpenSSH, a line applies to a host only through a positive pattern,
+//! and a matching `!pattern` excludes the host from that line. A key on a
+//! matching `@revoked` line is refused wherever the line stands, a
+//! `@cert-authority` line trusts no plain key (certificates are not
+//! supported), and any other marker makes the file unusable (R13).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -14,9 +20,23 @@ use hmac::{Hmac, Mac};
 use lr_core::{Error, Result};
 use sha1::Sha1;
 
+/// What a line's leading `@` marker says about its key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Marker {
+    /// No marker: the key is trusted for the hosts.
+    None,
+    /// `@revoked`: the key must never be accepted for the hosts.
+    Revoked,
+    /// `@cert-authority`: the key signs host certificates, which are not
+    /// supported, so it trusts nothing here.
+    CertAuthority,
+}
+
 /// One usable `known_hosts` line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
+    /// The line's marker.
+    pub marker: Marker,
     /// Host patterns, or one hashed pattern (`|1|salt|hash`).
     pub hosts: BTreeSet<String>,
     /// Key algorithm name, e.g. `ssh-ed25519`.
@@ -76,7 +96,7 @@ impl HostKeyVerifier {
             })?,
         };
         let entries = match std::fs::read_to_string(&path) {
-            Ok(text) => parse(&text),
+            Ok(text) => parse(&text)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(Error::Io(error)),
         };
@@ -88,15 +108,29 @@ impl HostKeyVerifier {
         })
     }
 
-    /// `true` when this key may be trusted for the server.
+    /// `true` when this key may be trusted for the server: a line without a
+    /// marker lists it for the host, and no `@revoked` line does.
     #[must_use]
     pub fn verify(&self, algorithm: &str, blob: &str) -> bool {
         if self.insecure {
             return true;
         }
-        self.entries
+        let mut trusted = false;
+        for entry in self
+            .entries
             .iter()
-            .any(|entry| entry.matches(&self.host, self.port, algorithm, blob))
+            .filter(|entry| entry.matches(&self.host, self.port, algorithm, blob))
+        {
+            match entry.marker {
+                Marker::Revoked => {
+                    tracing::error!(host = %self.host, "the server key is revoked in known_hosts");
+                    return false;
+                }
+                Marker::None => trusted = true,
+                Marker::CertAuthority => {}
+            }
+        }
+        trusted
     }
 
     /// The file this verifier was built from, for diagnostics.
@@ -120,17 +154,22 @@ impl Entry {
                 .iter()
                 .any(|pattern| hashed_matches(pattern, host, port));
         }
-        self.hosts
-            .iter()
-            .any(|pattern| plain_matches(pattern, host, port))
+        // A negated pattern that matches excludes the host; otherwise the
+        // host needs a positive pattern (OpenSSH `match_hostname`).
+        let mut positive = false;
+        for pattern in &self.hosts {
+            match pattern.strip_prefix('!') {
+                Some(negated) if plain_matches(negated, host, port) => return false,
+                Some(_) => {}
+                None => positive |= plain_matches(pattern, host, port),
+            }
+        }
+        positive
     }
 }
 
-/// Match `host` or `[host]:port` patterns, including a leading `!` negation.
+/// Match a `host` or `[host]:port` pattern.
 fn plain_matches(pattern: &str, host: &str, port: u16) -> bool {
-    if let Some(negated) = pattern.strip_prefix('!') {
-        return !plain_matches(negated, host, port);
-    }
     if let Some(inner) = pattern.strip_prefix('[').and_then(|p| p.split_once(']')) {
         let (name, rest) = inner;
         let pattern_port = rest.strip_prefix(':').and_then(|p| p.parse().ok());
@@ -177,16 +216,34 @@ fn default_known_hosts() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".ssh/known_hosts"))
 }
 
-/// Parse a `known_hosts` file, ignoring comments and unusable lines.
-#[must_use]
-pub fn parse(text: &str) -> Vec<Entry> {
+/// Parse a `known_hosts` file, ignoring comments and lines without a key.
+///
+/// # Errors
+/// Returns [`Error::Unsupported`] for a marker other than `@revoked` and
+/// `@cert-authority`: a line whose meaning is unknown must not be skipped,
+/// because it might have been meant to revoke a key.
+pub fn parse(text: &str) -> Result<Vec<Entry>> {
     let mut entries = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with('@') {
-            // `@cert-authority` and `@revoked` need policy decisions that this
-            // MVP does not make; the line is ignored rather than half-applied.
+    for (number, line) in text.lines().enumerate() {
+        let mut line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
             continue;
+        }
+        let mut marker = Marker::None;
+        if line.starts_with('@') {
+            let (word, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+            marker = match word {
+                "@revoked" => Marker::Revoked,
+                "@cert-authority" => Marker::CertAuthority,
+                other => {
+                    return Err(Error::unsupported(format!(
+                        "known_hosts line {} has the unknown marker {other}; refusing to \
+                         guess what it means",
+                        number + 1
+                    )));
+                }
+            };
+            line = rest.trim_start();
         }
         let mut fields = line.split_whitespace();
         let (Some(hosts), Some(algorithm), Some(blob)) =
@@ -195,12 +252,13 @@ pub fn parse(text: &str) -> Vec<Entry> {
             continue;
         };
         entries.push(Entry {
+            marker,
             hosts: hosts.split(',').map(str::to_owned).collect(),
             algorithm: algorithm.to_owned(),
             blob: blob.to_owned(),
         });
     }
-    entries
+    Ok(entries)
 }
 
 /// Minimal base64 (standard alphabet, padding optional) for `known_hosts`.
@@ -254,7 +312,7 @@ mod tests {
     const OTHER: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIDifferentKeyBlobForTheSameServer1111";
 
     fn verifier(text: &str, host: &str, port: u16) -> HostKeyVerifier {
-        let entries = parse(text);
+        let entries = parse(text).expect("parse");
         HostKeyVerifier {
             entries,
             host: host.to_owned(),
@@ -311,9 +369,55 @@ mod tests {
     }
 
     #[test]
-    fn comments_and_directives_are_skipped() {
-        let entries = parse("# comment\n@revoked nas.local ssh-ed25519 AAA\n\n");
+    fn comments_are_skipped() {
+        let entries = parse("# comment\n\n").expect("parse");
         assert!(entries.is_empty());
+    }
+
+    /// A line matches only through a positive pattern, and a matching
+    /// negated pattern excludes the host whatever else the line says (R13).
+    #[test]
+    fn negations_exclude_and_never_include() {
+        let text = format!("!evil.local,*.local ssh-ed25519 {ED25519}\n");
+        assert!(verifier(&text, "nas.local", 22).verify("ssh-ed25519", ED25519));
+        assert!(
+            !verifier(&text, "evil.local", 22).verify("ssh-ed25519", ED25519),
+            "a negated host is excluded although *.local matches it"
+        );
+        let only_negated = format!("!evil.local ssh-ed25519 {ED25519}\n");
+        assert!(
+            !verifier(&only_negated, "nas.local", 22).verify("ssh-ed25519", ED25519),
+            "a line without a positive match trusts nobody"
+        );
+    }
+
+    /// A revoked key is refused wherever its line stands (R13).
+    #[test]
+    fn a_revoked_key_is_refused_in_any_order() {
+        for text in [
+            format!("nas.local ssh-ed25519 {ED25519}\n@revoked nas.local ssh-ed25519 {ED25519}\n"),
+            format!("@revoked nas.local ssh-ed25519 {ED25519}\nnas.local ssh-ed25519 {ED25519}\n"),
+            format!("@revoked * ssh-ed25519 {ED25519}\nnas.local ssh-ed25519 {ED25519}\n"),
+        ] {
+            assert!(
+                !verifier(&text, "nas.local", 22).verify("ssh-ed25519", ED25519),
+                "{text}"
+            );
+        }
+        let other_revoked =
+            format!("@revoked nas.local ssh-ed25519 {OTHER}\nnas.local ssh-ed25519 {ED25519}\n");
+        assert!(verifier(&other_revoked, "nas.local", 22).verify("ssh-ed25519", ED25519));
+    }
+
+    /// A certificate authority line does not trust a plain key, and an
+    /// unknown marker makes the file unusable instead of being skipped (R13).
+    #[test]
+    fn markers_fail_closed() {
+        let authority = format!("@cert-authority *.local ssh-ed25519 {ED25519}\n");
+        assert!(!verifier(&authority, "nas.local", 22).verify("ssh-ed25519", ED25519));
+        let unknown = format!("@trusted nas.local ssh-ed25519 {ED25519}\n");
+        let error = parse(&unknown).expect_err("an unknown marker is refused");
+        assert!(error.to_string().contains("@trusted"), "{error}");
     }
 
     #[test]
