@@ -86,6 +86,20 @@ pub fn pwrite_all(fd: &OwnedFd, buf: &AlignedBuf, len: usize, offset: u64) -> io
     Ok(())
 }
 
+/// `syncfs(2)`: write back the whole filesystem that holds `fd`, data and
+/// metadata, and report a writeback error that happened since `fd` was
+/// opened.
+///
+/// # Errors
+/// Propagates `syncfs(2)` failures, such as `EIO` from failed writeback.
+pub fn syncfs(fd: &OwnedFd) -> io::Result<()> {
+    // SAFETY: `syncfs` only inspects the descriptor.
+    if unsafe { libc::syncfs(fd.as_raw_fd()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// `fsync(2)` a descriptor.
 ///
 /// # Errors

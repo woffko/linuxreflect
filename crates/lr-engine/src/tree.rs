@@ -522,6 +522,16 @@ impl RestoreRoot {
         })
     }
 
+    /// Write the restored files and directories to stable storage: the
+    /// barrier before a restore reports success (R34).
+    ///
+    /// # Errors
+    /// Returns [`Error::Io`] when writeback failed, for example `EIO` from
+    /// the device.
+    pub fn sync_filesystem(&self) -> Result<()> {
+        lr_unsafe::syncfs(&self.fd).map_err(Error::Io)
+    }
+
     /// The entry `relative`; its parent directories must already exist.
     fn entry(&self, relative: &Path) -> Result<Entry> {
         let (parent, name) = split_parent(relative)?;

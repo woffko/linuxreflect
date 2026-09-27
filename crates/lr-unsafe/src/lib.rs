@@ -19,7 +19,7 @@ pub mod directio;
 pub mod filemeta;
 
 pub use aligned::AlignedBuf;
-pub use directio::{fsync, pread_into, pwrite_all};
+pub use directio::{fsync, pread_into, pwrite_all, syncfs};
 
 use std::fs::File;
 use std::io;

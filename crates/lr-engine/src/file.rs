@@ -1086,6 +1086,13 @@ pub fn restore_file(request: &FileRestoreRequest) -> Result<FileRestoreReport> {
         }
         warnings.push(format!("metadata not restored: {summary}"));
     }
+    // Nothing is reported as restored before it is on stable storage (R34).
+    root.sync_filesystem().map_err(|error| {
+        Error::corrupt(format!(
+            "the files were written to {}, but they did not reach stable storage: {error}",
+            request.target.display()
+        ))
+    })?;
 
     Ok(FileRestoreReport {
         target: request.target.clone(),

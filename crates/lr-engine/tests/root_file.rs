@@ -338,3 +338,130 @@ fn a_btrfs_source_is_snapshotted_for_point_in_time() {
 
     cleanup(&source);
 }
+
+/// A file restore reports success only once its files are on stable
+/// storage. Here the target filesystem (ext4 without a journal, so nothing
+/// is written before writeback) sits on a device whose writes all fail: the
+/// restore's writes
+/// land in the page cache, and the barrier before the report must surface
+/// the writeback error instead of reporting success (R34).
+#[test]
+#[ignore = "requires root, loop devices and dm-flakey"]
+fn a_restore_whose_writes_never_reach_the_disk_fails() {
+    if !root_tests_enabled() {
+        return;
+    }
+    for tool in ["dmsetup", "mkfs.ext4", "losetup", "mount", "umount"] {
+        if !have(tool) {
+            lr_testkit::unavailable!("{tool} missing");
+        }
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = dir.path().join("source");
+    std::fs::create_dir_all(source.join("sub")).expect("dirs");
+    for index in 0..8u8 {
+        std::fs::write(
+            source.join(format!("sub/file{index}")),
+            vec![index; 256 * 1024],
+        )
+        .expect("file");
+    }
+    let report = backup_file(
+        &BackupRequest::new(
+            &source,
+            dir.path().join("backups"),
+            "durable",
+            Encryption::NoEncrypt,
+        )
+        .expect("request"),
+        &FileBackupOptions::default(),
+    )
+    .expect("backup");
+
+    const SIZE: u64 = 64 * 1024 * 1024;
+    let backing = dir.path().join("target.img");
+    std::fs::File::create(&backing)
+        .and_then(|file| file.set_len(SIZE))
+        .expect("backing");
+    let attached = Command::new("losetup")
+        .args(["-f", "--show"])
+        .arg(&backing)
+        .output()
+        .expect("losetup");
+    if !attached.status.success() {
+        lr_testkit::fixture_failed!("losetup could not attach the backing file");
+    }
+    let loop_device = String::from_utf8_lossy(&attached.stdout).trim().to_owned();
+    let name = format!("lr-writeback-{}", std::process::id());
+    let sectors = SIZE / 512;
+    let node = format!("/dev/mapper/{name}");
+    let mountpoint = dir.path().join("mnt");
+    std::fs::create_dir_all(&mountpoint).expect("mountpoint");
+    let cleanup = || {
+        let _ = run("umount", &[&mountpoint.display().to_string()]);
+        let _ = run("dmsetup", &["remove", &name]);
+        let _ = run("losetup", &["-d", &loop_device]);
+    };
+    let table = |target: &str| format!("0 {sectors} {target}");
+    if !run(
+        "dmsetup",
+        &[
+            "create",
+            &name,
+            "--table",
+            &table(&format!("linear {loop_device} 0")),
+        ],
+    ) {
+        cleanup();
+        lr_testkit::unavailable!("device-mapper is unavailable");
+    }
+    for _ in 0..20 {
+        if Path::new(&node).exists() {
+            break;
+        }
+        let _ = run("dmsetup", &["mknodes", &name]);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if !run("mkfs.ext4", &["-q", "-F", "-O", "^has_journal", &node])
+        || !run("mount", &[&node, &mountpoint.display().to_string()])
+    {
+        cleanup();
+        lr_testkit::fixture_failed!("the ext4 target could not be created or mounted");
+    }
+    let target = mountpoint.join("restored");
+    std::fs::create_dir_all(&target).expect("target");
+    let _ = run("sync", &[]);
+    // From now on every write to the device fails (up interval 0: always
+    // down), while reads still work. --nolockfs: freezing would make the
+    // thaw write the superblock through the failing table.
+    let flakey = table(&format!("flakey {loop_device} 0 0 1 1 error_writes"));
+    let switched = run("dmsetup", &["suspend", "--nolockfs", &name])
+        && run("dmsetup", &["load", &name, "--table", &flakey])
+        && run("dmsetup", &["resume", &name]);
+    if !switched {
+        let _ = run("dmsetup", &["resume", &name]);
+        cleanup();
+        lr_testkit::unavailable!("dm-flakey is unavailable");
+    }
+
+    let outcome = prepare_restore(&PrepareRequest::from_path(
+        &report.image_path,
+        &target,
+        Encryption::NoEncrypt,
+    ))
+    .and_then(|plan| {
+        apply_restore(&ApplyRequest {
+            token: plan.token,
+            confirm: true,
+            accept_inconsistent: true,
+            encryption: Encryption::NoEncrypt,
+            context: lr_engine::progress::EngineContext::silent(),
+        })
+    });
+    cleanup();
+    let error = outcome.expect_err("a restore that never reached the disk must fail");
+    assert!(
+        format!("{error}").contains("did not reach stable storage"),
+        "{error}"
+    );
+}
