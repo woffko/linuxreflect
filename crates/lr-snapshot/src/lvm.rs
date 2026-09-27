@@ -380,6 +380,21 @@ struct Monitor {
     stop: Arc<AtomicBool>,
     overflow: Arc<AtomicBool>,
     handle: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
+    /// The LV whose usage is watched, and whether it is a thin pool.
+    target: Option<String>,
+    thin: bool,
+}
+
+/// Current usage of the watched LV, in percent.
+fn usage_of(target: &str, thin: bool) -> Option<f64> {
+    let fields = if thin {
+        "data_percent,metadata_percent"
+    } else {
+        "snap_percent"
+    };
+    lvm_field("lvs", fields, target)
+        .ok()
+        .and_then(|text| max_percent(&text))
 }
 
 impl Monitor {
@@ -397,6 +412,8 @@ impl Monitor {
             stop: Arc::clone(&stop),
             overflow: Arc::clone(&overflow),
             handle: Arc::new(std::sync::Mutex::new(None)),
+            target: target.clone(),
+            thin,
         };
         let Some(target) = target else {
             // Without a pool LV there is nothing to watch; the job is still
@@ -414,15 +431,7 @@ impl Monitor {
                         }
                         std::thread::sleep(Duration::from_millis(100));
                     }
-                    let usage = if thin {
-                        lvm_field("lvs", "data_percent,metadata_percent", &target)
-                            .ok()
-                            .and_then(|text| max_percent(&text))
-                    } else {
-                        lvm_field("lvs", "snap_percent", &target)
-                            .ok()
-                            .and_then(|text| max_percent(&text))
-                    };
+                    let usage = usage_of(&target, thin);
                     if usage.is_some_and(|value| value >= OVERFLOW_PERCENT) {
                         overflow.store(true, Ordering::SeqCst);
                         tracing::error!(
@@ -453,6 +462,18 @@ impl Monitor {
 impl SnapshotHealth for Monitor {
     fn check(&self) -> Result<()> {
         if self.overflow.load(Ordering::SeqCst) {
+            return Err(Error::SnapshotOverflow);
+        }
+        Ok(())
+    }
+
+    /// Measure now instead of trusting the last periodic sample (R29).
+    fn check_final(&self) -> Result<()> {
+        self.check()?;
+        if let Some(target) = &self.target
+            && usage_of(target, self.thin).is_some_and(|value| value >= OVERFLOW_PERCENT)
+        {
+            self.overflow.store(true, Ordering::SeqCst);
             return Err(Error::SnapshotOverflow);
         }
         Ok(())

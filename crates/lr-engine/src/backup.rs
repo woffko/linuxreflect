@@ -638,6 +638,14 @@ pub fn backup_block_with(
         counts
     };
 
+    // Every read is done. The snapshot must still be healthy, or the last
+    // read may have run past its deadline (R29); then it is released at
+    // once instead of being held through the manifest and publication.
+    snapshot.check_final_health()?;
+    let consistency = snapshot.consistency;
+    drop(source);
+    drop(snapshot);
+
     reporter.phase("manifest");
     // 8. Phase B: copy the spooled manifest into the page stream.
     {
@@ -680,7 +688,7 @@ pub fn backup_block_with(
         let metadata = format!(
             "source={}\nconsistency={}\nfs_type={fs_type}\nkind={}\nseq={seq_in_chain}\n",
             request.source.display(),
-            snapshot.consistency,
+            consistency,
             request.member_type.file_tag()
         );
         write_extras_record(&mut extras, EXTRAS_IMAGE_METADATA, metadata.as_bytes())?;
@@ -710,7 +718,7 @@ pub fn backup_block_with(
         image_uri: request.image_uri(&image_name),
         image_uuid: request.image_uuid,
         chain_id,
-        consistency: snapshot.consistency,
+        consistency,
         source_size_bytes: device_size,
         chunk_size: request.chunk_size,
         total_chunks: chunk_count,
@@ -963,6 +971,9 @@ fn store_chunk(
     snapshot.check_health()?;
     match read_chunk(source, chunk, buffer) {
         Ok(bytes) => {
+            // The read may have outlived the snapshot: its bytes count only
+            // if the snapshot is still healthy now (R29).
+            snapshot.check_health()?;
             if is_all_zero(bytes) {
                 return Ok(if matches!(parent, ChunkState::Zero) {
                     SourceState::Unchanged

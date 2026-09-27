@@ -39,6 +39,15 @@ pub trait SnapshotHealth: Send + Sync {
     /// Returns [`lr_core::Error::SnapshotOverflow`] or
     /// [`lr_core::Error::FreezeTimeout`] when the job must abort.
     fn check(&self) -> Result<()>;
+
+    /// The check after the last read, before the image is accepted (R29):
+    /// a provider whose monitor samples periodically measures now.
+    ///
+    /// # Errors
+    /// See [`SnapshotHealth::check`].
+    fn check_final(&self) -> Result<()> {
+        self.check()
+    }
 }
 
 /// A block-level snapshot or quiesced read of a source.
@@ -90,6 +99,18 @@ impl BlockSnapshot {
     pub fn check_health(&self) -> Result<()> {
         match &self.health {
             Some(health) => health.check(),
+            None => Ok(()),
+        }
+    }
+
+    /// The health check after the last read (see
+    /// [`SnapshotHealth::check_final`]).
+    ///
+    /// # Errors
+    /// See [`BlockSnapshot::check_health`].
+    pub fn check_final_health(&self) -> Result<()> {
+        match &self.health {
+            Some(health) => health.check_final(),
             None => Ok(()),
         }
     }
