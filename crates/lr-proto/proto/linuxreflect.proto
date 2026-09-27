@@ -178,6 +178,10 @@ message RetentionSpec {
   string set = 2;
   uint32 keep_chains = 3;
   bool dry_run = 4;
+  // Verify every payload of the chains to keep before deleting (R20).
+  bool verify_first = 5;
+  // Passphrase file for verifying encrypted chains.
+  string passphrase_file = 6;
 }
 
 message ExportSpec {

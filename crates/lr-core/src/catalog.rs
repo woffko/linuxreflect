@@ -49,6 +49,11 @@ pub struct MemberRecord {
     pub size_bytes: u64,
     /// File name inside the set directory.
     pub file_name: String,
+    /// When a whole-chain verification last read every payload of this
+    /// member, seconds since the epoch (R20). Cache-only: a rebuilt catalog
+    /// has none, which only makes retention more careful.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_unix: Option<u64>,
 }
 
 /// One chain: a full plus its incrementals/differentials.
@@ -193,6 +198,7 @@ mod tests {
             source_label: "/dev/sda1".to_owned(),
             size_bytes: 1024,
             file_name: format!("{seq}-full.lrimg"),
+            verified_unix: None,
         }
     }
 

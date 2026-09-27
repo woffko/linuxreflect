@@ -208,12 +208,18 @@ impl Client {
         set: &str,
         keep_chains: u32,
         dry_run: bool,
+        verify_first: bool,
+        passphrase_file: Option<&std::path::Path>,
     ) -> anyhow::Result<String> {
         let request = lr_proto::v1::RetentionSpec {
             dest: dest.to_owned(),
             set: set.to_owned(),
             keep_chains,
             dry_run,
+            verify_first,
+            passphrase_file: passphrase_file
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
         };
         let progress = self.call(move |inner| {
             Box::pin(async move {

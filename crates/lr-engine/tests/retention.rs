@@ -304,3 +304,150 @@ fn retention_never_deletes_a_member_individually() {
         );
     }
 }
+
+/// A source with real data, so every member stores payloads.
+fn data_source(dir: &Path) -> PathBuf {
+    let path = dir.join("source.img");
+    let bytes: Vec<u8> = (0..8 * 1024 * 1024u32)
+        .map(|index| (index.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
+    std::fs::write(&path, bytes).expect("source");
+    path
+}
+
+/// The newest image file of the set.
+fn newest_image(dest: &Path, set: &str) -> PathBuf {
+    let files = image_files(dest, set);
+    let (_, handle) = open_dest(dest, set);
+    let newest = files
+        .iter()
+        .max_by_key(|name| {
+            std::fs::metadata(Path::new(&handle.path).join(name))
+                .and_then(|metadata| metadata.modified())
+                .expect("mtime")
+        })
+        .expect("an image");
+    Path::new(&handle.path).join(newest)
+}
+
+/// A newer chain whose image has an intact superblock but no footer is not a
+/// usable backup, so it never displaces the older chain (R20).
+#[test]
+fn retention_keeps_the_last_usable_chain_over_a_truncated_newer_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = data_source(dir.path());
+    let dest = dir.path().join("backups");
+    let set = "truncated";
+    build_chain(&source, &dest, set, 0, 1);
+    let older = image_files(&dest, set);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    build_chain(&source, &dest, set, 0, 2);
+    let damaged = newest_image(&dest, set);
+    std::fs::File::options()
+        .write(true)
+        .open(&damaged)
+        .expect("open")
+        .set_len(64 * 1024)
+        .expect("truncate after the superblock");
+
+    let (destination, handle) = open_dest(&dest, set);
+    let report = apply(
+        &*destination,
+        &handle,
+        set,
+        &RetentionOptions {
+            keep_chains: 1,
+            ..RetentionOptions::default()
+        },
+    )
+    .expect("retention");
+    let remaining = image_files(&dest, set);
+    for file in &older {
+        assert!(
+            remaining.contains(file),
+            "the only usable chain was deleted: {report:?}"
+        );
+    }
+}
+
+/// Verify a set's image with `--chain` semantics and record the result.
+fn verify_and_record(image: &Path) {
+    let request = lr_engine::verify::VerifyRequest {
+        image: image.display().to_string(),
+        encryption: Encryption::NoEncrypt,
+        chain: true,
+        destination_options: lr_store::DestinationOptions::default(),
+        context: lr_engine::progress::EngineContext::silent(),
+    };
+    let report = lr_engine::verify::verify_image(&request).expect("verify");
+    let note = lr_engine::verify::record_verification(&request, &report).expect("record");
+    assert!(note.is_none(), "{note:?}");
+}
+
+/// A verified older chain is never given up for a newer chain that was not
+/// verified, and verify-before-retention finds a newer chain's corrupted
+/// payload before anything is deleted (R20).
+#[test]
+fn retention_never_gives_up_the_last_verified_chain_for_an_unverified_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = data_source(dir.path());
+    let dest = dir.path().join("backups");
+    let set = "verified";
+    build_chain(&source, &dest, set, 0, 1);
+    let older = image_files(&dest, set);
+    verify_and_record(&newest_image(&dest, set));
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    build_chain(&source, &dest, set, 0, 2);
+    // A corrupted payload behind an intact superblock and footer.
+    let damaged = newest_image(&dest, set);
+    let mut bytes = std::fs::read(&damaged).expect("image");
+    bytes[256 * 1024] ^= 0xFF;
+    std::fs::write(&damaged, bytes).expect("corrupt");
+
+    let (destination, handle) = open_dest(&dest, set);
+    let report = apply(
+        &*destination,
+        &handle,
+        set,
+        &RetentionOptions {
+            keep_chains: 1,
+            ..RetentionOptions::default()
+        },
+    )
+    .expect("retention");
+    assert!(report.deleted.is_empty(), "{report:?}");
+    assert_eq!(report.kept.len(), 2, "{report:?}");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("newest verified chain")),
+        "{:?}",
+        report.warnings
+    );
+
+    let checked = apply(
+        &*destination,
+        &handle,
+        set,
+        &RetentionOptions {
+            keep_chains: 1,
+            verify_first: true,
+            ..RetentionOptions::default()
+        },
+    )
+    .expect("retention with verification");
+    assert!(
+        checked
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("failed verification")),
+        "{:?}",
+        checked.warnings
+    );
+    let remaining = image_files(&dest, set);
+    for file in &older {
+        assert!(remaining.contains(file), "the verified chain was deleted");
+    }
+    assert!(damaged.exists(), "a failed chain is left in place");
+}

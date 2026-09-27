@@ -167,6 +167,8 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             set,
             keep_chains,
             dry_run,
+            verify_first,
+            passphrase_file,
             identity,
             known_hosts,
             insecure_ignore_host_key,
@@ -174,8 +176,12 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             cli.json,
             dest,
             set,
-            *keep_chains,
-            *dry_run,
+            &RetentionFlags {
+                keep_chains: *keep_chains,
+                dry_run: *dry_run,
+                verify_first: *verify_first,
+                passphrase_file: passphrase_file.clone(),
+            },
             &DestinationOptions {
                 set_name: set.clone(),
                 identity: identity.clone(),
@@ -918,7 +924,11 @@ fn verify(
         destination_options: options.clone(),
         context: lr_engine::progress::EngineContext::silent(),
     };
-    let report = lr_engine::verify::verify_image(&request)?;
+    let mut report = lr_engine::verify::verify_image(&request)?;
+    // A whole-chain verification is recorded for retention (R20).
+    if let Some(note) = lr_engine::verify::record_verification(&request, &report)? {
+        report.warnings.push(note);
+    }
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
@@ -1326,22 +1336,37 @@ fn restore_prepare(
     Ok(())
 }
 
+/// What `retention apply` was asked to do.
+struct RetentionFlags {
+    keep_chains: usize,
+    dry_run: bool,
+    verify_first: bool,
+    passphrase_file: Option<PathBuf>,
+}
+
 /// `retention apply`: whole-chain deletion beyond `keep_chains` (spec §J.3).
 fn retention_apply(
     json: bool,
     dest: &str,
     set: &str,
-    keep_chains: usize,
-    dry_run: bool,
+    flags: &RetentionFlags,
     options: &DestinationOptions,
     socket: Option<&Path>,
 ) -> anyhow::Result<()> {
+    let RetentionFlags {
+        keep_chains,
+        dry_run,
+        verify_first,
+        ref passphrase_file,
+    } = *flags;
     if let Some(mut client) = client_if_available(socket) {
         let summary = client.apply_retention(
             dest,
             set,
             u32::try_from(keep_chains).unwrap_or(u32::MAX),
             dry_run,
+            verify_first,
+            passphrase_file.as_deref(),
         )?;
         let report: serde_json::Value = serde_json::from_str(&summary)?;
         if json {
@@ -1360,6 +1385,8 @@ fn retention_apply(
         &lr_engine::retention::RetentionOptions {
             keep_chains,
             dry_run,
+            verify_first,
+            encryption: lr_engine::options::restore_encryption(passphrase_file.as_deref())?,
             ..lr_engine::retention::RetentionOptions::default()
         },
     )?;

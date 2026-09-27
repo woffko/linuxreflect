@@ -26,6 +26,11 @@ pub struct RetentionOptions {
     pub break_stale_lock: bool,
     /// Set-lock lease in seconds; the spec default is 300.
     pub set_lock_ttl_secs: Option<u64>,
+    /// Verify every payload of the chains to keep before deleting anything;
+    /// a chain that fails does not count as a backup (R20).
+    pub verify_first: bool,
+    /// How to unlock encrypted chains for `verify_first`.
+    pub encryption: crate::keys::Encryption,
 }
 
 impl Default for RetentionOptions {
@@ -35,6 +40,8 @@ impl Default for RetentionOptions {
             dry_run: false,
             break_stale_lock: false,
             set_lock_ttl_secs: None,
+            verify_first: false,
+            encryption: crate::keys::Encryption::NoEncrypt,
         }
     }
 }
@@ -126,17 +133,61 @@ pub fn apply(
         );
     }
 
+    // A complete chain counts as a backup only when every member is sound:
+    // its footer and layout parse, so a newer image whose tail is missing
+    // never displaces a restorable chain. A damaged chain is neither counted
+    // nor deleted (R20).
+    let mut usable: Vec<ChainRecord> = Vec::new();
+    for chain in &complete {
+        match damaged_member(destination, set, chain) {
+            None => usable.push(chain.clone()),
+            Some(problem) => warnings.push(format!(
+                "chain {} is damaged ({problem}); it does not count as a backup and is left in \
+                 place",
+                chain.chain_id
+            )),
+        }
+    }
+
     let keep_count = options.keep_chains.max(1);
-    let kept: Vec<String> = complete
+    if options.verify_first {
+        verify_newest(
+            destination,
+            set,
+            &mut usable,
+            keep_count,
+            options,
+            &mut loaded.catalog,
+            &mut warnings,
+        );
+    }
+    let mut kept_chains: Vec<ChainRecord> = usable.iter().take(keep_count).cloned().collect();
+    // The newest chain known to be restorable is never given up for newer
+    // chains that were not verified (R20).
+    if !kept_chains.iter().any(is_verified)
+        && let Some(verified) = usable
+            .iter()
+            .skip(keep_count)
+            .find(|chain| is_verified(chain))
+    {
+        warnings.push(format!(
+            "chain {} is kept as well: it is the newest verified chain, and no chain within \
+             keep_chains has been verified (run verify --chain, or retention --verify-first)",
+            verified.chain_id
+        ));
+        kept_chains.push(verified.clone());
+    }
+    let kept: Vec<String> = kept_chains
         .iter()
-        .take(keep_count)
         .map(|chain| chain.chain_id.to_string())
         .collect();
-    let newest_kept_created = complete.first().map_or(0, |chain| chain.created_unix);
+    let newest_kept_created = usable.first().map_or(0, |chain| chain.created_unix);
 
     let mut doomed: Vec<(ChainRecord, &'static str)> = Vec::new();
-    for chain in complete.iter().skip(keep_count) {
-        doomed.push((chain.clone(), "beyond keep_chains"));
+    for chain in &usable {
+        if !kept.contains(&chain.chain_id.to_string()) {
+            doomed.push((chain.clone(), "beyond keep_chains"));
+        }
     }
     for chain in &loaded.catalog.chains {
         if chain.is_complete() {
@@ -196,9 +247,88 @@ pub fn apply(
         kept,
         deleted,
         dry_run: options.dry_run,
-        complete_chains: complete.len() as u64,
+        complete_chains: usable.len() as u64,
         warnings,
     })
+}
+
+/// `true` when every member of the chain was verified.
+fn is_verified(chain: &ChainRecord) -> bool {
+    !chain.members.is_empty()
+        && chain
+            .members
+            .iter()
+            .all(|member| member.verified_unix.is_some())
+}
+
+/// The first member of `chain` whose footer or layout does not parse.
+fn damaged_member(
+    destination: &dyn Destination,
+    set: &SetHandle,
+    chain: &ChainRecord,
+) -> Option<String> {
+    chain.members.iter().find_map(|member| {
+        destination
+            .open_ro(set, &member.file_name)
+            .and_then(lr_format::ImageReader::open)
+            .err()
+            .map(|error| format!("{}: {error}", member.file_name))
+    })
+}
+
+/// Verify the newest usable chains, every payload of every member, until
+/// `keep_count` of them pass; a chain that fails is dropped from `usable`,
+/// one that passes is marked verified in the catalog (R20).
+#[allow(clippy::too_many_arguments)]
+fn verify_newest(
+    destination: &dyn Destination,
+    set: &SetHandle,
+    usable: &mut Vec<ChainRecord>,
+    keep_count: usize,
+    options: &RetentionOptions,
+    catalog: &mut lr_core::catalog::Catalog,
+    warnings: &mut Vec<String>,
+) {
+    let mut passed = 0usize;
+    let mut index = 0usize;
+    while index < usable.len() && passed < keep_count {
+        let chain = &usable[index];
+        let Some(newest) = chain.latest_member() else {
+            index += 1;
+            continue;
+        };
+        let request = crate::verify::VerifyRequest {
+            image: newest.file_name.clone(),
+            encryption: options.encryption.clone(),
+            chain: true,
+            destination_options: lr_store::DestinationOptions::default(),
+            context: crate::progress::EngineContext::silent(),
+        };
+        match crate::verify::verify_in_set(destination, set, &newest.file_name, &request) {
+            Ok(_) => {
+                let files = chain
+                    .members
+                    .iter()
+                    .map(|member| member.file_name.clone())
+                    .collect();
+                crate::verify::mark_verified(catalog, &files, now_unix());
+                usable[index] = catalog
+                    .chain(chain.chain_id)
+                    .cloned()
+                    .unwrap_or_else(|| usable[index].clone());
+                passed += 1;
+                index += 1;
+            }
+            Err(error) => {
+                warnings.push(format!(
+                    "chain {} failed verification ({error}); it does not count as a backup and \
+                     is left in place",
+                    chain.chain_id
+                ));
+                usable.remove(index);
+            }
+        }
+    }
 }
 
 /// `true` when another member may be appended to the newest chain.

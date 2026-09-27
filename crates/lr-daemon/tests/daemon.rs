@@ -265,6 +265,7 @@ async fn version_is_unauthenticated_and_later_slices_are_unimplemented() {
             set: "missing".to_owned(),
             keep_chains: 1,
             dry_run: false,
+            ..lr_proto::v1::RetentionSpec::default()
         })
         .await
         .expect_err("there is no such set");
@@ -277,6 +278,7 @@ async fn version_is_unauthenticated_and_later_slices_are_unimplemented() {
             set: "empty".to_owned(),
             keep_chains: 1,
             dry_run: false,
+            ..lr_proto::v1::RetentionSpec::default()
         })
         .await
         .expect("pruning an empty set is a no-op")

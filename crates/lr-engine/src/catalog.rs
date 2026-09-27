@@ -143,6 +143,7 @@ pub fn build_catalog(set_name: &str, now: u64, scan: &Scan) -> Catalog {
                 source_label: String::new(),
                 size_bytes: member.size_bytes,
                 file_name: member.file_name.clone(),
+                verified_unix: None,
             })
             .collect();
         catalog.upsert_chain(ChainRecord {
@@ -295,11 +296,19 @@ pub fn load(
             warnings,
             rebuilt: false,
         }),
-        Some(_) => {
-            warnings.push(
-                "catalog.json disagrees with the member superblocks; using the scanned catalog"
-                    .to_owned(),
-            );
+        Some(cached) => {
+            // A new or removed member is the usual disagreement. Verification
+            // records stay with the members they were made for: the same
+            // image, file and size (R20).
+            let mut built = built;
+            carry_verification(&cached, &mut built);
+            if !same_records(&cached, &built) {
+                warnings.push(
+                    "catalog.json disagrees with the member superblocks; using the scanned \
+                     catalog"
+                        .to_owned(),
+                );
+            }
             Ok(Loaded {
                 catalog: built,
                 warnings,
@@ -311,6 +320,24 @@ pub fn load(
             warnings,
             rebuilt: true,
         }),
+    }
+}
+
+/// Copy verification records from `cached` to the members of `built` that
+/// are the same immutable image: same UUID, file name and size.
+fn carry_verification(cached: &Catalog, built: &mut Catalog) {
+    for chain in &mut built.chains {
+        for member in &mut chain.members {
+            if let Some(old) = cached
+                .chains
+                .iter()
+                .find_map(|chain| chain.member(member.image_uuid))
+                && old.file_name == member.file_name
+                && old.size_bytes == member.size_bytes
+            {
+                member.verified_unix = old.verified_unix;
+            }
+        }
     }
 }
 

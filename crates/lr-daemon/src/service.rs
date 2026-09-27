@@ -550,7 +550,12 @@ impl LinuxReflect for DaemonService {
                 move |context| {
                     let mut verify = verify;
                     verify.context = context;
-                    let report = lr_engine::verify::verify_image(&verify)?;
+                    let mut report = lr_engine::verify::verify_image(&verify)?;
+                    // A whole-chain verification is recorded for retention
+                    // (R20).
+                    if let Some(note) = lr_engine::verify::record_verification(&verify, &report)? {
+                        report.warnings.push(note);
+                    }
                     serde_json::to_string(&report)
                         .map_err(|error| Error::corrupt(format!("report json: {error}")))
                 },
@@ -850,6 +855,12 @@ impl LinuxReflect for DaemonService {
                 &lr_engine::retention::RetentionOptions {
                     keep_chains: usize::try_from(spec.keep_chains).unwrap_or(0),
                     dry_run: spec.dry_run,
+                    verify_first: spec.verify_first,
+                    encryption: lr_engine::options::restore_encryption(
+                        (!spec.passphrase_file.is_empty())
+                            .then(|| PathBuf::from(&spec.passphrase_file))
+                            .as_deref(),
+                    )?,
                     ..lr_engine::retention::RetentionOptions::default()
                 },
             )?;

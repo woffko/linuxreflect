@@ -104,14 +104,90 @@ pub fn verify_image(request: &VerifyRequest) -> Result<VerifyReport> {
     options.set_name.clone_from(&location.set);
     let destination = lr_store::open(&location.dest, &options)?;
     let set = destination.open_existing_set(&lr_core::SetId::ZERO)?;
+    verify_in_set(&*destination, &set, &location.name, request)
+}
 
-    let target = crate::chain::read_superblock(&*destination, &set, &location.name)?;
+/// Record a successful whole-chain verification in the set's catalog, so
+/// retention knows which chains were proven restorable (R20).
+///
+/// Only a report that read every member counts. The set lock is taken
+/// briefly; when another job holds it, the record is skipped and the
+/// returned note says so.
+///
+/// # Errors
+/// Propagates destination and catalog errors other than a busy set.
+pub fn record_verification(
+    request: &VerifyRequest,
+    report: &VerifyReport,
+) -> Result<Option<String>> {
+    if !report.every_member {
+        return Ok(None);
+    }
+    let location = uri::split_image(&request.image)?;
+    let mut options = request.destination_options.clone();
+    options.set_name.clone_from(&location.set);
+    let destination = lr_store::open(&location.dest, &options)?;
+    let set = destination.open_existing_set(&lr_core::SetId::ZERO)?;
+    let lock = match crate::backup::acquire_set_lock_for(&*destination, &set, 60, false) {
+        Ok(lock) => lock,
+        Err(Error::SetLocked { owner }) => {
+            return Ok(Some(format!(
+                "the set is locked by {owner}; the verification was not recorded"
+            )));
+        }
+        Err(error) => return Err(error),
+    };
+    let now = crate::backup::now_unix();
+    let mut loaded = crate::catalog::load(&*destination, &set, &location.set, now)?;
+    let verified: std::collections::HashSet<String> =
+        crate::chain::resolve_chain(&*destination, &set, &location.name)?
+            .into_iter()
+            .map(|member| member.file_name)
+            .collect();
+    mark_verified(&mut loaded.catalog, &verified, now);
+    lock.verify()?;
+    crate::catalog::write_catalog(&*destination, &set, &loaded.catalog)?;
+    Ok(None)
+}
+
+/// Mark the named members verified at `now`.
+pub(crate) fn mark_verified(
+    catalog: &mut lr_core::catalog::Catalog,
+    files: &std::collections::HashSet<String>,
+    now: u64,
+) {
+    for chain in &mut catalog.chains {
+        for member in &mut chain.members {
+            if files.contains(&member.file_name) {
+                member.verified_unix = Some(now);
+            }
+        }
+    }
+}
+
+/// [`verify_image`] on a destination that is already open; `request.image`
+/// only names the image in the report.
+///
+/// # Errors
+/// See [`verify_image`].
+pub(crate) fn verify_in_set(
+    destination: &dyn Destination,
+    set: &SetHandle,
+    name: &str,
+    request: &VerifyRequest,
+) -> Result<VerifyReport> {
+    let location = uri::ImageLocation {
+        dest: String::new(),
+        set: String::new(),
+        name: name.to_owned(),
+    };
+    let target = crate::chain::read_superblock(destination, set, &location.name)?;
 
     // The image's whole ancestry is always opened: a non-full member's
     // recovery point needs the payloads it inherits (R23). `--chain`
     // additionally reads every payload every member stores, including
     // superseded ones, which are recovery points of older members (R22).
-    let members = crate::chain::resolve_chain(&*destination, &set, &location.name)?;
+    let members = crate::chain::resolve_chain(destination, set, &location.name)?;
     if members.last().map(|member| member.file_name.as_str()) != Some(location.name.as_str()) {
         return Err(Error::corrupt(format!(
             "{} is not part of its own chain",
@@ -136,11 +212,11 @@ pub fn verify_image(request: &VerifyRequest) -> Result<VerifyReport> {
 
     // 1. Structure, MACs and page tags, member by member.
     for member in &members {
-        let superblock = crate::chain::read_superblock(&*destination, &set, &member.file_name)?;
+        let superblock = crate::chain::read_superblock(destination, set, &member.file_name)?;
         let keys = keys::unlock_image(&request.encryption, &superblock)?;
         let encrypted = superblock.is_encrypted();
         let page_report = verify_structure(
-            destination.open_ro(&set, &member.file_name)?,
+            destination.open_ro(set, &member.file_name)?,
             *keys.meta_key,
             encrypted,
         )
@@ -164,8 +240,8 @@ pub fn verify_image(request: &VerifyRequest) -> Result<VerifyReport> {
     match target.image_kind {
         ImageKind::Block if target.is_whole_disk() => {
             verify_whole_disk(
-                &*destination,
-                &set,
+                destination,
+                set,
                 &location.name,
                 &request.encryption,
                 &mut report,
@@ -173,8 +249,8 @@ pub fn verify_image(request: &VerifyRequest) -> Result<VerifyReport> {
         }
         ImageKind::Block => {
             verify_block_chain(
-                &*destination,
-                &set,
+                destination,
+                set,
                 &members,
                 &request.encryption,
                 every_member,
@@ -191,8 +267,8 @@ pub fn verify_image(request: &VerifyRequest) -> Result<VerifyReport> {
                 &members[members.len() - 1..]
             };
             verify_stream(
-                &*destination,
-                &set,
+                destination,
+                set,
                 own,
                 &request.encryption,
                 &mut reporter,
@@ -201,8 +277,8 @@ pub fn verify_image(request: &VerifyRequest) -> Result<VerifyReport> {
         }
         ImageKind::File => {
             verify_file(
-                &*destination,
-                &set,
+                destination,
+                set,
                 &members,
                 &request.encryption,
                 every_member,

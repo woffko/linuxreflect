@@ -390,6 +390,15 @@ pub(crate) enum RetentionCommand {
         #[arg(long)]
         dry_run: bool,
 
+        /// Verify every payload of the chains to keep before deleting any;
+        /// a chain that fails does not count as a backup.
+        #[arg(long)]
+        verify_first: bool,
+
+        /// Passphrase file, to verify encrypted chains with --verify-first.
+        #[arg(long, value_name = "PATH")]
+        passphrase_file: Option<PathBuf>,
+
         /// Private key for an SFTP destination.
         #[arg(long, value_name = "PATH")]
         identity: Option<PathBuf>,
