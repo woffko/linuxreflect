@@ -435,22 +435,22 @@ P3 = cleanup.
 | R12 | P2 | A passphrase FIFO blocks request threads | 3 | ☐ |
 | R13 | P2 | `known_hosts` negations and revocations not enforced | 3 | ☐ |
 | R14 | P2 | Live file backup can follow replaced ancestors | 1.6 | ☑ |
-| R15 | P1 | Requested encryption ignored on a plaintext chain | 2.2 | ☐ |
-| R16 | P1 | Live file backups lack per-file stability checks | 2.2 | ☐ |
-| R17 | P1 | Incrementals miss changes that keep size and mtime | 2.2 | ☐ |
+| R15 | P1 | Requested encryption ignored on a plaintext chain | 2.2 | ☑ |
+| R16 | P1 | Live file backups lack per-file stability checks | 2.2 | ☑ |
+| R17 | P1 | Incrementals miss changes that keep size and mtime | 2.2 | ☑ |
 | R18 | P1 | SFTP retry can delete an already published image | 2.1 | ☑ |
 | R19 | P1 | SFTP success does not establish durability | 2.1 | ☑ |
-| R20 | P1 | Retention can delete the last usable chain | 2.3 | ☐ |
+| R20 | P1 | Retention can delete the last usable chain | 2.3 | ☑ |
 | R21 | P1 | Lease refresh can overwrite a replacement lock | 2.1 | ☑ |
-| R22 | P1 | `verify --chain` misses corrupted superseded payloads | 2.3 | ☐ |
-| R23 | P2 | Default verification rejects valid non-full members | 2.3 | ☐ |
-| R24 | P1 | Whole-disk manifests can restore an incomplete region | 2.3 | ☐ |
-| R25 | P2 | File and Stream verification skip restore-required checks | 2.3 | ☐ |
-| R26 | P1 | Known bad sectors are rejected only after target writes | 2.3 | ☐ |
-| R27 | P1 | Local destinations bypass the freeze same-filesystem guard | 2.4 | ☐ |
-| R28 | P1 | Apostrophes in mountpoints break both thaw deadmen | 2.4 | ☐ |
-| R29 | P2 | The final source read can outlive snapshot health | 2.4 | ☐ |
-| R30 | P1 | Unmounted nested Btrfs subvolumes are silently omitted | 2.2 | ☐ |
+| R22 | P1 | `verify --chain` misses corrupted superseded payloads | 2.3 | ☑ |
+| R23 | P2 | Default verification rejects valid non-full members | 2.3 | ☑ |
+| R24 | P1 | Whole-disk manifests can restore an incomplete region | 2.3 | ☑ |
+| R25 | P2 | File and Stream verification skip restore-required checks | 2.3 | ☑ |
+| R26 | P1 | Known bad sectors are rejected only after target writes | 2.3 | ☑ |
+| R27 | P1 | Local destinations bypass the freeze same-filesystem guard | 2.4 | ☑ |
+| R28 | P1 | Apostrophes in mountpoints break both thaw deadmen | 2.4 | ☑ |
+| R29 | P2 | The final source read can outlive snapshot health | 2.4 | ☑ |
+| R30 | P1 | Unmounted nested Btrfs subvolumes are silently omitted | 2.2 | ☑ |
 | R31 | P1 | Backup options disappear when the CLI uses the daemon | 2.5 | ☐ |
 | R32 | P2 | Restore apply cannot request its polkit dialog | 2.8 | ☐ |
 | R33 | P2 | File restore drops metadata failures | 3 | ☐ |
