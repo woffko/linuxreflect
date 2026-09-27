@@ -304,12 +304,15 @@ pub fn open_readonly_nofollow(path: &std::path::Path) -> io::Result<OwnedFd> {
 
     let cpath = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    // `O_NONBLOCK`: opening a FIFO would otherwise wait for a writer before
+    // the caller could see that it is not a regular file (R12); reads of a
+    // regular file ignore the flag.
     // SAFETY: `cpath` is a valid NUL-terminated string and the flags are a
     // valid `open(2)` set; the returned descriptor is wrapped immediately.
     let fd = unsafe {
         libc::open(
             cpath.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY,
         )
     };
     if fd < 0 {

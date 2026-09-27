@@ -133,6 +133,39 @@ mod tests {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
+    /// A FIFO named as the passphrase file is refused at once instead of
+    /// waiting for a writer (R12).
+    #[test]
+    fn a_fifo_is_refused_without_waiting_for_a_writer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("chain.key");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .args(["-m", "600"])
+                .arg(&path)
+                .status()
+                .expect("mkfifo")
+                .success()
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let fifo = path.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(load_passphrase_file(&fifo).map(|_| ()));
+        });
+        let outcome = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("opening a FIFO must not wait for a writer");
+        let error = outcome.expect_err("a FIFO is not a passphrase file");
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+        // Release a reader stuck in open, so a failing run still exits; with
+        // no reader this fails at once (ENXIO) instead of waiting.
+        let _ = std::os::unix::fs::OpenOptionsExt::custom_flags(
+            std::fs::OpenOptions::new().write(true),
+            libc::O_NONBLOCK,
+        )
+        .open(&path);
+    }
+
     fn key_file(dir: &tempfile::TempDir, mode: u32, contents: &[u8]) -> std::path::PathBuf {
         let path = dir.path().join("chain.key");
         {

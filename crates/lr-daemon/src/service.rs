@@ -270,6 +270,19 @@ impl DaemonService {
             .ok_or_else(|| Error::denied("unknown", "the request carries no peer identity"))
     }
 
+    /// Run file I/O, such as reading a passphrase file or an image header,
+    /// on a blocking thread instead of an async request thread (R12).
+    async fn off_thread<T, F>(work: F) -> std::result::Result<T, Status>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        tokio::task::spawn_blocking(work)
+            .await
+            .map_err(|error| Status::internal(format!("blocking task failed: {error}")))?
+            .map_err(status::status_of)
+    }
+
     /// Authorize one action for one request.
     async fn authorize<T>(
         &self,
@@ -572,7 +585,8 @@ impl LinuxReflect for DaemonService {
         let peer = self.authorize(&request, Action::BackupCreate).await?;
         let spec = request.get_ref().clone();
         // The same conversion the CLI's direct route uses (R31).
-        let job = lr_request::backup_job(&spec).map_err(status::status_of)?;
+        let described = spec.clone();
+        let job = Self::off_thread(move || lr_request::backup_job(&described)).await?;
         let job_id = if spec.job_id.is_empty() {
             format!("backup-{}", job.request.image_uuid)
         } else {
@@ -594,12 +608,12 @@ impl LinuxReflect for DaemonService {
     ) -> std::result::Result<Response<Self::VerifyImageStream>, Status> {
         let peer = self.authorize(&request, Action::DiskRead).await?;
         let spec = request.get_ref().clone();
-        let encryption = lr_engine::options::restore_encryption(
-            (!spec.passphrase_file.is_empty())
-                .then(|| PathBuf::from(&spec.passphrase_file))
-                .as_deref(),
-        )
-        .map_err(status::status_of)?;
+        let passphrase_file =
+            (!spec.passphrase_file.is_empty()).then(|| PathBuf::from(&spec.passphrase_file));
+        let encryption = Self::off_thread(move || {
+            lr_engine::options::restore_encryption(passphrase_file.as_deref())
+        })
+        .await?;
         let verify = lr_engine::verify::VerifyRequest {
             image: spec.image.clone(),
             encryption,
@@ -645,26 +659,29 @@ impl LinuxReflect for DaemonService {
     ) -> std::result::Result<Response<RestorePlanInfo>, Status> {
         let peer = self.authorize(&request, Action::RestorePrepare).await?;
         let spec = request.get_ref().clone();
-        let encryption = lr_engine::options::restore_encryption(
-            (!spec.passphrase_file.is_empty())
-                .then(|| PathBuf::from(&spec.passphrase_file))
-                .as_deref(),
-        )
-        .map_err(status::status_of)?;
-        let mut prepare =
-            lr_engine::restore::PrepareRequest::new(&spec.image, &spec.target, encryption);
-        prepare.identity = (!spec.identity.is_empty()).then(|| PathBuf::from(&spec.identity));
-        prepare.known_hosts =
-            (!spec.known_hosts.is_empty()).then(|| PathBuf::from(&spec.known_hosts));
-        prepare.insecure_ignore_host_key = spec.insecure_ignore_host_key;
-        prepare.merge = spec.merge;
-        prepare.replace_partition_table = spec.replace_partition_table;
-        if spec.ttl_secs > 0 {
-            prepare.ttl = std::time::Duration::from_secs(spec.ttl_secs.min(600));
-        }
-        // The plan's token is bound to this caller (A11).
-        let plan = lr_engine::restore::prepare_restore_as(&prepare, peer.uid)
-            .map_err(status::status_of)?;
+        let uid = peer.uid;
+        // Reading the passphrase, the image and the target is file I/O
+        // (R12); the plan's token is bound to this caller (A11).
+        let plan = Self::off_thread(move || {
+            let encryption = lr_engine::options::restore_encryption(
+                (!spec.passphrase_file.is_empty())
+                    .then(|| PathBuf::from(&spec.passphrase_file))
+                    .as_deref(),
+            )?;
+            let mut prepare =
+                lr_engine::restore::PrepareRequest::new(&spec.image, &spec.target, encryption);
+            prepare.identity = (!spec.identity.is_empty()).then(|| PathBuf::from(&spec.identity));
+            prepare.known_hosts =
+                (!spec.known_hosts.is_empty()).then(|| PathBuf::from(&spec.known_hosts));
+            prepare.insecure_ignore_host_key = spec.insecure_ignore_host_key;
+            prepare.merge = spec.merge;
+            prepare.replace_partition_table = spec.replace_partition_table;
+            if spec.ttl_secs > 0 {
+                prepare.ttl = std::time::Duration::from_secs(spec.ttl_secs.min(600));
+            }
+            lr_engine::restore::prepare_restore_as(&prepare, uid)
+        })
+        .await?;
         Ok(Response::new(RestorePlanInfo {
             dest: plan.dest,
             set: plan.set,
@@ -690,12 +707,12 @@ impl LinuxReflect for DaemonService {
         let peer = self.authorize(&request, Action::RestoreApply).await?;
         let uid = peer.uid;
         let spec = request.get_ref().clone();
-        let encryption = lr_engine::options::restore_encryption(
-            (!spec.passphrase_file.is_empty())
-                .then(|| PathBuf::from(&spec.passphrase_file))
-                .as_deref(),
-        )
-        .map_err(status::status_of)?;
+        let passphrase_file =
+            (!spec.passphrase_file.is_empty()).then(|| PathBuf::from(&spec.passphrase_file));
+        let encryption = Self::off_thread(move || {
+            lr_engine::options::restore_encryption(passphrase_file.as_deref())
+        })
+        .await?;
         let apply = lr_engine::restore::ApplyRequest {
             token: spec.token.clone(),
             confirm: spec.confirm,
@@ -1180,5 +1197,66 @@ mod job_owners {
             .cancel_job(cancel_as(0, "by-root"))
             .await
             .expect("root cancels");
+    }
+}
+
+#[cfg(test)]
+mod request_threads {
+    use std::sync::Arc;
+
+    use lr_proto::v1::RestoreSpec;
+    use lr_proto::v1::linux_reflect_server::LinuxReflect;
+
+    use super::{DaemonService, Jobs, Peer};
+    use crate::auth::PeerIdentity;
+
+    /// A FIFO named as the passphrase file is refused at once; the request
+    /// neither waits for a writer nor holds an async request thread (R12).
+    #[test]
+    fn a_fifo_passphrase_is_refused_without_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fifo = dir.path().join("passphrase");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .args(["-m", "600"])
+                .arg(&fifo)
+                .status()
+                .expect("mkfifo")
+                .success()
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let passphrase_file = fifo.display().to_string();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let outcome = runtime.block_on(async move {
+                let auth = crate::auth::build(Some("static:all"), true)
+                    .await
+                    .expect("auth");
+                let service = DaemonService::new(auth, Arc::new(Jobs::new()), true);
+                let mut request = tonic::Request::new(RestoreSpec {
+                    image: "/nonexistent/set/chain/000-full.lrimg".to_owned(),
+                    target: "/nonexistent-target".to_owned(),
+                    passphrase_file,
+                    ..RestoreSpec::default()
+                });
+                request
+                    .extensions_mut()
+                    .insert(Peer(Arc::new(PeerIdentity::for_uid(1000))));
+                service
+                    .prepare_restore(request)
+                    .await
+                    .map(|_| ())
+                    .map_err(|status| status.message().to_owned())
+            });
+            let _ = sender.send(outcome);
+        });
+        let outcome = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the request must not wait on the FIFO");
+        let message = outcome.expect_err("a FIFO is not a passphrase file");
+        assert!(message.contains("not a regular file"), "{message}");
     }
 }
