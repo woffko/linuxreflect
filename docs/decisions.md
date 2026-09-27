@@ -1491,3 +1491,33 @@ in every later incremental, even from a stable snapshot (R17).
   unchanged content is still deduplicated against the chain, so it costs
   reading time, not space. Metadata equality, even with ctime, is strong
   evidence but not proof of equal content, and the documentation says so.
+
+## D-112 — Nested Btrfs subvolumes are refused or explicitly excluded
+
+Spec §E.1 enumerates *mounted* subvolumes and snapshots each of them. A
+snapshot of a subvolume does not contain the subvolumes nested in it: they
+appear as empty directories. A nested subvolume without its own mount entry
+was therefore silently missing from Stream backups, and from file backups
+taken from a Btrfs snapshot (R30).
+
+The specification's rule stays: only mounted subvolumes are backed up. What
+changes is that nothing is omitted silently.
+
+- **Detection.** After mounting the top level, the provider lists every
+  subvolume of the filesystem (`btrfs subvolume list`). A subvolume whose path
+  lies inside a mounted, included subvolume and that is not mounted itself is
+  a nested exclusion. LinuxReflect's own snapshots under `.linuxreflect/` are
+  never counted.
+- **Default: refuse.** The backup stops before any snapshot is taken, naming
+  the nested subvolumes and the two ways forward: mount them (so they are
+  included), or accept their exclusion.
+- **Explicit exclusion.** `--exclude-nested-subvolumes` (and
+  `BackupSpec.exclude_nested_subvolumes`) lets the backup proceed. The report
+  lists every excluded subvolume, a warning says their contents are not in
+  the image, and the Btrfs layout record carries one `excluded=<path>` line
+  per subvolume.
+- **Not chosen: recursive enumeration.** Snapshotting and restoring nested
+  subvolumes in place would change what the specification says a Stream
+  image contains, and systems such as Docker's Btrfs driver or Snapper keep
+  hundreds of nested subvolumes that nobody wants in a system backup. Mounting
+  what should be included is the explicit, reviewable choice.
