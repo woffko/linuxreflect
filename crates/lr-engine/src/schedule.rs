@@ -27,6 +27,8 @@ pub const DEFAULT_SYSTEMD_DIR: &str = "/etc/systemd/system";
 pub const DEFAULT_CONFIG: &str = "/etc/linuxreflect/config.toml";
 /// Unit name prefix; the spec names the units `linuxreflect-job@<name>`.
 pub const UNIT_PREFIX: &str = "linuxreflect-job@";
+/// Prefix of the units that start a new chain (`new_chain_on_calendar`).
+pub const CHAIN_UNIT_PREFIX: &str = "linuxreflect-newchain@";
 
 /// The whole config file (spec §J.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -269,9 +271,36 @@ fn command_line(arguments: &[String]) -> String {
 }
 
 fn validate(config: &Config) -> Result<()> {
+    // The daemon takes its socket from systemd and its log level from its
+    // environment; a value here would be ignored, so only the defaults are
+    // accepted (R36).
+    if config.daemon.socket != default_socket() {
+        return Err(Error::corrupt(format!(
+            "[daemon] socket = {:?} is not used: the daemon listens on the socket \
+             linuxreflect-daemon.socket gives it ({})",
+            config.daemon.socket,
+            default_socket()
+        )));
+    }
+    if config.daemon.log_level != default_log_level() {
+        return Err(Error::corrupt(format!(
+            "[daemon] log_level = {:?} is not used: set RUST_LOG for \
+             linuxreflect-daemon.service instead",
+            config.daemon.log_level
+        )));
+    }
+    if let Some(size) = &config.daemon.lvm_cow_size {
+        unit_safe("[daemon]", "lvm_cow_size", size)?;
+    }
     let mut names = std::collections::BTreeSet::new();
     for (name, destination) in &config.destinations {
         let owner = format!("destination {name}");
+        if !matches!(destination.kind.as_str(), "sftp" | "local") {
+            return Err(Error::corrupt(format!(
+                "{owner}: kind = {:?}; use sftp or local",
+                destination.kind
+            )));
+        }
         for (field, value) in [
             ("kind", Some(destination.kind.as_str())),
             ("host", destination.host.as_deref()),
@@ -309,6 +338,42 @@ fn validate(config: &Config) -> Result<()> {
         timer_safe(&owner, "on_calendar", &job.on_calendar)?;
         if let Some(delay) = &job.randomized_delay {
             timer_safe(&owner, "randomized_delay", delay)?;
+        }
+        if let Some(calendar) = job
+            .retention
+            .as_ref()
+            .and_then(|retention| retention.new_chain_on_calendar.as_deref())
+        {
+            timer_safe(&owner, "new_chain_on_calendar", calendar)?;
+        }
+        // Values the CLI would refuse only when the timer fires are refused
+        // now (R36).
+        let invalid =
+            |field: &str, error: Error| Error::corrupt(format!("{owner}: {field}: {error}"));
+        if let Some(mode) = &job.mode {
+            let _mode = crate::options::parse_mode(mode).map_err(|error| invalid("mode", error))?;
+        }
+        if let Some(snapshot) = &job.snapshot
+            && !matches!(
+                snapshot.as_str(),
+                "auto" | "btrfs" | "lvm" | "freeze" | "offline" | "none"
+            )
+        {
+            return Err(Error::corrupt(format!(
+                "{owner}: snapshot = {snapshot:?}; use auto, btrfs, lvm, freeze, offline or none"
+            )));
+        }
+        if let Some(compress) = &job.compress {
+            crate::options::parse_compression(compress)
+                .map_err(|error| invalid("compress", error))?;
+        }
+        if let Some(parent) = &job.parent
+            && parent != "latest"
+            && parent.parse::<lr_core::ImageId>().is_err()
+        {
+            return Err(Error::corrupt(format!(
+                "{owner}: parent = {parent:?}; use latest or an image UUID"
+            )));
         }
         lr_core::validate_job_name(&job.name).map_err(|error| Error::corrupt(error.to_string()))?;
         lr_core::validate_set_name(&job.set)
@@ -392,6 +457,23 @@ pub struct JobUnits {
     pub timer: String,
     /// Destination URI the job writes to.
     pub destination: String,
+    /// The units that start a new chain on `new_chain_on_calendar`.
+    #[serde(default)]
+    pub new_chain: Option<ChainUnits>,
+}
+
+/// The `linuxreflect-newchain@<name>` units of a job with
+/// `new_chain_on_calendar` (R36).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainUnits {
+    /// Service unit file name.
+    pub service_name: String,
+    /// Service unit contents.
+    pub service: String,
+    /// Timer unit file name.
+    pub timer_name: String,
+    /// Timer unit contents.
+    pub timer: String,
 }
 
 /// Render the `.service` and `.timer` units of one job.
@@ -403,33 +485,103 @@ pub struct JobUnits {
 /// passphrase file is used without encrypting.
 pub fn render_job(config: &Config, job: &JobConfig, cli: &Path) -> Result<JobUnits> {
     let (destination, network) = resolve_destination(config, job)?;
-    let mut service = String::new();
-    service.push_str("[Unit]\n");
-    service.push_str(&format!(
-        "Description=LinuxReflect backup job {}\n",
-        job.name
-    ));
-    if network {
-        service.push_str("Wants=network-online.target\n");
-        service.push_str("After=network-online.target\n");
+    let context = CommandContext {
+        program: cli.display().to_string(),
+        destination: destination.clone(),
+        named: config.destinations.get(&job.dest),
+        lvm_cow_size: config.daemon.lvm_cow_size.clone(),
+    };
+    let new_chain_calendar = job
+        .retention
+        .as_ref()
+        .and_then(|retention| retention.new_chain_on_calendar.as_deref());
+    // When both timers are due, the incremental waits for the new chain.
+    let after = new_chain_calendar.map(|_| chain_unit_name(&job.name, "service"));
+    let service = service_unit(
+        &format!("LinuxReflect backup job {}", job.name),
+        network,
+        after.as_deref(),
+        &commands(&context, job, &job.member_type),
+    );
+    let timer = timer_unit(
+        &format!("LinuxReflect backup timer for {}", job.name),
+        job,
+        &job.on_calendar,
+        &unit_name(&job.name, "service"),
+    );
+    let new_chain = new_chain_calendar.map(|calendar| ChainUnits {
+        service_name: chain_unit_name(&job.name, "service"),
+        service: service_unit(
+            &format!("LinuxReflect new chain for {}", job.name),
+            network,
+            None,
+            &commands(&context, job, "full"),
+        ),
+        timer_name: chain_unit_name(&job.name, "timer"),
+        timer: timer_unit(
+            &format!("LinuxReflect new-chain timer for {}", job.name),
+            job,
+            calendar,
+            &chain_unit_name(&job.name, "service"),
+        ),
+    });
+
+    Ok(JobUnits {
+        job: job.name.clone(),
+        service_name: unit_name(&job.name, "service"),
+        service,
+        timer_name: unit_name(&job.name, "timer"),
+        timer,
+        destination,
+        new_chain,
+    })
+}
+
+/// What every command of a job shares.
+struct CommandContext<'a> {
+    program: String,
+    destination: String,
+    /// The named destination the job writes to, whose key and
+    /// `known_hosts` the commands pass on (R36).
+    named: Option<&'a DestinationConfig>,
+    lvm_cow_size: Option<String>,
+}
+
+impl CommandContext<'_> {
+    /// `--identity` and `--known-hosts` of the named destination.
+    fn ssh_options(&self, command: &mut Vec<String>) {
+        let Some(named) = self.named else {
+            return;
+        };
+        for (option, path) in [
+            ("--identity", &named.identity),
+            ("--known-hosts", &named.known_hosts),
+        ] {
+            if let Some(path) = path {
+                command.push(option.to_owned());
+                command.push(path.display().to_string());
+            }
+        }
     }
-    service.push_str("\n[Service]\n");
-    service.push_str("Type=oneshot\n");
-    service.push_str("User=root\n");
-    let program = cli.display().to_string();
+}
+
+/// The backup commands (one per source) and the retention command of a job,
+/// as `member_type` members.
+fn commands(context: &CommandContext<'_>, job: &JobConfig, member_type: &str) -> Vec<Vec<String>> {
+    let mut all = Vec::new();
     for source in &job.source {
         let mut command: Vec<String> = [
-            program.as_str(),
+            context.program.as_str(),
             "backup",
             "create",
             "--source",
             source,
             "--dest",
-            &destination,
+            &context.destination,
             "--set",
             &job.set,
             "--type",
-            &job.member_type,
+            member_type,
         ]
         .map(str::to_owned)
         .to_vec();
@@ -437,11 +589,16 @@ pub fn render_job(config: &Config, job: &JobConfig, cli: &Path) -> Result<JobUni
             command.push(name.to_owned());
             command.push(value);
         };
-        if job.member_type != "full" {
+        if member_type != "full" {
             option(
                 "--parent",
                 job.parent.clone().unwrap_or_else(|| "latest".to_owned()),
             );
+            if let Some(retention) = &job.retention
+                && let Some(max) = retention.max_incrementals_per_chain
+            {
+                option("--max-incrementals", max.to_string());
+            }
         }
         if let Some(mode) = &job.mode {
             option("--mode", mode.clone());
@@ -452,66 +609,94 @@ pub fn render_job(config: &Config, job: &JobConfig, cli: &Path) -> Result<JobUni
         if let Some(compress) = &job.compress {
             option("--compress", compress.clone());
         }
+        if let Some(size) = &context.lvm_cow_size {
+            option("--lvm-cow-size", size.clone());
+        }
         if job.encrypt
             && let Some(passphrase) = &job.passphrase_file
         {
             option("--passphrase-file", passphrase.display().to_string());
         }
-        if let Some(retention) = &job.retention
-            && let Some(max) = retention.max_incrementals_per_chain
-        {
-            option("--max-incrementals", max.to_string());
-        }
+        context.ssh_options(&mut command);
         if !job.encrypt {
             command.push("--no-encrypt".to_owned());
         }
         command.push("--json".to_owned());
-        service.push_str(&format!("ExecStart={}\n", command_line(&command)));
+        all.push(command);
     }
     // Retention runs right after the backup, against the same set, so
     // `keep_chains` holds without a second timer.
     if let Some(retention) = &job.retention
         && let Some(keep) = retention.keep_chains
     {
-        let command = [
-            program.as_str(),
+        let mut command: Vec<String> = [
+            context.program.as_str(),
             "retention",
             "apply",
             "--dest",
-            &destination,
+            &context.destination,
             "--set",
             &job.set,
             "--keep-chains",
             &keep.to_string(),
         ]
-        .map(str::to_owned);
-        service.push_str(&format!("ExecStart={}\n", command_line(&command)));
+        .map(str::to_owned)
+        .to_vec();
+        context.ssh_options(&mut command);
+        all.push(command);
     }
+    all
+}
 
+/// A oneshot service running `commands` in order.
+fn service_unit(
+    description: &str,
+    network: bool,
+    after: Option<&str>,
+    commands: &[Vec<String>],
+) -> String {
+    let mut service = String::new();
+    service.push_str("[Unit]\n");
+    service.push_str(&format!("Description={description}\n"));
+    if network {
+        service.push_str("Wants=network-online.target\n");
+        service.push_str("After=network-online.target\n");
+    }
+    if let Some(after) = after {
+        service.push_str(&format!("After={after}\n"));
+    }
+    service.push_str("\n[Service]\n");
+    service.push_str("Type=oneshot\n");
+    service.push_str("User=root\n");
+    for command in commands {
+        service.push_str(&format!("ExecStart={}\n", command_line(command)));
+    }
+    service
+}
+
+/// A timer starting `unit` on `calendar`, with the job's persistence and
+/// randomized delay.
+fn timer_unit(description: &str, job: &JobConfig, calendar: &str, unit: &str) -> String {
     let mut timer = String::new();
     timer.push_str("[Unit]\n");
-    timer.push_str(&format!(
-        "Description=LinuxReflect backup timer for {}\n",
-        job.name
-    ));
+    timer.push_str(&format!("Description={description}\n"));
     timer.push_str("\n[Timer]\n");
-    timer.push_str(&format!("OnCalendar={}\n", job.on_calendar));
+    timer.push_str(&format!("OnCalendar={calendar}\n"));
     timer.push_str(&format!("Persistent={}\n", job.persistent));
     if let Some(delay) = &job.randomized_delay {
         timer.push_str(&format!("RandomizedDelaySec={delay}\n"));
     }
-    timer.push_str(&format!("Unit={}\n", unit_name(&job.name, "service")));
+    timer.push_str(&format!("Unit={unit}\n"));
     timer.push_str("\n[Install]\n");
     timer.push_str("WantedBy=timers.target\n");
+    timer
+}
 
-    Ok(JobUnits {
-        job: job.name.clone(),
-        service_name: unit_name(&job.name, "service"),
-        service,
-        timer_name: unit_name(&job.name, "timer"),
-        timer,
-        destination,
-    })
+/// `linuxreflect-newchain@<name>.<kind>`: the units that start a new chain on
+/// `new_chain_on_calendar` (R36).
+#[must_use]
+pub fn chain_unit_name(job: &str, kind: &str) -> String {
+    format!("{CHAIN_UNIT_PREFIX}{job}.{kind}")
 }
 
 /// `linuxreflect-job@<name>.<kind>` (spec §J.4).
@@ -570,10 +755,15 @@ pub fn materialize(
     if !dry_run {
         std::fs::create_dir_all(&systemd_dir).map_err(Error::Io)?;
         for units in &jobs {
-            for (name, contents) in [
+            let mut files = vec![
                 (&units.service_name, &units.service),
                 (&units.timer_name, &units.timer),
-            ] {
+            ];
+            if let Some(chain) = &units.new_chain {
+                files.push((&chain.service_name, &chain.service));
+                files.push((&chain.timer_name, &chain.timer));
+            }
+            for (name, contents) in files {
                 let path = systemd_dir.join(name);
                 std::fs::write(&path, contents).map_err(Error::Io)?;
                 written.push(path);
@@ -590,8 +780,17 @@ pub fn materialize(
             reloaded = run_systemctl(&["daemon-reload"])?;
             if start {
                 let mut args = vec!["enable", "--now"];
-                let timers: Vec<String> =
-                    jobs.iter().map(|units| units.timer_name.clone()).collect();
+                let timers: Vec<String> = jobs
+                    .iter()
+                    .flat_map(|units| {
+                        std::iter::once(units.timer_name.clone()).chain(
+                            units
+                                .new_chain
+                                .as_ref()
+                                .map(|chain| chain.timer_name.clone()),
+                        )
+                    })
+                    .collect();
                 for timer in &timers {
                     args.push(timer);
                 }
@@ -647,11 +846,17 @@ pub fn remove(job: &str, systemd_dir: Option<&Path>) -> Result<Vec<PathBuf>> {
         let _ = std::process::Command::new("systemctl")
             .args(["disable", "--now"])
             .arg(unit_name(job, "timer"))
+            .arg(chain_unit_name(job, "timer"))
             .output();
     }
     let mut removed = Vec::new();
-    for kind in ["service", "timer"] {
-        let path = systemd_dir.join(unit_name(job, kind));
+    for name in [
+        unit_name(job, "service"),
+        unit_name(job, "timer"),
+        chain_unit_name(job, "service"),
+        chain_unit_name(job, "timer"),
+    ] {
+        let path = systemd_dir.join(name);
         match std::fs::remove_file(&path) {
             Ok(()) => removed.push(path),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -823,6 +1028,168 @@ keep_chains = 3
             assert!(parse(&text).is_err(), "{field} = {value:?} must be refused");
         }
         assert!(parse(&job("randomized_delay", "15m")).is_ok());
+    }
+
+    /// Every accepted field reaches the job, or the config is refused
+    /// (R36): the named destination's key and `known_hosts`, the daemon's
+    /// COW size, and `new_chain_on_calendar`.
+    #[test]
+    fn every_accepted_field_takes_effect() {
+        let text = r#"
+[daemon]
+lvm_cow_size = "10%"
+
+[[job]]
+name = "nightly"
+source = ["/dev/vg0/root"]
+dest = "nas"
+set = "laptop-root"
+passphrase_file = "/etc/linuxreflect/laptop-root.key"
+on_calendar = "*-*-* 02:00:00"
+persistent = true
+[job.retention]
+keep_chains = 2
+max_incrementals_per_chain = 14
+new_chain_on_calendar = "Sun *-*-* 01:00:00"
+
+[destinations.nas]
+kind = "sftp"
+host = "nas.local"
+user = "backup"
+path = "/backups/laptop"
+known_hosts = "/etc/linuxreflect/known_hosts"
+identity = "/etc/linuxreflect/id_ed25519"
+"#;
+        let config = parse(text).expect("config");
+        let units = render_job(&config, &config.jobs[0], Path::new("/usr/bin/linuxreflect"))
+            .expect("render");
+        let commands = |service: &str| -> Vec<Vec<String>> {
+            service
+                .lines()
+                .filter_map(|line| line.strip_prefix("ExecStart="))
+                .map(systemd_words)
+                .collect()
+        };
+        let has = |command: &[String], option: &str, value: &str| {
+            command
+                .windows(2)
+                .any(|pair| pair[0] == option && pair[1] == value)
+        };
+        let regular = commands(&units.service);
+        assert_eq!(regular.len(), 2, "{}", units.service);
+        for command in &regular {
+            assert!(
+                has(command, "--identity", "/etc/linuxreflect/id_ed25519"),
+                "{command:?}"
+            );
+            assert!(
+                has(command, "--known-hosts", "/etc/linuxreflect/known_hosts"),
+                "{command:?}"
+            );
+        }
+        assert!(
+            has(&regular[0], "--lvm-cow-size", "10%"),
+            "{:?}",
+            regular[0]
+        );
+        assert!(has(&regular[0], "--type", "incremental"));
+
+        // The new chain: its own timer on the given calendar, a full backup,
+        // and the incremental ordered after it when both are due.
+        let chain = units.new_chain.as_ref().expect("new-chain units");
+        assert_eq!(chain.timer_name, "linuxreflect-newchain@nightly.timer");
+        assert_eq!(chain.service_name, "linuxreflect-newchain@nightly.service");
+        assert!(
+            chain.timer.contains("OnCalendar=Sun *-*-* 01:00:00"),
+            "{}",
+            chain.timer
+        );
+        assert!(chain.timer.contains("Persistent=true"));
+        assert!(
+            chain
+                .timer
+                .contains("Unit=linuxreflect-newchain@nightly.service")
+        );
+        let full = commands(&chain.service);
+        assert!(has(&full[0], "--type", "full"), "{:?}", full[0]);
+        assert!(
+            !full[0].iter().any(|word| word == "--parent"),
+            "{:?}",
+            full[0]
+        );
+        assert!(has(&full[0], "--identity", "/etc/linuxreflect/id_ed25519"));
+        assert!(
+            units
+                .service
+                .contains("After=linuxreflect-newchain@nightly.service"),
+            "{}",
+            units.service
+        );
+
+        // Both pairs are written and removed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, text).expect("config");
+        let systemd = dir.path().join("units");
+        let report = materialize(
+            &config_path,
+            Path::new("/usr/bin/linuxreflect"),
+            Some(&systemd),
+            false,
+            false,
+            false,
+        )
+        .expect("materialize");
+        assert_eq!(report.written.len(), 4, "{:?}", report.written);
+        let removed = super::remove("nightly", Some(&systemd)).expect("remove");
+        assert_eq!(removed.len(), 4, "{removed:?}");
+        assert_eq!(std::fs::read_dir(&systemd).expect("units").count(), 0);
+    }
+
+    /// Values nothing would read, or that would fail only when the timer
+    /// fires, are refused when the config is read (R36).
+    #[test]
+    fn fields_without_an_effect_or_with_a_bad_value_are_refused() {
+        let job = |extra: &str| {
+            format!(
+                "[[job]]\nname = \"j\"\nsource = [\"/data\"]\ndest = \"/backups\"\nset = \"s\"\n\
+                 encrypt = false\non_calendar = \"daily\"\n{extra}\n"
+            )
+        };
+        for (text, why) in [
+            (
+                format!("[daemon]\nsocket = \"/tmp/other.sock\"\n{}", job("")),
+                "socket",
+            ),
+            (
+                format!("[daemon]\nlog_level = \"debug\"\n{}", job("")),
+                "log_level",
+            ),
+            (job("mode = \"blocky\""), "mode"),
+            (job("snapshot = \"zfs\""), "snapshot"),
+            (job("compress = \"lz4\""), "compress"),
+            (
+                job("type = \"incremental\"\nparent = \"yesterday\""),
+                "parent",
+            ),
+            (
+                format!(
+                    "{}[destinations.x]\nkind = \"ftp\"\npath = \"/p\"\n",
+                    job("")
+                ),
+                "kind",
+            ),
+        ] {
+            let error = parse(&text).expect_err(why);
+            assert!(format!("{error}").contains(why), "{why}: {error}");
+        }
+        assert!(
+            parse(&format!(
+                "[daemon]\nsocket = \"/run/linuxreflect/daemon.sock\"\nlog_level = \"info\"\n{}",
+                job("mode = \"file\"\nsnapshot = \"none\"\ncompress = \"zstd:3\"")
+            ))
+            .is_ok()
+        );
     }
 
     /// The spec's §J.2 example, verbatim.
@@ -1014,7 +1381,13 @@ on_calendar = "daily"
         )
         .expect("materialize");
         assert_eq!(report.jobs.len(), 1);
-        assert_eq!(report.written.len(), 2);
+        // The job and, for `new_chain_on_calendar`, its new-chain units.
+        assert_eq!(report.written.len(), 4);
+        assert!(
+            units_dir
+                .join(super::chain_unit_name("root-nightly", "timer"))
+                .exists()
+        );
         // A non-system directory cannot be reloaded; that is reported, not
         // silently ignored.
         assert!(!report.reloaded);

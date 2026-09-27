@@ -1565,6 +1565,13 @@ fn print_schedule(report: &serde_json::Value) {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("-"),
         );
+        if let Some(chain) = job
+            .get("new_chain")
+            .and_then(|chain| chain.get("timer_name"))
+            .and_then(serde_json::Value::as_str)
+        {
+            println!("  {:<20} new chains: {chain}", "");
+        }
     }
     if report.get("dry_run").and_then(serde_json::Value::as_bool) == Some(true) {
         println!("dry run: nothing was written");
