@@ -224,7 +224,29 @@ pub fn open_o_direct(path: &std::path::Path, write: bool) -> io::Result<OwnedFd>
 /// while the claim is held nobody else can mount or claim it. Sysfs and
 /// `mountinfo` checks cannot see mounts in other namespaces (A1, A2). On a
 /// regular file Linux ignores the flag. `direct` adds `O_DIRECT`.
+///
+/// Right after a device changes, udev probing or a partition-table reread can
+/// hold a claim for a moment, so `EBUSY` is retried for about a second. A
+/// device that stays busy, such as one mounted elsewhere, is still refused.
 pub fn open_block_exclusive(
+    path: &std::path::Path,
+    write: bool,
+    direct: bool,
+) -> io::Result<OwnedFd> {
+    const ATTEMPTS: u32 = 6;
+    let mut attempt = 1;
+    loop {
+        match open_block_exclusive_once(path, write, direct) {
+            Err(error) if error.raw_os_error() == Some(libc::EBUSY) && attempt < ATTEMPTS => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+fn open_block_exclusive_once(
     path: &std::path::Path,
     write: bool,
     direct: bool,
