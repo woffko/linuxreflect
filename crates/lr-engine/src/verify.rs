@@ -13,7 +13,6 @@
 
 use std::path::PathBuf;
 
-use lr_core::io::ReadSeek;
 use lr_core::{Error, ImageKind, Result};
 use lr_format::{
     BlockEntry, BlockManifestHeader, ChunkState, DiskHeader, ImageReader, StreamId, Superblock,
@@ -22,7 +21,6 @@ use lr_format::{
 use lr_store::{Destination, DestinationOptions, SetHandle, uri};
 
 use crate::keys::{self, Encryption};
-use crate::stream::{StreamLayout, parse_stream_layout};
 
 /// Largest plaintext a stream chunk can hold (CDC's maximum).
 const MAX_STREAM_CHUNK: usize = 256 * 1024;
@@ -349,8 +347,16 @@ fn verify_file(
             (member.file_name.clone(), lr_format::read_manifest(&bytes)?)
         };
         reporter.phase(&format!("member {file_name}"));
+        // The tree a restore of this recovery point would build (R25).
+        let tree: std::collections::BTreeMap<Vec<u8>, lr_format::FileRecord> = records
+            .iter()
+            .map(|record| (record.entry.path.clone(), record.clone()))
+            .collect();
+        crate::plan::file_tree(&tree)
+            .map_err(|error| Error::corrupt(format!("{file_name}: {error}")))?;
         for record in &records {
             restored_files += 1;
+            let mut position_in_file = 0u64;
             for hash in &record.entry.chunk_refs_here {
                 let Some((owner, offset, _)) = index.get(hash) else {
                     return Err(Error::corrupt(format!(
@@ -358,9 +364,6 @@ fn verify_file(
                         String::from_utf8_lossy(&record.entry.path)
                     )));
                 };
-                if every_member && *owner != position {
-                    continue;
-                }
                 let holder = &mut opened[*owner];
                 let entry = BlockEntry::stored(
                     u16::try_from(*owner).unwrap_or(u16::MAX),
@@ -380,9 +383,26 @@ fn verify_file(
                                 holder.superblock.image_uuid
                             ))
                         })?;
+                crate::plan::holes_hold_zeros(
+                    &record.entry.path,
+                    &record.holes,
+                    position_in_file,
+                    &plaintext,
+                )
+                .map_err(|error| Error::corrupt(format!("{file_name}: {error}")))?;
+                position_in_file += plaintext.len() as u64;
                 reporter.report(report.bytes_checked)?;
                 report.chunks += 1;
                 report.bytes_checked += plaintext.len() as u64;
+            }
+            if record.entry.file_kind == lr_format::FILE_KIND_REGULAR
+                && position_in_file != record.entry.size
+            {
+                return Err(Error::corrupt(format!(
+                    "{file_name}: {} records {} bytes, its chunks hold {position_in_file}",
+                    String::from_utf8_lossy(&record.entry.path),
+                    record.entry.size
+                )));
             }
         }
     }
@@ -447,40 +467,13 @@ fn verify_stream(
                 report.bytes_checked += plaintext.len() as u64;
             }
         }
-        // The layout extras must still parse: they carry what a restore needs.
-        let _ = stream_layout_of(&mut reader, &keys, kind);
+        // What a restore needs, the section list and the Btrfs layout
+        // record, must parse; a missing layout fails here, not at restore
+        // time (R25).
+        crate::stream::read_stream_image(destination, set, &member.file_name, encryption)
+            .map_err(|error| Error::corrupt(format!("{}: {error}", member.file_name)))?;
     }
     Ok(())
-}
-
-fn stream_layout_of(
-    reader: &mut ImageReader<Box<dyn ReadSeek + Send>>,
-    keys: &crate::keys::ImageKeys,
-    kind: lr_crypto::aead::AeadKind,
-) -> Option<StreamLayout> {
-    let mut extras = Vec::new();
-    {
-        let mut page = reader
-            .stream_reader(StreamId::Extras, *keys.meta_key, kind)
-            .ok()?;
-        let mut buffer = vec![0u8; 64 * 1024];
-        loop {
-            let read = page.read_bytes_partial(&mut buffer).ok()?;
-            if read == 0 {
-                break;
-            }
-            extras.extend_from_slice(&buffer[..read]);
-        }
-    }
-    let mut cursor = std::io::Cursor::new(extras.as_slice());
-    while (cursor.position() as usize) < extras.len() {
-        let mut wire = wire::Reader::new(&mut cursor);
-        let (extras_kind, payload) = lr_format::read_extras_record(&mut wire).ok()?;
-        if extras_kind == lr_format::EXTRAS_BTRFS_LAYOUT {
-            return parse_stream_layout(&String::from_utf8_lossy(&payload)).ok();
-        }
-    }
-    None
 }
 
 /// Re-hash every chunk of every region of a whole-disk image.

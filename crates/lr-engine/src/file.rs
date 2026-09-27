@@ -938,7 +938,9 @@ pub fn restore_file(request: &FileRestoreRequest) -> Result<FileRestoreReport> {
 
     // Nothing is written before the whole tree is known to stay inside the
     // target (R06).
-    validate_tree(&final_entries)?;
+    // Paths, holes and hard-link groups, before anything is written (R06,
+    // R25).
+    crate::plan::file_tree(&final_entries)?;
     prepare_target(&request.target, request.merge)?;
     let root = tree::RestoreRoot::open(&request.target)?;
 
@@ -994,9 +996,23 @@ pub fn restore_file(request: &FileRestoreRequest) -> Result<FileRestoreReport> {
                     ))
                 })?;
                 let plaintext = member.chunk_plaintext(entry, CDC_MAX as usize)?;
+                crate::plan::holes_hold_zeros(
+                    &record.entry.path,
+                    &record.holes,
+                    offset,
+                    &plaintext,
+                )?;
                 write_skipping_holes(file, offset, &plaintext, &record.holes)?;
                 offset += plaintext.len() as u64;
                 restored_bytes += plaintext.len() as u64;
+            }
+            // A size the chunks do not hold would be padded or cut (R25).
+            if offset != record.entry.size {
+                return Err(Error::corrupt(format!(
+                    "{} records {} bytes, its chunks hold {offset}",
+                    String::from_utf8_lossy(&record.entry.path),
+                    record.entry.size
+                )));
             }
             reporter.report(restored_bytes)?;
             Ok(())

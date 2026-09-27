@@ -127,6 +127,89 @@ pub(crate) fn whole_disk<R: std::io::Read + std::io::Seek>(
     Ok(summary)
 }
 
+/// The structural checks a file tree passes before it is restored or called
+/// restorable (R25): plain paths below directories of the image (R06), hole
+/// maps only on regular files, sorted, non-empty and inside the file, and a
+/// file carrying every hard-link group a link names.
+///
+/// # Errors
+/// Returns [`Error::Corrupt`] naming the first violation.
+pub(crate) fn file_tree(
+    records: &std::collections::BTreeMap<Vec<u8>, lr_format::FileRecord>,
+) -> Result<()> {
+    crate::file::validate_tree(records)?;
+    let name = |path: &[u8]| String::from_utf8_lossy(path).into_owned();
+    let mut groups = std::collections::HashSet::new();
+    for record in records.values() {
+        let entry = &record.entry;
+        if !record.holes.is_empty() && entry.file_kind != lr_format::FILE_KIND_REGULAR {
+            return Err(Error::corrupt(format!(
+                "{} records holes but is not a regular file",
+                name(&entry.path)
+            )));
+        }
+        let mut end = 0u64;
+        for &(offset, len) in &record.holes {
+            let hole_end = offset.checked_add(len);
+            if len == 0 || offset < end || hole_end.is_none_or(|hole_end| hole_end > entry.size) {
+                return Err(Error::corrupt(format!(
+                    "{} records the hole {offset}+{len}, which is empty, out of order or past \
+                     its {}-byte size",
+                    name(&entry.path),
+                    entry.size
+                )));
+            }
+            end = offset + len;
+        }
+        if entry.file_kind == lr_format::FILE_KIND_REGULAR && entry.hardlink_group != 0 {
+            groups.insert(entry.hardlink_group);
+        }
+    }
+    for record in records.values() {
+        let entry = &record.entry;
+        if entry.file_kind == lr_format::FILE_KIND_HARDLINK
+            && !groups.contains(&entry.hardlink_group)
+        {
+            return Err(Error::corrupt(format!(
+                "{} is a hard link to group {}, which no file of the image carries",
+                name(&entry.path),
+                entry.hardlink_group
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Check one decoded chunk of a file at `position` against its recorded
+/// holes: a hole must hold zeros, or the restore, which leaves holes
+/// unwritten, would lose data (R25).
+///
+/// # Errors
+/// Returns [`Error::Corrupt`] when a hole covers non-zero content.
+pub(crate) fn holes_hold_zeros(
+    path: &[u8],
+    holes: &[(u64, u64)],
+    position: u64,
+    plaintext: &[u8],
+) -> Result<()> {
+    let end = position + plaintext.len() as u64;
+    for &(offset, len) in holes {
+        let from = offset.max(position);
+        let to = (offset + len).min(end);
+        if from >= to {
+            continue;
+        }
+        let slice = &plaintext[(from - position) as usize..(to - position) as usize];
+        if slice.iter().any(|byte| *byte != 0) {
+            return Err(Error::corrupt(format!(
+                "{} records a hole at {offset}+{len} over data",
+                String::from_utf8_lossy(path)
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The message for an image that records unreadable source chunks (R26).
 #[must_use]
 pub fn bad_sector_message(bad: u64, first: Option<u64>) -> String {
@@ -359,6 +442,298 @@ mod tests {
             let (outcome, untouched) = prepare(flaw);
             assert!(outcome.is_err(), "{what} was accepted");
             assert!(untouched, "{what}: the target was written");
+        }
+    }
+
+    // --- File images (R25) ---
+
+    use lr_format::{ChainMember, ChunkOptions, FileEntry, FileRecord};
+
+    fn file_entry(path: &str, kind: u8, size: u64, refs: Vec<[u8; 32]>, group: u32) -> FileEntry {
+        FileEntry {
+            file_kind: kind,
+            mode: if kind == lr_format::FILE_KIND_DIRECTORY {
+                0o040_755
+            } else {
+                0o100_644
+            },
+            uid: 0,
+            gid: 0,
+            mtime_sec: 1,
+            mtime_nsec: 0,
+            size,
+            rdev: 0,
+            hardlink_group: group,
+            link_target: Vec::new(),
+            path: path.as_bytes().to_vec(),
+            xattrs: Vec::new(),
+            acl: Vec::new(),
+            chunk_refs_total: refs.len() as u64,
+            chunk_refs_here: refs,
+        }
+    }
+
+    /// A file image whose `data` file holds `chunks` and records `size` and
+    /// `holes`; `extra` records are added as they are.
+    fn write_file_image(
+        path: &std::path::Path,
+        chunks: &[&[u8]],
+        size: u64,
+        holes: Vec<(u64, u64)>,
+        extra: Vec<FileRecord>,
+    ) {
+        let superblock = Superblock {
+            image_kind: ImageKind::File,
+            flags: 0,
+            source_size_bytes: size,
+            logical_block_size: 4096,
+            chunk_size: crate::file::CDC_MAX,
+            ..whole_disk_superblock()
+        };
+        let derived = crate::keys::unlock_image(&Encryption::NoEncrypt, &superblock).expect("keys");
+        let keys = WriterKeys {
+            data_key: None,
+            meta_key: *derived.meta_key,
+            dedup_key: *derived.dedup_key,
+        };
+        let file = std::fs::File::create(path).expect("create");
+        let mut writer = ImageWriter::create(file, &superblock, None).expect("writer");
+        let mut nonce = NonceSeq::new();
+        let mut index = Vec::new();
+        let mut refs = Vec::new();
+        for chunk in chunks {
+            let reference = writer
+                .append_chunk(
+                    ChunkOptions {
+                        kind: AeadKind::Aes256Gcm,
+                        level: 0,
+                        compress: false,
+                    },
+                    &keys,
+                    ImageKind::File,
+                    &mut nonce,
+                    chunk,
+                )
+                .expect("chunk");
+            refs.push(reference.hash);
+            index.push(
+                BlockEntry::stored(0, reference.hash, reference.offset, reference.stored_len)
+                    .expect("entry"),
+            );
+        }
+        let mut records = vec![
+            FileRecord {
+                entry: file_entry("", lr_format::FILE_KIND_DIRECTORY, 0, Vec::new(), 0),
+                holes: Vec::new(),
+            },
+            FileRecord {
+                entry: file_entry("data", lr_format::FILE_KIND_REGULAR, size, refs, 0),
+                holes,
+            },
+        ];
+        records.extend(extra);
+        {
+            let mut manifest =
+                writer.page_stream(StreamId::Manifest, AeadKind::Aes256Gcm, *derived.meta_key);
+            for record in &records {
+                lr_format::write_record(&mut manifest, record).expect("record");
+            }
+            manifest.finish().expect("manifest");
+        }
+        {
+            let mut hash_index =
+                writer.page_stream(StreamId::HashIndex, AeadKind::Aes256Gcm, *derived.meta_key);
+            for entry in &index {
+                entry.write(&mut hash_index).expect("index");
+            }
+            hash_index.finish().expect("index");
+        }
+        {
+            let mut extras =
+                writer.page_stream(StreamId::Extras, AeadKind::Aes256Gcm, *derived.meta_key);
+            lr_format::write_chain_members(
+                &mut extras,
+                &[ChainMember {
+                    index: 0,
+                    image_uuid: superblock.image_uuid,
+                }],
+            )
+            .expect("members");
+            extras.finish().expect("extras");
+        }
+        let (mut file, _footer) = writer
+            .finish(&[0u8; 32], None, AeadKind::Aes256Gcm)
+            .expect("finish");
+        use std::io::Write;
+        file.flush().expect("flush");
+    }
+
+    fn verify_file_image(
+        chunks: &[&[u8]],
+        size: u64,
+        holes: Vec<(u64, u64)>,
+        extra: Vec<FileRecord>,
+    ) -> lr_core::Result<crate::verify::VerifyReport> {
+        let set = tempfile::Builder::new()
+            .prefix("set")
+            .tempdir()
+            .expect("set");
+        std::fs::create_dir(set.path().join("chain")).expect("chain");
+        let image = set.path().join("chain/000-full.lrimg");
+        write_file_image(&image, chunks, size, holes, extra);
+        crate::verify::verify_image(&crate::verify::VerifyRequest {
+            image: image.display().to_string(),
+            encryption: Encryption::NoEncrypt,
+            chain: true,
+            destination_options: lr_store::DestinationOptions::default(),
+            context: crate::progress::EngineContext::silent(),
+        })
+    }
+
+    /// File images that are well framed but cannot be restored as recorded
+    /// fail verification (R25).
+    #[test]
+    fn file_images_that_cannot_be_restored_fail_verification() {
+        let data: &[u8] = &[0x11; 8192];
+        let mut sparse = vec![0x22u8; 4096];
+        sparse.extend_from_slice(&[0u8; 4096]);
+        verify_file_image(&[data], 8192, Vec::new(), Vec::new()).expect("a sound image");
+        verify_file_image(&[&sparse], 8192, vec![(4096, 4096)], Vec::new())
+            .expect("a hole over zeros");
+        let orphan = FileRecord {
+            entry: file_entry("link", lr_format::FILE_KIND_HARDLINK, 8192, Vec::new(), 7),
+            holes: Vec::new(),
+        };
+        for (what, outcome) in [
+            (
+                "a size its chunks do not hold",
+                verify_file_image(&[data], 9000, Vec::new(), Vec::new()),
+            ),
+            (
+                "a hole past the end",
+                verify_file_image(&[data], 8192, vec![(8000, 4096)], Vec::new()),
+            ),
+            (
+                "a hole over data",
+                verify_file_image(&[data], 8192, vec![(0, 4096)], Vec::new()),
+            ),
+            (
+                "a hard link to no file",
+                verify_file_image(&[data], 8192, Vec::new(), vec![orphan]),
+            ),
+        ] {
+            assert!(outcome.is_err(), "{what} verified: {outcome:?}");
+        }
+    }
+
+    // --- Stream images (R25) ---
+
+    /// A stream image with one stored chunk, with or without its Btrfs
+    /// layout record.
+    fn write_stream_image(path: &std::path::Path, with_layout: bool) {
+        let superblock = Superblock {
+            image_kind: ImageKind::Stream,
+            flags: 0,
+            source_size_bytes: 4096,
+            logical_block_size: 4096,
+            chunk_size: crate::file::CDC_MAX,
+            ..whole_disk_superblock()
+        };
+        let derived = crate::keys::unlock_image(&Encryption::NoEncrypt, &superblock).expect("keys");
+        let keys = WriterKeys {
+            data_key: None,
+            meta_key: *derived.meta_key,
+            dedup_key: *derived.dedup_key,
+        };
+        let file = std::fs::File::create(path).expect("create");
+        let mut writer = ImageWriter::create(file, &superblock, None).expect("writer");
+        let mut nonce = NonceSeq::new();
+        let reference = writer
+            .append_chunk(
+                ChunkOptions {
+                    kind: AeadKind::Aes256Gcm,
+                    level: 0,
+                    compress: false,
+                },
+                &keys,
+                ImageKind::Stream,
+                &mut nonce,
+                &[0x33; 4096],
+            )
+            .expect("chunk");
+        {
+            let mut manifest =
+                writer.page_stream(StreamId::Manifest, AeadKind::Aes256Gcm, *derived.meta_key);
+            lr_format::StreamSection {
+                subvolid: 256,
+                send_stream_bytes: 4096,
+                parent_snapshot_uuid: None,
+                subvol_path: "/@".to_owned(),
+                entry_count: 1,
+            }
+            .write(&mut manifest)
+            .expect("section");
+            BlockEntry::stored(0, reference.hash, reference.offset, reference.stored_len)
+                .expect("entry")
+                .write(&mut manifest)
+                .expect("entry");
+            manifest.finish().expect("manifest");
+        }
+        {
+            let mut extras =
+                writer.page_stream(StreamId::Extras, AeadKind::Aes256Gcm, *derived.meta_key);
+            lr_format::write_chain_members(
+                &mut extras,
+                &[ChainMember {
+                    index: 0,
+                    image_uuid: superblock.image_uuid,
+                }],
+            )
+            .expect("members");
+            if with_layout {
+                lr_format::write_extras_record(
+                    &mut extras,
+                    lr_format::EXTRAS_BTRFS_LAYOUT,
+                    b"fs_uuid=00000000-0000-0000-0000-000000000001\nlabel=\n\
+                      default_subvolid=256\ndefault_subvol_path=/@\nmount_options=\n\
+                      subvol=/@\t256\n",
+                )
+                .expect("layout");
+            }
+            extras.finish().expect("extras");
+        }
+        let (mut file, _footer) = writer
+            .finish(&[0u8; 32], None, AeadKind::Aes256Gcm)
+            .expect("finish");
+        use std::io::Write;
+        file.flush().expect("flush");
+    }
+
+    /// A stream image without the Btrfs layout record a restore needs fails
+    /// verification instead of failing at restore time (R25).
+    #[test]
+    fn a_stream_image_without_its_layout_fails_verification() {
+        for with_layout in [true, false] {
+            let set = tempfile::Builder::new()
+                .prefix("set")
+                .tempdir()
+                .expect("set");
+            std::fs::create_dir(set.path().join("chain")).expect("chain");
+            let image = set.path().join("chain/000-full.lrimg");
+            write_stream_image(&image, with_layout);
+            let outcome = crate::verify::verify_image(&crate::verify::VerifyRequest {
+                image: image.display().to_string(),
+                encryption: Encryption::NoEncrypt,
+                chain: true,
+                destination_options: lr_store::DestinationOptions::default(),
+                context: crate::progress::EngineContext::silent(),
+            });
+            if with_layout {
+                outcome.expect("a complete stream image verifies");
+            } else {
+                let error = outcome.expect_err("the layout is missing");
+                assert!(error.to_string().contains("layout"), "{error}");
+            }
         }
     }
 }

@@ -536,9 +536,33 @@ pub fn prepare_restore(request: &PrepareRequest) -> Result<RestorePlan> {
         // What a block restore would write, checked before any token: a
         // malformed manifest or a recorded bad sector is refused here, not
         // halfway through the target (R26).
-        if superblock.image_kind == ImageKind::Block {
-            let summary = crate::plan::block_chain(validated, &superblock)?;
-            crate::plan::refuse_bad_sectors(&summary)?;
+        match superblock.image_kind {
+            ImageKind::Block => {
+                let summary = crate::plan::block_chain(validated, &superblock)?;
+                crate::plan::refuse_bad_sectors(&summary)?;
+            }
+            // The tree the restore would build (R25).
+            ImageKind::File => {
+                let mut validated = validated;
+                if let Some(newest) = validated.last_mut() {
+                    let tree = crate::file::read_records(newest)?
+                        .into_iter()
+                        .map(|record| (record.entry.path.clone(), record))
+                        .collect();
+                    crate::plan::file_tree(&tree)?;
+                }
+            }
+            // Every member's sections and Btrfs layout record (R25).
+            ImageKind::Stream => {
+                for file in &files {
+                    crate::stream::read_stream_image(
+                        &*destination,
+                        &set,
+                        &file.file_name,
+                        &request.encryption,
+                    )?;
+                }
+            }
         }
         files.into_iter().map(|file| file.file_name).collect()
     };
