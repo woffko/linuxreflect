@@ -29,6 +29,8 @@ struct Args {
     /// Octal socket mode override (tests, containers).
     socket_mode: Option<u32>,
     token_secret_file: Option<PathBuf>,
+    /// Registry of named destinations (A6).
+    destinations_file: Option<PathBuf>,
     help: bool,
 }
 
@@ -43,6 +45,7 @@ impl Default for Args {
             sd_notify: true,
             socket_mode: None,
             token_secret_file: None,
+            destinations_file: None,
             help: false,
         }
     }
@@ -77,6 +80,13 @@ impl Args {
                             .into(),
                     );
                 }
+                "--destinations-file" => {
+                    args.destinations_file = Some(
+                        argv.next()
+                            .ok_or("--destinations-file needs a path")?
+                            .into(),
+                    );
+                }
                 "--sd-notify=no" | "--no-sd-notify" => args.sd_notify = false,
                 "--sd-notify=yes" => args.sd_notify = true,
                 "--help" | "-h" => args.help = true,
@@ -89,7 +99,8 @@ impl Args {
     fn usage() -> &'static str {
         "linuxreflect-daemon [--socket PATH] [--socket-group NAME] [--no-create-group]\n\
          \x20                    [--socket-mode OCTAL] [--auth static:<uid,...>] [--dev-mode]\n\
-         \x20                    [--sd-notify=no] [--token-secret-file PATH]"
+         \x20                    [--sd-notify=no] [--token-secret-file PATH]\n\
+         \x20                    [--destinations-file PATH]"
     }
 }
 
@@ -136,6 +147,9 @@ fn init_logging() {
 
 /// Start the daemon and serve until the process is stopped.
 fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(path) = &args.destinations_file {
+        lr_store::named::set_registry_path(path.clone());
+    }
     if let Some(path) = &args.token_secret_file {
         lr_engine::restore::init_token_secret(path)?;
     }

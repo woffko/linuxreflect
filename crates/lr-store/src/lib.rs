@@ -9,6 +9,7 @@
 
 pub mod known_hosts;
 pub mod local;
+pub mod named;
 mod publish;
 pub mod sftp;
 pub mod uri;
@@ -266,6 +267,9 @@ impl DestinationOptions {
 /// Returns [`Error::Unsupported`] for an unknown scheme or an SFTP option this
 /// build cannot honour, and propagates connection errors.
 pub fn open(uri: &str, options: &DestinationOptions) -> Result<std::sync::Arc<dyn Destination>> {
+    // `@name` is a destination configured on this machine (A6).
+    let (uri, options) = named::resolve(uri, options)?;
+    let (uri, options) = (uri.as_str(), &options);
     // The set name becomes a directory; an empty one is allowed only for
     // listing the sets (D-106), and anything else must match D-115.
     if !options.set_name.is_empty() {

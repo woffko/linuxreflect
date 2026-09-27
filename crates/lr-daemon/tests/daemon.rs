@@ -70,6 +70,8 @@ fn invalid_explicit_key_fails_before_serving_without_environment_fallback() {
 struct Daemon {
     child: Child,
     socket: PathBuf,
+    /// The daemon's registry of named destinations (A6).
+    destinations: PathBuf,
     _dir: tempfile::TempDir,
 }
 
@@ -82,6 +84,7 @@ impl Daemon {
         let socket = dir.path().join("daemon.sock");
         let secret = dir.path().join("token.key");
         let unused_env_secret = dir.path().join("environment-token.key");
+        let destinations = dir.path().join("destinations.toml");
         let binary = env!("CARGO_BIN_EXE_linuxreflect-daemon");
         let child = Command::new(binary)
             .env("LR_TOKEN_SECRET_FILE", &unused_env_secret)
@@ -99,6 +102,8 @@ impl Daemon {
                 "--sd-notify=no",
                 "--token-secret-file",
                 &secret.display().to_string(),
+                "--destinations-file",
+                &destinations.display().to_string(),
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -107,6 +112,7 @@ impl Daemon {
         let mut daemon = Self {
             child,
             socket,
+            destinations,
             _dir: dir,
         };
         if !daemon.wait_for_socket() {
@@ -792,4 +798,97 @@ async fn file_options_survive_the_daemon_route() {
         Some("true"),
         "{metadata:?}"
     );
+}
+
+/// ListSets hands the caller's SSH options to the destination; they were
+/// dropped before, so an SFTP set could not be listed (A6).
+#[tokio::test]
+async fn list_sets_forwards_the_ssh_options() {
+    let daemon = Daemon::start(&format!("static:{}", uid()));
+    let work = tempfile::tempdir().expect("workdir");
+    // A key with open permissions is refused before any connection, naming
+    // the file: proof that the daemon received it.
+    let key = work.path().join("forwarded-marker-key");
+    std::fs::write(&key, b"not a key").expect("key");
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).expect("mode");
+    let mut client = daemon.client().await;
+    let error = client
+        .list_sets(SetRef {
+            dest: "sftp://backup@127.0.0.1:1/srv".to_owned(),
+            set: "laptop".to_owned(),
+            identity: key.display().to_string(),
+            ..SetRef::default()
+        })
+        .await
+        .expect_err("no server listens there");
+    assert!(
+        error.message().contains("forwarded-marker-key"),
+        "{}",
+        error.message()
+    );
+}
+
+/// A destination configured by name is used as `@name` for backups and
+/// listings, and can be removed again (A6).
+#[tokio::test]
+async fn a_named_destination_is_used_by_name() {
+    let daemon = Daemon::start(&format!("static:{}", uid()));
+    let work = tempfile::tempdir().expect("workdir");
+    let source = work.path().join("tree");
+    std::fs::create_dir_all(&source).expect("tree");
+    std::fs::write(source.join("file"), b"data").expect("file");
+    let backups = work.path().join("backups");
+    let mut client = daemon.client().await;
+    let list = client
+        .set_destination(lr_proto::v1::NamedDestination {
+            name: "shelf".to_owned(),
+            uri: backups.display().to_string(),
+            ..lr_proto::v1::NamedDestination::default()
+        })
+        .await
+        .expect("configure")
+        .into_inner();
+    assert_eq!(list.destinations.len(), 1);
+    assert!(daemon.destinations.is_file());
+
+    let mut stream = client
+        .create_backup(BackupSpec {
+            source: source.display().to_string(),
+            dest: "@shelf".to_owned(),
+            set: "named".to_owned(),
+            mode: "file".to_owned(),
+            no_encrypt: true,
+            ..BackupSpec::default()
+        })
+        .await
+        .expect("create_backup")
+        .into_inner();
+    let mut progress = Vec::new();
+    while let Some(step) = stream.message().await.expect("stream") {
+        progress.push(step);
+    }
+    assert!(failure_code(&progress).is_none(), "{progress:?}");
+    assert!(
+        backups.join("named").is_dir(),
+        "the backup went to the named folder"
+    );
+
+    let sets = client
+        .list_sets(SetRef {
+            dest: "@shelf".to_owned(),
+            ..SetRef::default()
+        })
+        .await
+        .expect("list sets")
+        .into_inner();
+    assert_eq!(sets.sets, ["named"]);
+
+    let list = client
+        .remove_destination(lr_proto::v1::DestinationRef {
+            name: "shelf".to_owned(),
+        })
+        .await
+        .expect("remove")
+        .into_inner();
+    assert!(list.destinations.is_empty());
 }

@@ -1521,3 +1521,27 @@ changes is that nothing is omitted silently.
   image contains, and systems such as Docker's Btrfs driver or Snapper keep
   hundreds of nested subvolumes that nobody wants in a system backup. Mounting
   what should be included is the explicit, reviewable choice.
+
+## D-121 — SFTP destinations are configured on the daemon and named
+
+The installed daemon runs without an `ssh-agent`, and the GUI had no way to
+supply a key, so SFTP could not be used from the GUI (A6). Letting clients send
+key paths is not the answer: listing is allowed to any user of the active
+session, and the root daemon would then read whatever file a client names
+(compare A4).
+
+- **Registry.** `/etc/linuxreflect/destinations.toml` (the daemon's
+  `--destinations-file`) holds `[[destination]]` entries: `name`, `uri`, and
+  optional absolute `identity` and `known_hosts` paths. Names follow the set-
+  name grammar (D-115).
+- **Use.** Any destination argument can be `@name`, and an image URI
+  `@name/<set>/<chain>/<file>`. `lr_store::open` resolves the name, so every
+  operation supports it, and a named destination's own key and `known_hosts`
+  replace anything a client sent.
+- **Management.** `ListDestinations` needs `disk.read`; `SetDestination` and
+  `RemoveDestination` need `destination.configure` (administrator). The CLI
+  has `linuxreflect destination list|add|remove`, which edits the registry
+  directly when no daemon runs. The GUI lists the configured destinations in
+  the backup wizard and uses them by name.
+- `ListSets` and `ListChains` now forward the SSH options a request carries,
+  for callers that do pass them.

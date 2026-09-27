@@ -1143,7 +1143,8 @@ pub(crate) fn snapshot_opts(request: &BackupRequest) -> SnapshotOpts {
         // pass even a local path as `dest`, and only SFTP is remote (R27).
         destination: local_destination(request),
         destination_remote: matches!(
-            lr_store::uri::parse(&request.dest),
+            lr_store::named::resolve(&request.dest, &request.destination_options)
+                .and_then(|(uri, _)| lr_store::uri::parse(&uri)),
             Ok(lr_store::DestinationUri::Sftp { .. })
         ),
     }
@@ -1154,7 +1155,10 @@ fn local_destination(request: &BackupRequest) -> Option<PathBuf> {
     if request.dest.is_empty() {
         return Some(request.dest_root.clone());
     }
-    match lr_store::uri::parse(&request.dest) {
+    // A named destination is judged by what it names (A6).
+    let dest = lr_store::named::resolve(&request.dest, &request.destination_options)
+        .map_or_else(|_| request.dest.clone(), |(uri, _)| uri);
+    match lr_store::uri::parse(&dest) {
         Ok(lr_store::DestinationUri::Local { path }) => Some(path),
         _ => None,
     }

@@ -339,6 +339,29 @@ fn job_state_of(snapshot: &crate::jobs::JobSnapshot) -> JobState {
     }
 }
 
+/// The configured destinations, for the client.
+fn destination_list() -> std::result::Result<lr_proto::v1::DestinationList, Status> {
+    let entries =
+        lr_store::named::load(&lr_store::named::registry_path()).map_err(status::status_of)?;
+    Ok(lr_proto::v1::DestinationList {
+        destinations: entries
+            .into_iter()
+            .map(|entry| lr_proto::v1::NamedDestination {
+                name: entry.name,
+                uri: entry.uri,
+                identity: entry
+                    .identity
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+                known_hosts: entry
+                    .known_hosts
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+            })
+            .collect(),
+    })
+}
+
 #[tonic::async_trait]
 impl LinuxReflect for DaemonService {
     type CreateBackupStream = ReceiverStream<std::result::Result<Progress, Status>>;
@@ -415,6 +438,56 @@ impl LinuxReflect for DaemonService {
     ) -> std::result::Result<Response<SetInfo>, Status> {
         self.authorize(&request, Action::DiskRead).await?;
         Ok(Response::new(self.set_info(request.get_ref())?))
+    }
+
+    async fn list_destinations(
+        &self,
+        request: GrpcRequest<lr_proto::v1::Request>,
+    ) -> std::result::Result<Response<lr_proto::v1::DestinationList>, Status> {
+        self.authorize(&request, Action::DiskRead).await?;
+        Ok(Response::new(destination_list()?))
+    }
+
+    async fn set_destination(
+        &self,
+        request: GrpcRequest<lr_proto::v1::NamedDestination>,
+    ) -> std::result::Result<Response<lr_proto::v1::DestinationList>, Status> {
+        self.authorize(&request, Action::DestinationConfigure)
+            .await?;
+        let wanted = request.get_ref();
+        let entry = lr_store::named::NamedDestination {
+            name: wanted.name.clone(),
+            uri: wanted.uri.clone(),
+            identity: (!wanted.identity.is_empty()).then(|| PathBuf::from(&wanted.identity)),
+            known_hosts: (!wanted.known_hosts.is_empty())
+                .then(|| PathBuf::from(&wanted.known_hosts)),
+        };
+        lr_store::named::validate(&entry).map_err(status::status_of)?;
+        let path = lr_store::named::registry_path();
+        let mut entries = lr_store::named::load(&path).map_err(status::status_of)?;
+        entries.retain(|existing| existing.name != entry.name);
+        entries.push(entry);
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        lr_store::named::save(&path, &entries).map_err(status::status_of)?;
+        Ok(Response::new(destination_list()?))
+    }
+
+    async fn remove_destination(
+        &self,
+        request: GrpcRequest<lr_proto::v1::DestinationRef>,
+    ) -> std::result::Result<Response<lr_proto::v1::DestinationList>, Status> {
+        self.authorize(&request, Action::DestinationConfigure)
+            .await?;
+        let name = request.get_ref().name.clone();
+        let path = lr_store::named::registry_path();
+        let mut entries = lr_store::named::load(&path).map_err(status::status_of)?;
+        let before = entries.len();
+        entries.retain(|existing| existing.name != name);
+        if entries.len() == before {
+            return Err(status::not_found(format!("no destination named @{name}")));
+        }
+        lr_store::named::save(&path, &entries).map_err(status::status_of)?;
+        Ok(Response::new(destination_list()?))
     }
 
     async fn list_chains(
@@ -809,7 +882,14 @@ impl LinuxReflect for DaemonService {
 impl DaemonService {
     /// Load and validate a set's catalog for `ListSets`/`ListChains`.
     fn set_info(&self, spec: &SetRef) -> std::result::Result<SetInfo, Status> {
-        let options = lr_store::DestinationOptions::new(&spec.set);
+        // The caller's SSH options reach the destination (A6); a named
+        // destination replaces them with its own.
+        let options = lr_store::DestinationOptions {
+            set_name: spec.set.clone(),
+            identity: (!spec.identity.is_empty()).then(|| PathBuf::from(&spec.identity)),
+            known_hosts: (!spec.known_hosts.is_empty()).then(|| PathBuf::from(&spec.known_hosts)),
+            insecure_ignore_host_key: spec.insecure_ignore_host_key,
+        };
         let destination = lr_store::open(&spec.dest, &options).map_err(status::status_of)?;
         if spec.set.is_empty() {
             // No set named: list the sets instead of opening (and creating)

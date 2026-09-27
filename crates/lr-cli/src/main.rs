@@ -161,6 +161,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             },
             cli.socket.as_deref(),
         ),
+        Command::Destination(command) => destination(cli.json, command, cli.socket.as_deref()),
         Command::Retention(RetentionCommand::Apply {
             dest,
             set,
@@ -1282,6 +1283,94 @@ fn restore_prepare(
     println!("token: {}", plan.token);
     println!();
     println!("apply with: linuxreflect restore apply --token <token> --confirm");
+    Ok(())
+}
+
+/// `destination list|add|remove` (A6): through the daemon when it runs,
+/// otherwise on the registry file directly (which needs root).
+fn destination(
+    json: bool,
+    command: &cli::DestinationCommand,
+    socket: Option<&Path>,
+) -> anyhow::Result<()> {
+    use cli::DestinationCommand;
+    use client::DestinationChange;
+    let change = match command {
+        DestinationCommand::List => DestinationChange::List,
+        DestinationCommand::Add {
+            name,
+            uri,
+            identity,
+            known_hosts,
+        } => DestinationChange::Set(lr_proto::v1::NamedDestination {
+            name: name.clone(),
+            uri: uri.clone(),
+            identity: identity
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            known_hosts: known_hosts
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+        }),
+        DestinationCommand::Remove { name } => DestinationChange::Remove(name.clone()),
+    };
+    let entries: Vec<lr_store::named::NamedDestination> = if let Some(mut client) =
+        client_if_available(socket)
+    {
+        client
+            .destinations(change)?
+            .destinations
+            .into_iter()
+            .map(|entry| lr_store::named::NamedDestination {
+                name: entry.name,
+                uri: entry.uri,
+                identity: (!entry.identity.is_empty()).then(|| PathBuf::from(entry.identity)),
+                known_hosts: (!entry.known_hosts.is_empty())
+                    .then(|| PathBuf::from(entry.known_hosts)),
+            })
+            .collect()
+    } else {
+        let path = lr_store::named::registry_path();
+        let mut entries = lr_store::named::load(&path)?;
+        match change {
+            DestinationChange::List => {}
+            DestinationChange::Set(entry) => {
+                let entry = lr_store::named::NamedDestination {
+                    name: entry.name,
+                    uri: entry.uri,
+                    identity: (!entry.identity.is_empty()).then(|| PathBuf::from(entry.identity)),
+                    known_hosts: (!entry.known_hosts.is_empty())
+                        .then(|| PathBuf::from(entry.known_hosts)),
+                };
+                lr_store::named::validate(&entry)?;
+                entries.retain(|existing| existing.name != entry.name);
+                entries.push(entry);
+                entries.sort_by(|left, right| left.name.cmp(&right.name));
+                lr_store::named::save(&path, &entries)?;
+            }
+            DestinationChange::Remove(name) => {
+                let before = entries.len();
+                entries.retain(|existing| existing.name != name);
+                if entries.len() == before {
+                    bail!("no destination named @{name}");
+                }
+                lr_store::named::save(&path, &entries)?;
+            }
+        }
+        entries
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&entries)?);
+        return Ok(());
+    }
+    if entries.is_empty() {
+        println!("no destinations are configured");
+    }
+    for entry in &entries {
+        println!("@{:<16} {}", entry.name, entry.uri);
+    }
     Ok(())
 }
 

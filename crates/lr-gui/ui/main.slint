@@ -11,7 +11,7 @@
 
 import { ScrollView, ListView, Button, ComboBox, CheckBox, LineEdit, ProgressIndicator, Palette } from "std-widgets.slint";
 import { Theme } from "theme.slint";
-import { DiskRow, HistoryRow, PartitionTile, DiskCard, JobStage, JobPresentation } from "types.slint";
+import { ConfiguredDestination, DiskRow, HistoryRow, PartitionTile, DiskCard, JobStage, JobPresentation } from "types.slint";
 import { NavItem, DiskPanel, StepList, Banner, PageHeader } from "widgets.slint";
 
 export { DiskRow, HistoryRow, PartitionTile, DiskCard, JobStage, JobPresentation }
@@ -36,6 +36,7 @@ export component MainWindow inherits Window {
     in-out property <string> destination: "";
     // Backup folders used recently, newest first (remembered per user).
     in-out property <[string]> recent-destinations: [];
+    in-out property <[ConfiguredDestination]> configured-destinations: [];
     in-out property <string> backup-set: "default";
     in-out property <string> mode: "auto";
     in-out property <string> member-type: "full";
@@ -380,6 +381,24 @@ export component MainWindow inherits Window {
                                                 clicked => { root.destination = recent; }
                                             }
                                         }
+                                        if root.configured-destinations.length > 0: Text { text: "Set up by an administrator"; color: Theme.muted; }
+                                        for configured in root.configured-destinations: HorizontalLayout {
+                                            spacing: 8px;
+                                            Text {
+                                                text: "@" + configured.name + "  " + configured.uri;
+                                                color: Theme.text;
+                                                vertical-alignment: center;
+                                                overflow: elide;
+                                                horizontal-stretch: 1;
+                                                min-width: 0px;
+                                            }
+                                            Button {
+                                                text: root.destination == "@" + configured.name ? "In use" : "Use";
+                                                enabled: !root.busy && root.destination != "@" + configured.name;
+                                                accessible-label: "Use the destination " + configured.name;
+                                                clicked => { root.destination = "@" + configured.name; }
+                                            }
+                                        }
                                         Text { text: "Backup name"; font-weight: 700; color: Theme.text; }
                                         LineEdit { text <=> root.backup-set; placeholder-text: "A name for this backup, for example laptop-root"; }
                                         Text {
@@ -442,10 +461,15 @@ export component MainWindow inherits Window {
                                                 Button { text: "Choose file…"; clicked => { root.pick-passphrase(); } }
                                             }
                                         }
-                                        CheckBox { text: "Enter the destination as text (SFTP)"; checked <=> root.show-destination-text; }
+                                        CheckBox { text: "Enter the destination as text"; checked <=> root.show-destination-text; }
                                         if root.show-destination-text: LineEdit {
                                             text <=> root.destination;
-                                            placeholder-text: "/mnt/backups or sftp://user@host/path";
+                                            placeholder-text: "/mnt/backups or @name";
+                                        }
+                                        if root.show-destination-text: Text {
+                                            text: "An SFTP server is set up once by an administrator with linuxreflect destination add, and then chosen as @name.";
+                                            color: Theme.muted;
+                                            wrap: word-wrap;
                                         }
                                     }
 

@@ -153,6 +153,24 @@ pub struct ImageLocation {
 /// Returns [`Error::Unsupported`] when the URI is not deep enough to contain a
 /// set, a chain and a file name.
 pub fn split_image(uri: &str) -> Result<ImageLocation> {
+    // `@name/<set>/<chain>/<file>` names an image on a configured
+    // destination (A6); the name stays the destination.
+    if let Some(rest) = uri.strip_prefix('@') {
+        let mut parts = rest.split('/').filter(|part| !part.is_empty());
+        let name = parts.next().unwrap_or_default();
+        let set = parts.next().unwrap_or_default();
+        let member: Vec<&str> = parts.collect();
+        if name.is_empty() || set.is_empty() || member.len() < 2 {
+            return Err(Error::unsupported(format!(
+                "'{uri}' must name a set, a chain and a member, e.g. @<name>/<set>/<chain>/<file>.lrimg"
+            )));
+        }
+        return Ok(ImageLocation {
+            dest: format!("@{name}"),
+            set: set.to_owned(),
+            name: member.join("/"),
+        });
+    }
     let parsed = parse(uri)?;
     /// Rebuilds the destination part from the leading path components.
     type Rebuild = Box<dyn Fn(&[String]) -> String>;

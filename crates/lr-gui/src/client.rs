@@ -76,6 +76,24 @@ impl Client {
         ))
     }
 
+    /// `ListDestinations` (A6): the destinations an administrator
+    /// configured, as `(name, uri)`.
+    ///
+    /// # Errors
+    /// Propagates gRPC errors.
+    pub async fn list_destinations(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let list = self
+            .service()
+            .list_destinations(Request::default())
+            .await?
+            .into_inner();
+        Ok(list
+            .destinations
+            .into_iter()
+            .map(|entry| (entry.name, entry.uri))
+            .collect())
+    }
+
     /// `ListDisks`.
     ///
     /// # Errors

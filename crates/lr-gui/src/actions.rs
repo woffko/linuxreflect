@@ -90,14 +90,28 @@ impl Actions {
                     .iter()
                     .map(|entry| disk_row(entry, &entries))
                     .collect();
-                Ok::<_, anyhow::Error>((rows, panels))
+                // Configured destinations are optional: a daemon without a
+                // registry, or one that cannot read it, still lists disks.
+                let configured = client.list_destinations().await.unwrap_or_default();
+                Ok::<_, anyhow::Error>((rows, panels, configured))
             }
             .await;
             match outcome {
-                Ok((rows, panels)) => {
+                Ok((rows, panels, configured)) => {
                     let weak = weak.clone();
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = weak.upgrade() {
+                            ui.set_configured_destinations(slint::ModelRc::new(
+                                slint::VecModel::from(
+                                    configured
+                                        .into_iter()
+                                        .map(|(name, uri)| crate::ConfiguredDestination {
+                                            name: name.into(),
+                                            uri: uri.into(),
+                                        })
+                                        .collect::<Vec<_>>(),
+                                ),
+                            ));
                             let disk_count = panels.len();
                             let partitions = rows.len() - disk_count;
                             ui.set_disk_cards(disk_cards(&panels, &rows));

@@ -76,6 +76,10 @@ pub(crate) enum Command {
     #[command(subcommand)]
     Retention(RetentionCommand),
 
+    /// Named destinations configured on this machine, used as `@name`.
+    #[command(subcommand)]
+    Destination(DestinationCommand),
+
     /// Manage systemd job timers (Slice S14).
     #[command(subcommand)]
     Schedule(ScheduleCommand),
@@ -366,6 +370,39 @@ pub(crate) enum RestoreCommand {
         /// Passphrase file.
         #[arg(long, value_name = "PATH")]
         passphrase_file: Option<PathBuf>,
+    },
+}
+
+/// `destination` subcommands (A6).
+#[derive(Debug, Subcommand)]
+pub(crate) enum DestinationCommand {
+    /// List the configured destinations.
+    List,
+
+    /// Add or replace a destination; clients then use it as `@<name>`.
+    Add {
+        /// Name, used as `@<name>` (letters, digits, '.', '_', '-').
+        #[arg(long)]
+        name: String,
+
+        /// Destination: a path or `sftp://user@host/path`.
+        #[arg(long, value_name = "URI")]
+        uri: String,
+
+        /// Private key for an SFTP destination (read by the daemon).
+        #[arg(long, value_name = "PATH")]
+        identity: Option<PathBuf>,
+
+        /// `known_hosts` file for an SFTP destination.
+        #[arg(long, value_name = "PATH")]
+        known_hosts: Option<PathBuf>,
+    },
+
+    /// Remove a destination.
+    Remove {
+        /// Name of the destination.
+        #[arg(long)]
+        name: String,
     },
 }
 

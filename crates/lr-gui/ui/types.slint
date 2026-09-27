@@ -1,6 +1,13 @@
 // Data exchanged with the Rust side. Field names are part of the automation
 // contract (`script.rs`), so rename them only together with it.
 
+// A destination an administrator configured on the daemon (A6); it is used
+// as `@name`, so the GUI never handles key paths.
+export struct ConfiguredDestination {
+    name: string,
+    uri: string,
+}
+
 export struct DiskRow {
     name: string,
     kind: string,

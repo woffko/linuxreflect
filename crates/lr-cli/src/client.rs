@@ -233,6 +233,32 @@ impl Client {
         finished_summary(progress)
     }
 
+    /// `ListDestinations`, `SetDestination` or `RemoveDestination` (A6).
+    ///
+    /// # Errors
+    /// Propagates gRPC errors.
+    pub(crate) fn destinations(
+        &mut self,
+        change: DestinationChange,
+    ) -> anyhow::Result<lr_proto::v1::DestinationList> {
+        self.call(move |inner| {
+            Box::pin(async move {
+                let response = match change {
+                    DestinationChange::List => inner.list_destinations(Request::default()).await,
+                    DestinationChange::Set(entry) => inner.set_destination(entry).await,
+                    DestinationChange::Remove(name) => {
+                        inner
+                            .remove_destination(lr_proto::v1::DestinationRef { name })
+                            .await
+                    }
+                };
+                response
+                    .map(|response| response.into_inner())
+                    .map_err(grpc_error)
+            })
+        })
+    }
+
     /// `SetSchedule` (Slice S14).
     ///
     /// # Errors
@@ -532,4 +558,14 @@ pub(crate) fn progress_line(progress: &lr_proto::v1::Progress) -> Option<String>
         }
         Some(Step::Finished(_)) | Some(Step::Failure(_)) | None => None,
     }
+}
+
+/// What `destination` asks the daemon to do.
+pub(crate) enum DestinationChange {
+    /// Only list.
+    List,
+    /// Add or replace one.
+    Set(lr_proto::v1::NamedDestination),
+    /// Remove one by name.
+    Remove(String),
 }

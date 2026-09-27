@@ -152,6 +152,25 @@ message SetRef {
   bool insecure_ignore_host_key = 5;
 }
 
+// ── Named destinations (A6) ─────────────────────────────────────────────────
+
+// A destination an administrator configured on the daemon's machine;
+// clients use it as `@name` and never send key paths.
+message NamedDestination {
+  string name = 1;
+  string uri = 2;
+  string identity = 3;
+  string known_hosts = 4;
+}
+
+message DestinationList {
+  repeated NamedDestination destinations = 1;
+}
+
+message DestinationRef {
+  string name = 1;
+}
+
 // ── Verification ────────────────────────────────────────────────────────────
 
 message VerifySpec {
@@ -278,6 +297,11 @@ service LinuxReflect {
   rpc DiskMap(SourceRef) returns (DiskList);
   rpc ProbeSource(SourceRef) returns (Plan);
   rpc ListSets(SetRef) returns (SetInfo);
+  // Named destinations: reading needs disk.read, changing them
+  // destination.configure.
+  rpc ListDestinations(Request) returns (DestinationList);
+  rpc SetDestination(NamedDestination) returns (DestinationList);
+  rpc RemoveDestination(DestinationRef) returns (DestinationList);
   rpc ListChains(SetRef) returns (SetInfo);
 
   // backup.create

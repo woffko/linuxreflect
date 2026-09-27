@@ -202,6 +202,12 @@ linuxreflect backup create --source /dev/nvme0n1 --dest /mnt/backup --set laptop
 linuxreflect backup create --source /home --dest sftp://backup@nas/backups --set home \
     --type incremental --parent latest --passphrase-file /etc/linuxreflect/home.key
 
+# An SFTP server set up once by an administrator, then used by name (also from
+# the GUI): the daemon keeps the key and known_hosts paths, clients send @nas.
+sudo linuxreflect destination add --name nas --uri sftp://backup@nas/backups \
+    --identity /etc/linuxreflect/keys/nas --known-hosts /etc/linuxreflect/known_hosts
+linuxreflect backup create --source /home --dest @nas --set home
+
 # A point-in-time copy of a Btrfs root, staying on that filesystem.
 linuxreflect backup create --source / --dest /mnt/backup --set root --mode file \
     --snapshot btrfs --one-file-system
