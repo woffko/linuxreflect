@@ -118,11 +118,20 @@ impl WalkedTree {
     /// file (it was replaced while the backup ran; retry the backup), and
     /// propagates other I/O errors.
     pub fn open_file(&self, walked: &WalkedEntry) -> Result<File> {
+        self.open_recorded(&walked.entry.path, walked.identity)
+    }
+
+    /// [`WalkedTree::open_file`] for a file known by its recorded path and
+    /// identity, so a caller that consumed the entry can still open it.
+    ///
+    /// # Errors
+    /// As [`WalkedTree::open_file`].
+    pub fn open_recorded(&self, path: &[u8], identity: Option<(u64, u64)>) -> Result<File> {
         let root = self
             .root
             .as_ref()
             .ok_or_else(|| Error::unsupported("this walk has no pinned root"))?;
-        let relative = Path::new(std::ffi::OsStr::from_bytes(&walked.entry.path));
+        let relative = Path::new(std::ffi::OsStr::from_bytes(path));
         let (parent, name) = split_parent(relative)?;
         let replaced = |why: String| {
             Error::unsupported(format!(
@@ -136,7 +145,7 @@ impl WalkedTree {
         let path = lr_unsafe::beneath::entry_path(&parent, name).map_err(Error::Io)?;
         let file = open_nofollow(&path).map_err(|error| replaced(error.to_string()))?;
         let metadata = file.metadata().map_err(Error::Io)?;
-        if Some((metadata.dev(), metadata.ino())) != walked.identity {
+        if Some((metadata.dev(), metadata.ino())) != identity {
             return Err(replaced("it is a different file now".to_owned()));
         }
         Ok(file)
@@ -863,8 +872,8 @@ fn remove_existing(path: &Path) -> Result<()> {
 
 /// Sort entries so directories come after their contents, for metadata passes.
 #[must_use]
-pub fn deepest_first(entries: &[FileEntry]) -> Vec<&FileEntry> {
-    let mut sorted: Vec<&FileEntry> = entries.iter().collect();
+pub fn deepest_first<'a>(entries: impl IntoIterator<Item = &'a FileEntry>) -> Vec<&'a FileEntry> {
+    let mut sorted: Vec<&FileEntry> = entries.into_iter().collect();
     sorted.sort_by(|a, b| {
         let depth = |entry: &FileEntry| entry.path.iter().filter(|byte| **byte == b'/').count();
         depth(b).cmp(&depth(a)).then_with(|| b.path.cmp(&a.path))

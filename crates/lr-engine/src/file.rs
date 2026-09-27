@@ -269,10 +269,10 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
 
     // The base state an incremental/differential compares against: the newest
     // member of the parent chain.
-    let mut base: HashMap<Vec<u8>, FileEntry> = HashMap::new();
-    // What the reference member recorded to detect a change without
-    // reading the file (D-111); empty for a parent written before that.
-    let mut base_changes: HashMap<Vec<u8>, (u64, i64, u32)> = HashMap::new();
+    // Each entry is keyed by its path, moved out of the entry so it is held
+    // once, with what the reference member recorded to detect a change
+    // without reading the file (D-111; none for a parent written before).
+    let mut base: HashMap<Vec<u8>, (FileEntry, Option<ChangeStamp>)> = HashMap::new();
     if let Some(parent) = &parent {
         let mut members =
             crate::chain::open_chain(&*destination, &set, &parent.files, &request.encryption)?;
@@ -287,9 +287,11 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
         };
         if let Some(reference) = reference {
             let records = read_records(reference)?;
-            base_changes = read_change_tokens(reference, &records)?;
-            for record in records {
-                base.insert(record.entry.path.clone(), record.entry);
+            let changes = read_change_tokens(reference, records.len())?;
+            base.reserve(records.len());
+            for (record, change) in records.into_iter().zip(changes) {
+                let mut entry = record.entry;
+                base.insert(std::mem::take(&mut entry.path), (entry, change));
             }
         }
     }
@@ -390,7 +392,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
     // (D-111).
     let known: HashSet<[u8; 32]> = base
         .values()
-        .flat_map(|entry| entry.chunk_refs_here.iter().copied())
+        .flat_map(|(entry, _)| entry.chunk_refs_here.iter().copied())
         .collect();
     let mut records: Vec<FileRecord> = Vec::with_capacity(walk.entries.len());
     let mut changes: Vec<ChangeToken> = Vec::new();
@@ -404,8 +406,16 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
     let mut deduplicated_chunks = 0u64;
     let mut seen_content = 0u64;
 
-    for walked in &walk.entries {
-        let mut entry = walked.entry.clone();
+    // The entries are consumed as they are recorded, so each is held once,
+    // not once by the walk and again by the manifest.
+    let walked_entries = std::mem::take(&mut walk.entries);
+    for walked in walked_entries {
+        let tree::WalkedEntry {
+            mut entry,
+            holes: walked_holes,
+            identity,
+            change: walked_change,
+        } = walked;
         match entry.file_kind {
             lr_format::FILE_KIND_DIRECTORY => counts[1] += 1,
             lr_format::FILE_KIND_SYMLINK => counts[2] += 1,
@@ -421,22 +431,19 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
             // match what the reference member recorded (R17, D-111).
             let inherited = base
                 .get(&entry.path)
-                .filter(|previous| unchanged(previous, &entry))
-                .filter(|_| {
-                    !options.verify_content
-                        && walked.change.is_some()
-                        && base_changes.get(&entry.path) == walked.change.as_ref()
+                .filter(|(previous, recorded)| {
+                    unchanged(previous, &entry)
+                        && !options.verify_content
+                        && walked_change.is_some()
+                        && *recorded == walked_change
                 })
-                .cloned();
+                .map(|(previous, _)| (previous.chunk_refs_total, previous.chunk_refs_here.clone()));
             match inherited {
-                Some(previous) => {
+                Some((chunk_refs_total, chunk_refs_here)) => {
                     // The chunk references stay valid: they point at the same
                     // chain members, whose indices do not change.
-                    entry = FileEntry {
-                        chunk_refs_total: previous.chunk_refs_total,
-                        chunk_refs_here: previous.chunk_refs_here,
-                        ..entry
-                    };
+                    entry.chunk_refs_total = chunk_refs_total;
+                    entry.chunk_refs_here = chunk_refs_here;
                     unchanged_files += 1;
                     seen_content += entry.size;
                     reporter.report(seen_content)?;
@@ -458,7 +465,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
                             warnings: &mut read_warnings,
                         },
                         &walk,
-                        walked,
+                        (&entry.path, identity),
                         &name,
                         seen_content,
                     )?;
@@ -480,7 +487,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
             // A hard link has no content of its own; its group's first file
             // carries it. Nothing to chunk.
         }
-        if let Some((ino, ctime_sec, ctime_nsec)) = read_change.or(walked.change) {
+        if let Some((ino, ctime_sec, ctime_nsec)) = read_change.or(walked_change) {
             changes.push(ChangeToken {
                 index: u32::try_from(records.len())
                     .map_err(|_| Error::unsupported("more than 4 billion files"))?,
@@ -491,7 +498,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
         }
         records.push(FileRecord {
             entry,
-            holes: read_holes.unwrap_or_else(|| walked.holes.clone()),
+            holes: read_holes.unwrap_or(walked_holes),
         });
     }
 
@@ -642,6 +649,10 @@ fn unchanged(previous: &FileEntry, fresh: &FileEntry) -> bool {
         && previous.acl == fresh.acl
 }
 
+/// `(inode, ctime_sec, ctime_nsec)`: what a file's change detection compares
+/// (D-111).
+type ChangeStamp = (u64, i64, u32);
+
 /// How often a file that changes while it is read is read (R16).
 const STABLE_ATTEMPTS: u32 = 3;
 
@@ -686,7 +697,7 @@ struct Captured {
 fn capture_file<W: Write + Seek>(
     capture: &mut Capture<'_, W>,
     walk: &tree::WalkedTree,
-    walked: &tree::WalkedEntry,
+    (path, identity): (&[u8], Option<(u64, u64)>),
     name: &str,
     processed: u64,
 ) -> Result<Captured> {
@@ -702,7 +713,7 @@ fn capture_file<W: Write + Seek>(
     };
     let mut last = None;
     for _ in 0..STABLE_ATTEMPTS {
-        let file = walk.open_file(walked)?;
+        let file = walk.open_recorded(path, identity)?;
         let before = file.metadata().map_err(Error::Io)?;
         let holes = tree::holes_of(&file, before.size(), name, capture.warnings);
         // SEEK_DATA/SEEK_HOLE moved the shared offset; read from the start.
@@ -764,35 +775,52 @@ fn chunk_file<W: Write + Seek>(
     processed: u64,
     seq_in_chain: u32,
 ) -> Result<(Vec<[u8; 32]>, u64)> {
-    let reader: Box<dyn Read> = Box::new(file);
-    let chunker = StreamCDC::with_level(
-        reader,
-        CDC_MIN as usize,
-        CDC_AVG as usize,
-        CDC_MAX as usize,
-        Normalization::Level1,
-    );
+    // A file shorter than the minimum chunk size is a single chunk, since
+    // FastCDC never cuts before `CDC_MIN`; reading it directly spares the
+    // `CDC_MAX` buffer the chunker allocates for every file, which dominated
+    // small-file trees (docs/performance.md). A longer file goes through the
+    // chunker, head included, so the cut points are the same either way.
+    let mut file = file;
+    let mut head = Vec::new();
+    Read::by_ref(&mut file)
+        .take(u64::from(CDC_MIN))
+        .read_to_end(&mut head)
+        .map_err(Error::Io)?;
+    let chunks: Box<dyn Iterator<Item = Result<Vec<u8>>>> = if head.len() < CDC_MIN as usize {
+        Box::new((!head.is_empty()).then_some(Ok(head)).into_iter())
+    } else {
+        let reader: Box<dyn Read> = Box::new(std::io::Cursor::new(head).chain(file));
+        let name = name.to_owned();
+        Box::new(
+            StreamCDC::with_level(
+                reader,
+                CDC_MIN as usize,
+                CDC_AVG as usize,
+                CDC_MAX as usize,
+                Normalization::Level1,
+            )
+            .map(move |chunk| {
+                chunk
+                    .map(|chunk| chunk.data)
+                    .map_err(|error| Error::corrupt(format!("chunking {name} failed: {error}")))
+            }),
+        )
+    };
     let member = u16::try_from(seq_in_chain).unwrap_or(u16::MAX);
     let mut hashes = Vec::new();
     let mut reported = processed;
-    for chunk in chunker {
-        let chunk =
-            chunk.map_err(|error| Error::corrupt(format!("chunking {name} failed: {error}")))?;
-        reported += chunk.length as u64;
+    for data in chunks {
+        let data = data?;
+        reported += data.len() as u64;
         reporter.report(reported)?;
-        let hash = lr_crypto::content_hash(&writer_keys.dedup_key, &chunk.data);
+        let hash = lr_crypto::content_hash(&writer_keys.dedup_key, &data);
         hashes.push(hash);
         if index.contains_key(&hash) || known.contains(&hash) {
             *deduplicated_chunks += 1;
             continue;
         }
-        let reference = writer.append_chunk(
-            options,
-            writer_keys,
-            ImageKind::File,
-            nonce_seq,
-            &chunk.data,
-        )?;
+        let reference =
+            writer.append_chunk(options, writer_keys, ImageKind::File, nonce_seq, &data)?;
         *stored_chunks += 1;
         let entry = BlockEntry::stored(
             member,
@@ -1055,12 +1083,8 @@ pub fn restore_file(request: &FileRestoreRequest) -> Result<FileRestoreReport> {
 
     // Metadata after content, directories deepest first so writing children
     // cannot bump a directory's mtime.
-    let entries: Vec<FileEntry> = final_entries
-        .values()
-        .map(|record| record.entry.clone())
-        .collect();
     let mut losses = Vec::new();
-    for entry in tree::deepest_first(&entries) {
+    for entry in tree::deepest_first(final_entries.values().map(|record| &record.entry)) {
         if let Err(error) = tree::apply_metadata(&root, entry, &mut losses) {
             if entry.file_kind == lr_format::FILE_KIND_SPECIAL {
                 warnings.push(format!(
@@ -1269,11 +1293,11 @@ pub fn read_records(member: &mut crate::chain::OpenMember) -> Result<Vec<FileRec
 /// Propagates stream and format errors.
 fn read_change_tokens(
     member: &mut crate::chain::OpenMember,
-    records: &[FileRecord],
-) -> Result<HashMap<Vec<u8>, (u64, i64, u32)>> {
+    record_count: usize,
+) -> Result<Vec<Option<(u64, i64, u32)>>> {
     let extras = member.stream_bytes(StreamId::Extras)?;
     let mut cursor = Cursor::new(extras.as_slice());
-    let mut tokens = HashMap::new();
+    let mut tokens = vec![None; record_count];
     while (cursor.position() as usize) < extras.len() {
         let mut wire = lr_format::wire::Reader::new(&mut cursor);
         let (kind, payload) = read_extras_record(&mut wire)?;
@@ -1281,14 +1305,11 @@ fn read_change_tokens(
             continue;
         }
         for token in read_file_changes(&payload)? {
-            let record = usize::try_from(token.index)
+            let slot = usize::try_from(token.index)
                 .ok()
-                .and_then(|index| records.get(index))
+                .and_then(|index| tokens.get_mut(index))
                 .ok_or_else(|| Error::corrupt("a change token names no manifest entry"))?;
-            tokens.insert(
-                record.entry.path.clone(),
-                (token.ino, token.ctime_sec, token.ctime_nsec),
-            );
+            *slot = Some((token.ino, token.ctime_sec, token.ctime_nsec));
         }
     }
     Ok(tokens)
