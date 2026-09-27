@@ -68,7 +68,11 @@ it did not make.
 
 - **Local folders, mounted shares** (NFS, SMB) and **SFTP**
   (`sftp://user@host/path`, SSH agent or identity file, strict host-key
-  checking; passwords never go into URIs).
+  checking; passwords never go into URIs). Mount NFS and SMB destinations
+  with `soft`: on a hard mount a vanished server blocks the job in the kernel,
+  and it can then only be ended when the daemon's stop timeout runs out.
+  SFTP servers can be set up once by an administrator and used by name
+  (`@nas`), also from the GUI.
 - A backup set is locked while a job writes to it, even over SFTP, and a
   destination that disappears mid-backup (network outage, unplugged disk)
   fails the job cleanly without damaging earlier backups.
