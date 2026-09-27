@@ -439,6 +439,7 @@ impl Actions {
         let replace_partition_table = ui
             .upgrade()
             .is_some_and(|ui| ui.get_restore_replace_table());
+        let merge = ui.upgrade().is_some_and(|ui| ui.get_restore_merge());
         let request = self
             .shared
             .restore_review
@@ -452,7 +453,13 @@ impl Actions {
             let outcome = async {
                 let client = Client::connect(&socket).await?;
                 client
-                    .prepare_restore(&image, &target, &passphrase_file, replace_partition_table)
+                    .prepare_restore(
+                        &image,
+                        &target,
+                        &passphrase_file,
+                        replace_partition_table,
+                        merge,
+                    )
                     .await
             }
             .await;

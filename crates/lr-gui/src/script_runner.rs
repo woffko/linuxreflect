@@ -56,6 +56,13 @@ pub(crate) fn run_script(
                     ui.set_target(value.into());
                 })?
             }
+            Step::Merge(merge) => {
+                let merge = *merge;
+                set(weak, move |ui| {
+                    ui.invoke_restore_inputs_changed();
+                    ui.set_restore_merge(merge);
+                })?
+            }
             Step::Token(value) => {
                 let value = value.clone();
                 set(weak, move |ui| ui.set_token(value.into()))?

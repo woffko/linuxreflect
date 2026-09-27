@@ -572,6 +572,20 @@ pub fn prepare_restore(request: &PrepareRequest) -> Result<RestorePlan> {
     let mut kind_warnings = Vec::new();
     let (target_facts, target_directory) = if superblock.image_kind == ImageKind::File {
         let directory = crate::target::DirectoryFacts::read(&request.target)?;
+        // A folder that already holds files is refused here, before a plan is
+        // approved, unless the request chose to restore into it (A10).
+        if !request.merge
+            && std::fs::read_dir(&request.target)
+                .map_err(Error::Io)?
+                .next()
+                .is_some()
+        {
+            return Err(Error::unsupported(format!(
+                "{} is not empty; choose to restore into it anyway (--merge, or the restore \
+                 wizard's option), which replaces files with the same name",
+                request.target.display()
+            )));
+        }
         let free = directory.free_bytes()?;
         if free < superblock.source_size_bytes {
             return Err(Error::NoSpace);

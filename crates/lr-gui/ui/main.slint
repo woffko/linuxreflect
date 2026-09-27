@@ -54,6 +54,7 @@ export component MainWindow inherits Window {
     in-out property <string> target: "";
     in-out property <string> restore-passphrase-file: "";
     in-out property <bool> restore-replace-table: false;
+    in-out property <bool> restore-merge: false;
     in-out property <string> restore-plan: "(no plan yet)";
     in-out property <string> restore-summary: "";
     in-out property <bool> show-restore-details: false;
@@ -660,12 +661,21 @@ export component MainWindow inherits Window {
                                             checked <=> root.restore-replace-table;
                                             enabled: !root.busy;
                                         }
+                                        CheckBox {
+                                            text: "Restore files into this folder even if it is not empty";
+                                            checked <=> root.restore-merge;
+                                            enabled: !root.busy;
+                                            toggled => { root.restore-inputs-changed(); }
+                                        }
                                     }
 
                                     if root.restore-step == 2: VerticalLayout {
                                         spacing: 6px;
                                         Text { text: "Restore: " + root.planned-image; color: Theme.text; wrap: word-wrap; }
                                         Text { text: "Write to: " + root.planned-target; font-weight: 700; color: Theme.text; wrap: word-wrap; }
+                                        if root.restore-merge: Banner {
+                                            text: "Files already in " + root.planned-target + " that the backup also contains are replaced; other files there stay.";
+                                        }
                                         Banner {
                                             error: true;
                                             text: "Everything currently on " + root.planned-target + " will be replaced. Check the destination before you confirm.";

@@ -945,3 +945,74 @@ fn a_backup_chain_made_and_restored_through_the_gui_on_x11() {
         "a file deleted before the newest backup must not come back"
     );
 }
+
+/// The restore wizard restores a file backup into a folder that already has
+/// files once the user chooses so; without the choice it refuses (A10).
+#[test]
+#[ignore = "needs Xvfb; restores into a non-empty folder through the GUI on X11"]
+fn a_file_restore_into_a_non_empty_folder_needs_the_merge_choice_on_x11() {
+    if !root_tests_enabled() {
+        return;
+    }
+    if !have("Xvfb") {
+        lr_testkit::unavailable!("Xvfb missing - the X11 GUI test");
+    }
+    let dir = private_test_dir();
+    let Some(daemon) = Daemon::start(dir.path()) else {
+        lr_testkit::unavailable!("the daemon binary is not built next to the GUI");
+    };
+    let mut reaper = Reaper(Vec::new());
+    let display = start_xvfb(&mut reaper);
+
+    let source = dir.path().join("source");
+    let restore = dir.path().join("restore");
+    std::fs::create_dir_all(&restore).expect("restore dir");
+    std::fs::write(restore.join("keep.txt"), b"already here\n").expect("existing file");
+    write_tree(&source, "merge marker\n");
+    let script = dir.path().join("merge-script.txt");
+    std::fs::write(
+        &script,
+        format!(
+            "refresh-disks\n\
+             source {source}\n\
+             dest {backups}\n\
+             set gui-merge\n\
+             mode file\n\
+             probe\n\
+             backup\n\
+             image-from-summary\n\
+             target {restore}\n\
+             expect-prepare-failure is not empty\n\
+             merge on\n\
+             prepare\n\
+             restore\n\
+             expect-file {restore}/hello.txt\n\
+             expect-contains {restore}/hello.txt merge\n\
+             expect-file {restore}/keep.txt\n\
+             print\n\
+             quit\n",
+            source = source.display(),
+            backups = dir.path().join("backups").display(),
+            restore = restore.display(),
+        ),
+    )
+    .expect("script");
+    let output = Command::new(GUI)
+        .env("DISPLAY", &display)
+        .env_remove("WAYLAND_DISPLAY")
+        .env("SLINT_BACKEND", "winit-software")
+        .arg("--socket")
+        .arg(&daemon.socket)
+        .arg("--script")
+        .arg(&script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("GUI run");
+    assert!(output.status.success(), "{}", text(&output));
+    assert_eq!(
+        std::fs::read(restore.join("keep.txt")).expect("kept file"),
+        b"already here\n",
+        "a file the backup does not contain stays"
+    );
+}

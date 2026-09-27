@@ -30,6 +30,8 @@ pub enum Step {
     Image(String),
     /// Set the target field.
     Target(String),
+    /// Restore files into a non-empty folder (`merge on|off`).
+    Merge(bool),
     /// Replace the restore token.
     Token(String),
     /// Take the image path from the last backup summary (as the wizard does).
@@ -110,6 +112,16 @@ pub fn parse(text: &str) -> Result<Vec<Step>, Error> {
             "restore-passphrase-file" => Step::RestorePassphraseFile(need(argument)?),
             "image" => Step::Image(need(argument)?),
             "target" => Step::Target(need(argument)?),
+            "merge" => Step::Merge(match need(argument)?.as_str() {
+                "on" => true,
+                "off" => false,
+                other => {
+                    return Err(Error::corrupt(format!(
+                        "line {}: merge takes on or off, not `{other}`",
+                        number + 1
+                    )));
+                }
+            }),
             "token" => Step::Token(need(argument)?),
             "image-from-summary" => Step::ImageFromSummary,
             "refresh-disks" => Step::RefreshDisks,

@@ -368,12 +368,26 @@ fn a_non_empty_target_needs_merge() {
         &FileBackupOptions::default(),
     )
     .expect("backup");
-    let plain = prepare_restore(&PrepareRequest::from_path(
+    // The plan is refused before a token exists, so the wizard can offer the
+    // choice instead of failing at the end (A10).
+    let refused = prepare_restore(&PrepareRequest::from_path(
         &report.image_path,
         &target,
         Encryption::NoEncrypt,
     ))
+    .expect_err("a non-empty target must be refused at prepare");
+    assert!(format!("{refused}").contains("--merge"), "{refused}");
+
+    // A folder that fills up between prepare and apply is still refused.
+    let emptied = dir.path().join("emptied");
+    std::fs::create_dir_all(&emptied).expect("emptied");
+    let plain = prepare_restore(&PrepareRequest::from_path(
+        &report.image_path,
+        &emptied,
+        Encryption::NoEncrypt,
+    ))
     .expect("prepare");
+    std::fs::write(emptied.join("late"), b"arrived after prepare").expect("late");
     let refused = apply_restore(&ApplyRequest {
         token: plain.token,
         confirm: true,
@@ -381,7 +395,7 @@ fn a_non_empty_target_needs_merge() {
         encryption: Encryption::NoEncrypt,
         context: lr_engine::progress::EngineContext::silent(),
     })
-    .expect_err("a non-empty target must be refused");
+    .expect_err("a target that filled up after prepare must be refused");
     assert!(format!("{refused}").contains("--merge"), "{refused}");
 
     let merged = prepare_restore(
