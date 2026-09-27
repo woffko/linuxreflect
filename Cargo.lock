@@ -3505,6 +3505,7 @@ version = "0.1.0"
 dependencies = [
  "hmac",
  "lr-core",
+ "lr-unsafe",
  "russh",
  "russh-sftp",
  "serde",
