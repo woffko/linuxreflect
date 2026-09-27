@@ -10,8 +10,8 @@ Together they report 52 findings. Many share a root cause, so the plan is
 organised around the mechanisms that fix them rather than by finding number.
 The [finding index](#finding-index) at the end maps every ID to its work item.
 
-Status of this document: **phases 0–3 done, phase 4 open**. Tick items off in
-the index as they land.
+Status of this document: **phases 0–4 done**. Every finding in the index is
+ticked.
 
 ## Contents
 
@@ -373,6 +373,12 @@ Release **`v0.1.0-beta.1`**.
   and publication, as a permanent suite.
 - **Stale comments** that promise protections the code lacks (sparse
   fallback, RestoreApply prompting) are corrected with their fixes.
+
+**Status (phase 4).** Done: [`operator-guide.md`](operator-guide.md); the
+scale profiles and budgets in [`performance.md`](performance.md)
+(`cargo xtask scale`), which also made small-file backups about 8x faster;
+the fault-injection suite (`crates/lr-engine/tests/fault_injection.rs`),
+which found A15; and the stale comments. Writing the guide found A16.
 
 ## Shared mechanisms
 
