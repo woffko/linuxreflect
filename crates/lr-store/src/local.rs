@@ -23,7 +23,10 @@ use std::time::Duration;
 
 use lr_core::{Error, Result, SetId};
 
-use crate::{Destination, LockOwner, LockRecord, ReadSeek, SetHandle, SetLock, TempFile, now_unix};
+use crate::{
+    Destination, Durability, LockOwner, LockRecord, ReadSeek, SetHandle, SetLock, TempFile,
+    now_unix,
+};
 
 /// `O_NOFOLLOW`: fail instead of opening a symlink.
 const O_NOFOLLOW: i32 = 0o400_000;
@@ -98,7 +101,7 @@ impl LocalDestination {
     /// fsync `tmp`, rename it to `final_name` (replacing it only when
     /// `replace`), then fsync the directory so the rename itself is durable
     /// (spec §L.1: finalize = fsync + rename).
-    fn publish(&self, tmp: &str, final_name: &str, replace: bool) -> Result<()> {
+    fn publish(&self, tmp: &str, final_name: &str, replace: bool) -> Result<Durability> {
         let (_tmp_dir, tmp_path) = self.entry(tmp, false)?;
         let (final_dir, final_path) = self.entry(final_name, true)?;
         open_nofollow(&tmp_path)
@@ -120,7 +123,8 @@ impl LocalDestination {
         }
         File::open(lr_unsafe::beneath::self_path(&final_dir))
             .and_then(|dir| dir.sync_all())
-            .map_err(Error::Io)
+            .map_err(Error::Io)?;
+        Ok(Durability::Synced)
     }
 
     /// Path of the set lock file.
@@ -351,12 +355,12 @@ impl Destination for LocalDestination {
         })
     }
 
-    fn publish_new(&self, set: &SetHandle, tmp: &str, final_name: &str) -> Result<()> {
+    fn publish_new(&self, set: &SetHandle, tmp: &str, final_name: &str) -> Result<Durability> {
         let _ = set;
         self.publish(tmp, final_name, false)
     }
 
-    fn replace(&self, set: &SetHandle, tmp: &str, final_name: &str) -> Result<()> {
+    fn replace(&self, set: &SetHandle, tmp: &str, final_name: &str) -> Result<Durability> {
         let _ = set;
         self.publish(tmp, final_name, true)
     }

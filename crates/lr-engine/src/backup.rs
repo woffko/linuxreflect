@@ -244,6 +244,10 @@ impl BackupRequest {
 /// What a finished backup produced.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BackupReport {
+    /// Non-fatal notes, such as a destination that could not confirm the
+    /// image reached stable storage.
+    #[serde(default)]
+    pub warnings: Vec<String>,
     /// Final image path inside the set; absolute for a local destination and
     /// set-relative for a remote one.
     pub image_path: PathBuf,
@@ -686,13 +690,15 @@ pub fn backup_block_with(
     writer.flush().map_err(Error::Io)?;
     let image_bytes = writer.seek(SeekFrom::End(0)).map_err(Error::Io)?;
     drop(writer);
-    destination.publish_new(&set, &tmp_name, &image_name)?;
+    // A failed flush publishes nothing (R19); an unconfirmed one is reported.
+    let durability = destination.publish_new(&set, &tmp_name, &image_name)?;
     guard.disarm();
 
     // 11. Catalog update, still under the lock (spec §D.3).
     update_catalog(&*destination, &set, &request.set_name, now_unix())?;
 
     Ok(BackupReport {
+        warnings: durability.warning("the image").into_iter().collect(),
         image_path: local_image_path(&set_root, &image_name),
         image_uri: request.image_uri(&image_name),
         image_uuid: request.image_uuid,

@@ -496,7 +496,8 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
     writer.flush().map_err(Error::Io)?;
     let image_bytes = writer.seek(std::io::SeekFrom::End(0)).map_err(Error::Io)?;
     drop(writer);
-    destination.publish_new(&set, &tmp_name, &image_name)?;
+    // A failed flush publishes nothing (R19); an unconfirmed one is reported.
+    let durability = destination.publish_new(&set, &tmp_name, &image_name)?;
     guard.disarm();
     // The walk pins a directory inside the snapshot; close it first so the
     // snapshot's private mount can be released.
@@ -510,6 +511,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
     }
 
     let mut warnings = walk.warnings;
+    warnings.extend(durability.warning("the image"));
     if consistency == Consistency::PerFile {
         warnings.push(
             "file mode without a tree snapshot is consistently per file, not point-in-time \

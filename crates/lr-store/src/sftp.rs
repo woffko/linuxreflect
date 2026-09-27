@@ -24,15 +24,15 @@ use russh::keys::agent::client::AgentClient;
 use russh::keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate, load_secret_key};
 use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::client::{RawSftpSession, SftpSession};
-use russh_sftp::protocol::{OpenFlags, Packet, StatusCode};
+use russh_sftp::protocol::{FileAttributes, OpenFlags, Packet, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::runtime::Runtime;
 
 use crate::known_hosts::HostKeyVerifier;
 use crate::uri::DestinationUri;
 use crate::{
-    Destination, DestinationOptions, LockOwner, LockRecord, SetHandle, SetLock, TempFile,
-    WriteSeekSync, now_unix,
+    Destination, DestinationOptions, Durability, LockOwner, LockRecord, SetHandle, SetLock,
+    TempFile, WriteSeekSync, now_unix,
 };
 
 /// Connection timeout for one operation.
@@ -161,6 +161,8 @@ impl Session {
 
 /// The OpenSSH extension that renames over an existing file atomically.
 const POSIX_RENAME: &str = "posix-rename@openssh.com";
+/// The OpenSSH extension that flushes an open file to stable storage.
+const FSYNC: &str = "fsync@openssh.com";
 
 /// Verifies the server key while the handshake runs.
 struct ClientHandler {
@@ -277,10 +279,19 @@ impl SftpDestination {
         label: &str,
         mut operation: impl FnMut(Arc<SftpSession>) -> SftpFuture<T>,
     ) -> Result<T> {
+        self.run_with(label, |connection| operation(Arc::clone(&connection.sftp)))
+    }
+
+    /// [`Self::run`] for operations that need the whole connection.
+    fn run_with<T>(
+        &self,
+        label: &str,
+        mut operation: impl FnMut(&Session) -> SftpFuture<T>,
+    ) -> Result<T> {
         let mut delay = RETRY_BASE_DELAY;
         let mut last = None;
         for attempt in 0..RETRY_ATTEMPTS {
-            let session = match self.session() {
+            let session = match self.connection() {
                 Ok(session) => session,
                 Err(error) => {
                     last = Some(error);
@@ -289,7 +300,7 @@ impl SftpDestination {
                     continue;
                 }
             };
-            let future = operation(Arc::clone(&session));
+            let future = operation(&session);
             match self.runtime.block_on(future) {
                 Ok(value) => return Ok(value),
                 Err(error) => {
@@ -701,7 +712,7 @@ impl Destination for SftpDestination {
         })
     }
 
-    fn publish_new(&self, set: &SetHandle, tmp: &str, final_name: &str) -> Result<()> {
+    fn publish_new(&self, set: &SetHandle, tmp: &str, final_name: &str) -> Result<Durability> {
         let _ = set;
         crate::publish::publish_new_with(
             self,
@@ -711,7 +722,7 @@ impl Destination for SftpDestination {
         )
     }
 
-    fn replace(&self, set: &SetHandle, tmp: &str, final_name: &str) -> Result<()> {
+    fn replace(&self, set: &SetHandle, tmp: &str, final_name: &str) -> Result<Durability> {
         let _ = set;
         crate::publish::replace_with(self, &self.path(tmp), &self.path(final_name), Self::retry())
     }
@@ -972,6 +983,31 @@ impl crate::publish::RemoteOps for SftpDestination {
                         other => Err(other),
                     },
                 }
+            })
+        })
+    }
+
+    fn sync(&self, path: &str) -> Result<bool> {
+        let path = path.to_owned();
+        self.run_with("fsync", |connection| {
+            let supported = connection.supports(FSYNC);
+            let raw = Arc::clone(&connection.raw);
+            let path = path.clone();
+            Box::pin(async move {
+                if !supported {
+                    return Ok(false);
+                }
+                let handle = raw
+                    .open(&path, OpenFlags::READ, FileAttributes::default())
+                    .await
+                    .map_err(|error| sftp_error("open for fsync", error))?
+                    .handle;
+                let synced = raw
+                    .fsync(handle.as_str())
+                    .await
+                    .map_err(|error| sftp_error("fsync", error));
+                let _ = raw.close(handle).await;
+                synced.map(|_| true)
             })
         })
     }

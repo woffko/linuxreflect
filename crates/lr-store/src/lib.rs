@@ -122,6 +122,29 @@ impl std::fmt::Debug for TempFile {
     }
 }
 
+/// Whether a published file is known to have reached stable storage (R19).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Durability {
+    /// The data was flushed to stable storage before it was renamed into
+    /// place.
+    Synced,
+    /// The destination cannot confirm it; the reason says why.
+    Unconfirmed(String),
+}
+
+impl Durability {
+    /// A warning for a report when durability is not confirmed.
+    #[must_use]
+    pub fn warning(&self, what: &str) -> Option<String> {
+        match self {
+            Self::Synced => None,
+            Self::Unconfirmed(reason) => Some(format!(
+                "{what} was published but may not survive a crash of the destination: {reason}"
+            )),
+        }
+    }
+}
+
 /// The name of a new temporary file for `final_name`: in the same directory,
 /// so publication is a rename, with a random part so nobody can plant it.
 ///
@@ -309,16 +332,20 @@ pub trait Destination: Send + Sync {
     /// a lost reply recognises the earlier success instead of repeating the
     /// rename (R18).
     ///
+    /// The data is flushed first and a failed flush prevents publication
+    /// (R19); a destination that cannot flush says so in the result.
+    ///
     /// # Errors
-    /// Refuses an existing `final_name` and propagates I/O errors.
-    fn publish_new(&self, set: &SetHandle, tmp: &str, final_name: &str) -> Result<()>;
+    /// Refuses an existing `final_name` and propagates I/O errors, including
+    /// a failed flush.
+    fn publish_new(&self, set: &SetHandle, tmp: &str, final_name: &str) -> Result<Durability>;
 
     /// Replace the replaceable file `final_name` (the catalog) with the
     /// temporary file `tmp`, as atomically as the destination allows.
     ///
     /// # Errors
-    /// Propagates I/O errors.
-    fn replace(&self, set: &SetHandle, tmp: &str, final_name: &str) -> Result<()>;
+    /// Propagates I/O errors, including a failed flush.
+    fn replace(&self, set: &SetHandle, tmp: &str, final_name: &str) -> Result<Durability>;
 
     /// Open an existing file read-only.
     ///

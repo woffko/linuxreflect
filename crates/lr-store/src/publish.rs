@@ -10,10 +10,14 @@ use std::time::Duration;
 
 use lr_core::{Error, Result};
 
+use crate::Durability;
+
 /// The remote operations publication needs.
 pub(crate) trait RemoteOps {
     /// Size of `path`, `None` when it does not exist.
     fn size(&self, path: &str) -> Result<Option<u64>>;
+    /// Flush `path` to stable storage; `Ok(false)` when the server cannot.
+    fn sync(&self, path: &str) -> Result<bool>;
     /// One rename attempt that never replaces an existing `to`.
     fn rename(&self, from: &str, to: &str) -> Result<()>;
     /// One rename attempt that atomically replaces `to`; `Ok(false)` when
@@ -33,18 +37,34 @@ pub(crate) struct Retry {
 
 /// Publish `from` as `to` without ever replacing or deleting `to` (R18).
 ///
-/// A rename whose reply is lost may still have happened. Before retrying,
-/// the protocol looks: the temporary file gone and `to` of the expected size
-/// is the earlier attempt's success; both present is a name collision, which
-/// is refused.
+/// The data is flushed first; a failed flush publishes nothing (R19). A
+/// rename whose reply is lost may still have happened. Before retrying, the
+/// protocol looks: the temporary file gone and `to` of the expected size is
+/// the earlier attempt's success; both present is a name collision, which is
+/// refused.
 pub(crate) fn publish_new_with(
     ops: &dyn RemoteOps,
     from: &str,
     to: &str,
     retry: Retry,
-) -> Result<()> {
+) -> Result<Durability> {
+    let durability = synced(ops, from)?;
     let expected = ops.size(from)?.ok_or_else(|| vanished(from))?;
-    renamed_with(ops, from, to, expected, retry, |ops| ops.rename(from, to))
+    renamed_with(ops, from, to, expected, retry, |ops| ops.rename(from, to))?;
+    Ok(durability)
+}
+
+/// Flush `path`, reporting a server that cannot.
+fn synced(ops: &dyn RemoteOps, path: &str) -> Result<Durability> {
+    Ok(if ops.sync(path)? {
+        Durability::Synced
+    } else {
+        Durability::Unconfirmed(
+            "the SFTP server does not offer fsync@openssh.com, so it never confirmed that the \
+             data reached its disk"
+                .to_owned(),
+        )
+    })
 }
 
 /// Replace `to` with `from` (the catalog).
@@ -53,7 +73,13 @@ pub(crate) fn publish_new_with(
 /// old copy is first moved aside, so no attempt ever deletes the only copy;
 /// the catalog is a cache rebuilt from the images, so a crash in between
 /// costs nothing but a rescan.
-pub(crate) fn replace_with(ops: &dyn RemoteOps, from: &str, to: &str, retry: Retry) -> Result<()> {
+pub(crate) fn replace_with(
+    ops: &dyn RemoteOps,
+    from: &str,
+    to: &str,
+    retry: Retry,
+) -> Result<Durability> {
+    let durability = synced(ops, from)?;
     let expected = ops.size(from)?.ok_or_else(|| vanished(from))?;
     let mut supported = true;
     let atomic = renamed_with(ops, from, to, expected, retry, |ops| {
@@ -65,7 +91,7 @@ pub(crate) fn replace_with(ops: &dyn RemoteOps, from: &str, to: &str, retry: Ret
         }
     });
     if supported {
-        return atomic;
+        return atomic.map(|()| durability);
     }
     let aside = match ops.size(to)? {
         Some(size) => {
@@ -75,11 +101,11 @@ pub(crate) fn replace_with(ops: &dyn RemoteOps, from: &str, to: &str, retry: Ret
         }
         None => None,
     };
-    publish_new_with(ops, from, to, retry)?;
+    renamed_with(ops, from, to, expected, retry, |ops| ops.rename(from, to))?;
     if let Some(aside) = aside {
         let _ = ops.remove(&aside);
     }
-    Ok(())
+    Ok(durability)
 }
 
 /// Run `attempt` until the rename of `from` to `to` is known to have
@@ -138,6 +164,12 @@ mod tests {
         files: RefCell<HashMap<String, Vec<u8>>>,
         renames: Cell<u32>,
         atomic_replace: bool,
+        /// Every sync and rename, in order.
+        log: RefCell<Vec<String>>,
+        /// Whether the server's sync fails.
+        sync_fails: bool,
+        /// Whether the first rename's reply is lost.
+        lose_first: bool,
     }
 
     impl LostAck {
@@ -151,6 +183,9 @@ mod tests {
                 ),
                 renames: Cell::new(0),
                 atomic_replace: true,
+                log: RefCell::new(Vec::new()),
+                sync_fails: false,
+                lose_first: true,
             }
         }
     }
@@ -171,6 +206,14 @@ mod tests {
                 .map(|bytes| bytes.len() as u64))
         }
 
+        fn sync(&self, path: &str) -> Result<bool> {
+            self.log.borrow_mut().push(format!("sync {path}"));
+            if self.sync_fails {
+                return Err(Error::Io(std::io::Error::other("fsync failed: EIO")));
+            }
+            Ok(true)
+        }
+
         fn rename(&self, from: &str, to: &str) -> Result<()> {
             let mut files = self.files.borrow_mut();
             if files.contains_key(to) {
@@ -180,8 +223,9 @@ mod tests {
                 .remove(from)
                 .ok_or_else(|| Error::Io(std::io::ErrorKind::NotFound.into()))?;
             files.insert(to.to_owned(), bytes);
+            self.log.borrow_mut().push(format!("rename {from} {to}"));
             self.renames.set(self.renames.get() + 1);
-            if self.renames.get() == 1 {
+            if self.lose_first && self.renames.get() == 1 {
                 return Err(lost());
             }
             Ok(())
@@ -196,8 +240,9 @@ mod tests {
                 .remove(from)
                 .ok_or_else(|| Error::Io(std::io::ErrorKind::NotFound.into()))?;
             files.insert(to.to_owned(), bytes);
+            self.log.borrow_mut().push(format!("rename {from} {to}"));
             self.renames.set(self.renames.get() + 1);
-            if self.renames.get() == 1 {
+            if self.lose_first && self.renames.get() == 1 {
                 return Err(lost());
             }
             Ok(true)
@@ -280,6 +325,37 @@ mod tests {
             files.len(),
             1,
             "the old copy is removed afterwards: {files:?}"
+        );
+    }
+
+    /// The data is flushed before the rename that publishes it (R19).
+    #[test]
+    fn the_image_is_synced_before_it_is_published() {
+        let mut ops = LostAck::with(&[("tmp", b"image")]);
+        ops.lose_first = false;
+        publish_new_with(&ops, "tmp", "img", FAST).expect("publish");
+        assert_eq!(*ops.log.borrow(), ["sync tmp", "rename tmp img"]);
+    }
+
+    /// A failed sync prevents publication; the temporary file stays for the
+    /// caller to discard (R19).
+    #[test]
+    fn a_failed_sync_prevents_publication() {
+        let mut ops = LostAck::with(&[("tmp", b"image")]);
+        ops.sync_fails = true;
+        let error = publish_new_with(&ops, "tmp", "img", FAST).expect_err("sync failed");
+        assert!(error.to_string().contains("fsync failed"), "{error}");
+        assert!(
+            !ops.files.borrow().contains_key("img"),
+            "nothing was published"
+        );
+        assert!(
+            ops.log
+                .borrow()
+                .iter()
+                .all(|entry| !entry.starts_with("rename")),
+            "{:?}",
+            ops.log.borrow()
         );
     }
 }

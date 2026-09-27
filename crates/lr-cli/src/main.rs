@@ -691,6 +691,9 @@ fn backup_create(json: bool, options: &BackupOptions<'_>) -> anyhow::Result<()> 
                     "warning:     the image is inconsistent; restoring it needs --accept-inconsistent"
                 );
             }
+            for warning in &report.warnings {
+                println!("warning:     {warning}");
+            }
             if !report.encrypted {
                 println!("note:        image is not encrypted and not tamper-evident");
             }
@@ -731,6 +734,9 @@ fn backup_create(json: bool, options: &BackupOptions<'_>) -> anyhow::Result<()> 
                     region.zero_chunks,
                     region.bad_chunks
                 );
+            }
+            for warning in &report.warnings {
+                println!("warning:     {warning}");
             }
             if !report.encrypted {
                 println!("note:        image is not encrypted and not tamper-evident");
@@ -815,6 +821,9 @@ fn backup_create(json: bool, options: &BackupOptions<'_>) -> anyhow::Result<()> 
                 report.total_chunks, report.stored_chunks, report.deduplicated_chunks
             );
             println!("image size:  {} bytes", report.image_bytes);
+            for warning in &report.warnings {
+                println!("warning:     {warning}");
+            }
             if !report.encrypted {
                 println!("note:        image is not encrypted and not tamper-evident");
             }

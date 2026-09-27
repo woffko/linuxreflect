@@ -316,6 +316,9 @@ fn an_sftp_destination_carries_a_chain() {
         other => panic!("expected a block image, got {other:?}"),
     };
     assert!(full.image_uri.starts_with("sftp://"), "{}", full.image_uri);
+    // OpenSSH offers fsync@openssh.com, so the image was flushed before it
+    // was renamed and no durability warning is raised (R19).
+    assert!(full.warnings.is_empty(), "{:?}", full.warnings);
     // The image really landed on the served side.
     let served = server.root().join(SET_NAME);
     assert!(

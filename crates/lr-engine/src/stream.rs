@@ -65,6 +65,10 @@ pub struct SubvolumeReport {
 /// What a stream backup produced.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StreamReport {
+    /// Non-fatal notes, such as a destination that could not confirm the
+    /// image reached stable storage.
+    #[serde(default)]
+    pub warnings: Vec<String>,
     /// Final image path inside the set.
     pub image_path: PathBuf,
     /// Image identifier.
@@ -488,7 +492,8 @@ pub fn backup_stream(request: &BackupRequest) -> Result<StreamReport> {
     writer.flush().map_err(Error::Io)?;
     let image_bytes = writer.seek(std::io::SeekFrom::End(0)).map_err(Error::Io)?;
     drop(writer);
-    destination.publish_new(&set, &tmp_name, &image_name)?;
+    // A failed flush publishes nothing (R19); an unconfirmed one is reported.
+    let durability = destination.publish_new(&set, &tmp_name, &image_name)?;
     guard.disarm();
 
     // The image is durable, so the snapshots it streamed may now be recorded
@@ -503,6 +508,7 @@ pub fn backup_stream(request: &BackupRequest) -> Result<StreamReport> {
     }
 
     Ok(StreamReport {
+        warnings: durability.warning("the image").into_iter().collect(),
         image_path: crate::backup::local_image_path(&set_root, &image_name),
         image_uuid: request.image_uuid,
         chain_id: request.chain_id,

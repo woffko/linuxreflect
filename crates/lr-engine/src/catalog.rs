@@ -259,7 +259,9 @@ pub fn write_catalog(
     if published.is_err() {
         let _ = destination.delete(set, &tmp.name);
     }
-    published
+    // The catalog is a cache rebuilt from the images' superblocks, so an
+    // unconfirmed flush needs no warning; the images carry their own.
+    published.map(|_| ())
 }
 
 /// Load the catalog, validating it against the members' superblocks.
