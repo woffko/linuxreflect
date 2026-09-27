@@ -292,6 +292,120 @@ fn a_whole_disk_image_round_trips_to_a_larger_disk() {
     );
 }
 
+/// Partition numbers need not follow disk order: here partition 2 comes
+/// first on the disk, then 1, then 5. The image orders its regions by
+/// position and keeps every number, and the restore puts each partition
+/// back where it was (R37).
+#[test]
+fn partitions_numbered_out_of_disk_order_round_trip() {
+    if !have("sgdisk") {
+        lr_testkit::unavailable!("sgdisk missing");
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = dir.path().join("numbered.img");
+    sparse(&source, 64 * 1024 * 1024);
+    assert!(
+        run(
+            "sgdisk",
+            &[
+                "-n",
+                "2:2048:+8M",
+                "-n",
+                "1:0:+8M",
+                "-n",
+                "5:0:+8M",
+                &source.display().to_string(),
+            ],
+        ),
+        "sgdisk"
+    );
+    let rows = |path: &Path| -> Vec<(u32, u64, u64)> {
+        let text = Command::new("sgdisk")
+            .arg("-p")
+            .arg(path)
+            .output()
+            .expect("sgdisk -p");
+        String::from_utf8_lossy(&text.stdout)
+            .lines()
+            .filter_map(|line| {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                Some((
+                    fields.first()?.parse().ok()?,
+                    fields.get(1)?.parse().ok()?,
+                    fields.get(2)?.parse().ok()?,
+                ))
+            })
+            .collect()
+    };
+    let before = rows(&source);
+    assert_eq!(
+        before.iter().map(|row| row.0).collect::<Vec<_>>(),
+        [1, 2, 5],
+        "{before:?}"
+    );
+    // A distinct payload at the start of every partition.
+    for (number, start, _) in &before {
+        write_at(&source, start * 512, &[*number as u8; 4096]);
+    }
+
+    let report = backup_image(&request(&source, &dir.path().join("out"))).expect("backup");
+    let ImageReport::WholeDisk(disk) = &report else {
+        panic!("expected a whole-disk image, got {report:?}");
+    };
+    let numbers: Vec<u32> = disk
+        .regions
+        .iter()
+        .filter(|region| region.index > 0)
+        .map(|region| region.index)
+        .collect();
+    assert_eq!(numbers, [2, 1, 5], "regions follow the disk, numbers stay");
+
+    let target = dir.path().join("numbered-target.img");
+    sparse(&target, 96 * 1024 * 1024);
+    let plan = prepare_restore(&PrepareRequest::from_path(
+        &disk.image_path,
+        &target,
+        Encryption::NoEncrypt,
+    ))
+    .expect("prepare");
+    apply_restore(&ApplyRequest {
+        token: plan.token,
+        confirm: true,
+        accept_inconsistent: false,
+        encryption: Encryption::NoEncrypt,
+        context: lr_engine::progress::EngineContext::silent(),
+    })
+    .expect("apply");
+    assert_eq!(rows(&target), before, "the partitions moved");
+    let listing = Command::new("sgdisk")
+        .arg("-p")
+        .arg(&target)
+        .output()
+        .expect("sgdisk -p");
+    let listing = String::from_utf8_lossy(&listing.stdout);
+    assert!(
+        listing.contains("holds up to 128 entries"),
+        "the entry array must keep its size: {listing}"
+    );
+    let verify = Command::new("sgdisk")
+        .arg("--verify")
+        .arg(&target)
+        .output()
+        .expect("sgdisk --verify");
+    assert!(
+        String::from_utf8_lossy(&verify.stdout).contains("No problems found"),
+        "{}",
+        String::from_utf8_lossy(&verify.stdout)
+    );
+    for (number, start, _) in &before {
+        assert_eq!(
+            read_at(&target, start * 512, 4096),
+            vec![*number as u8; 4096],
+            "partition {number}"
+        );
+    }
+}
+
 #[test]
 fn a_disk_without_a_partition_table_stays_a_block_backup() {
     let dir = tempfile::tempdir().expect("tempdir");

@@ -178,7 +178,9 @@ pub fn backup_whole_disk(request: &crate::backup::BackupRequest) -> Result<Whole
     let lbs = source.logical_block_size();
     let mut buffer = source.buffer(request.chunk_size as usize)?;
 
-    // Regions: the leading area, then every partition in index order.
+    // Regions: the leading area, then every partition in disk order. The
+    // numbers need not follow the disk (partition 2 may come before 1), so
+    // regions are ordered by position and keep their own numbers (R37).
     let mut regions: Vec<RegionRecord> = Vec::new();
     let first_partition_byte = layout
         .partitions
@@ -192,12 +194,13 @@ pub fn backup_whole_disk(request: &crate::backup::BackupRequest) -> Result<Whole
         region.consistency = Consistency::Offline;
         regions.push(region);
     }
-    let plans: Vec<PartitionPlan> = layout
+    let mut plans: Vec<PartitionPlan> = layout
         .partitions
         .iter()
         .filter(|partition| partition.size_bytes > 0)
         .map(plan_partition)
         .collect();
+    plans.sort_by_key(|plan| (plan.start_lba, plan.index));
     for plan in &plans {
         let mut region = RegionRecord::new(plan.kind, plan.index, plan.start_lba, plan.size_bytes);
         region.consistency = Consistency::Offline;
@@ -733,39 +736,103 @@ pub(crate) fn restore_whole_disk<R: std::io::Read + std::io::Seek>(
     })
 }
 
-/// Rewrite the primary and backup GPT for the current target size, through
-/// the claimed target (`path` only names it in messages). The table's LBAs
-/// are in the image's logical blocks, which `prepare` matched to the target's
+/// Fit the restored GPT to the target: move the backup header and entry
+/// array to the target's last blocks and let the usable area end before
+/// them, through the claimed target (`path` only names it in messages).
+///
+/// The entry array stays exactly as restored, so every partition keeps its
+/// number and slot, and the entry count does not change. (The `gpt` crate
+/// rewrote the whole table, which moved the used entries to the front, so
+/// partition 5 of a table with a gap came back as partition 3, and shrank
+/// the entry count to the number of partitions; R37.) The table's LBAs are
+/// in the image's logical blocks, which `prepare` matched to the target's
 /// (A14).
 fn regenerate_gpt(target: &DirectBlockTarget, path: &Path, logical_block_size: u32) -> Result<()> {
-    let block =
-        gpt::disk::LogicalBlockSize::try_from(u64::from(logical_block_size)).map_err(|_| {
-            Error::corrupt(format!(
-                "the image's logical block size {logical_block_size} cannot hold a GPT"
-            ))
-        })?;
-    let config = gpt::GptConfig::new()
-        .logical_block_size(block)
-        .writable(true)
-        .only_valid_headers(false)
-        .change_partition_count(true);
-    let file = target.buffered_handle()?;
-    let flush = file.try_clone().map_err(Error::Io)?;
-    let mut disk = config.open_from_device(file).map_err(|e| {
+    use std::os::unix::fs::FileExt;
+    let fail = |what: String| {
         Error::corrupt(format!(
-            "cannot reopen {} to regenerate the partition table: {e}",
+            "cannot fit the partition table to {}: {what}",
             path.display()
         ))
-    })?;
-    // `update_partitions` recomputes both headers for the *current* device
-    // size, including the backup header's location; `write_inplace` alone would
-    // keep the old backup LBA from the restored header.
-    let partitions = disk.partitions().clone();
-    disk.update_partitions(partitions)
-        .map_err(|e| Error::corrupt(format!("cannot rebuild the partition table: {e}")))?;
-    disk.write_inplace()
-        .map_err(|e| Error::corrupt(format!("cannot write the regenerated GPT: {e}")))?;
-    flush.sync_all().map_err(Error::Io)
+    };
+    let lbs = u64::from(logical_block_size);
+    let block = usize::try_from(lbs).map_err(|_| fail("block size".to_owned()))?;
+    let file = target.buffered_handle()?;
+    let last_lba = (target.size_bytes() / lbs)
+        .checked_sub(1)
+        .ok_or_else(|| fail("the target is empty".to_owned()))?;
+    let field = |bytes: &[u8], at: usize| {
+        u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap_or([0; 8]))
+    };
+    let field32 = |bytes: &[u8], at: usize| {
+        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap_or([0; 4]))
+    };
+
+    let mut primary = vec![0u8; block];
+    file.read_exact_at(&mut primary, lbs).map_err(Error::Io)?;
+    if &primary[0..8] != b"EFI PART" {
+        return Err(fail("there is no GPT header in block 1".to_owned()));
+    }
+    let header_size = field32(&primary, 12) as usize;
+    if !(92..=block).contains(&header_size) {
+        return Err(fail(format!("the header claims {header_size} bytes")));
+    }
+    let mut unsealed = primary[..header_size].to_vec();
+    unsealed[16..20].fill(0);
+    if crc32fast::hash(&unsealed) != field32(&primary, 16) {
+        return Err(fail("the header checksum does not match".to_owned()));
+    }
+    let entries_lba = field(&primary, 72);
+    let entry_count = u64::from(field32(&primary, 80));
+    let entry_size = u64::from(field32(&primary, 84));
+    let entries_bytes = entry_count * entry_size;
+    if entry_size < 128 || entries_bytes == 0 || entries_bytes > 16 * 1024 * 1024 {
+        return Err(fail(format!(
+            "{entry_count} entries of {entry_size} bytes is not a partition array"
+        )));
+    }
+    let entries_blocks = entries_bytes.div_ceil(lbs);
+    let mut entries = vec![0u8; usize::try_from(entries_blocks * lbs).unwrap_or(0)];
+    file.read_exact_at(&mut entries, entries_lba * lbs)
+        .map_err(Error::Io)?;
+    let listed = usize::try_from(entries_bytes).unwrap_or(0);
+    if crc32fast::hash(&entries[..listed]) != field32(&primary, 88) {
+        return Err(fail(
+            "the partition array checksum does not match".to_owned(),
+        ));
+    }
+    let backup_entries_lba = last_lba
+        .checked_sub(entries_blocks)
+        .ok_or_else(|| fail("the target is too small".to_owned()))?;
+    let last_usable = backup_entries_lba - 1;
+    if last_usable < field(&primary, 48) {
+        return Err(fail(
+            "the target is smaller than the restored table".to_owned(),
+        ));
+    }
+
+    let seal = |header: &mut Vec<u8>| {
+        header[16..20].fill(0);
+        let crc = crc32fast::hash(&header[..header_size]);
+        header[16..20].copy_from_slice(&crc.to_le_bytes());
+    };
+    primary[32..40].copy_from_slice(&last_lba.to_le_bytes());
+    primary[48..56].copy_from_slice(&last_usable.to_le_bytes());
+    seal(&mut primary);
+    let mut backup = primary.clone();
+    backup[24..32].copy_from_slice(&last_lba.to_le_bytes());
+    backup[32..40].copy_from_slice(&1u64.to_le_bytes());
+    backup[72..80].copy_from_slice(&backup_entries_lba.to_le_bytes());
+    seal(&mut backup);
+
+    file.write_all_at(&entries, backup_entries_lba * lbs)
+        .map_err(Error::Io)?;
+    file.write_all_at(&backup, last_lba * lbs)
+        .map_err(Error::Io)?;
+    file.write_all_at(&primary, lbs).map_err(Error::Io)?;
+
+    // The protective MBR is left as restored, boot code included.
+    file.sync_all().map_err(Error::Io)
 }
 
 /// Recreate a swap region from its stored header.

@@ -19,6 +19,7 @@ lr-fsmap.workspace = true
 lr-snapshot.workspace = true
 lr-store.workspace = true
 gpt.workspace = true
+crc32fast.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

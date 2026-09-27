@@ -67,6 +67,7 @@ rand = "=0.10.2"
 
 # Partition tables / syscalls (spec §B)
 gpt = "=4.1.0"
+crc32fast = "=1.5.2"
 mbrman = "=0.6.1"
 nix = { version = "=0.31.3", features = ["ioctl", "fs", "mount", "dir", "user"] }
 libc = "=0.2.189"
