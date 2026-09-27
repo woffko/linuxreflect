@@ -1435,3 +1435,31 @@ replacing the disk's partition table and every partition on it.
 
 Regression test: the root test `image_and_target_kinds_must_match`, which
 fails before the change.
+
+## D-120 — The storage contract
+
+One retry wrapper used to serve operations with different idempotency, and
+paths below a destination were built by joining strings. Block 2.1 of the
+remediation plan replaces that with explicit operations:
+
+| Operation | Rule |
+|---|---|
+| `create_tmp` | Random name next to the final one, created exclusively (`O_CREAT \| O_EXCL \| O_NOFOLLOW`, SFTP `EXCLUDE`); callers publish and discard by the returned name (R07) |
+| `publish_new` | Flush first; a failed flush publishes nothing, and a server without `fsync@openssh.com` yields `Durability::Unconfirmed`, reported as a warning (R19). Never replaces or deletes an existing file; a retry after a lost reply recognises the earlier success (R18). Locally `renameat2(RENAME_NOREPLACE)` |
+| `replace` | For the catalog only: `rename` locally, `posix-rename@openssh.com` over SFTP, otherwise the old copy is moved aside first. The catalog is a cache rebuilt from the images, so its durability is not reported |
+| `open_set` / `open_existing_set` | Only backups create a set; every read path uses `open_existing_set`, which fails with "no backup set" (A9) |
+| `lock_set` | A random token per acquisition. Locally the holder keeps an exclusive `flock` on its lock file, so a live holder, even a paused one, is never broken on its host. Refreshes write into the holder's own inode (locally) or re-read the token first (SFTP) and never recreate a removed lock. `SetLock::verify` is called before every publication, catalog write and deletion (R21) |
+
+- **Confinement.** Locally, the set directory and every directory below it
+  are opened from the pinned destination root without following symlinks,
+  and each file is named as one component of its pinned directory
+  (`lr_unsafe::beneath`, as in D-118). Over SFTP the server account's own
+  permissions are the boundary.
+- **Scratch space.** Manifest spools are unnamed (`O_TMPFILE`, or a random
+  0600 name unlinked at once) and kept on one descriptor, so there is nothing
+  to substitute and nothing to clean up (R08, R39). The daemon keeps its host
+  mount namespace (no `PrivateTmp=`), because its NBD and FUSE mounts must be
+  visible to the user.
+- **Remote limits.** SFTP has no compare-and-swap, so a replacement that lands
+  between a refresh's token check and its write cannot be prevented; the
+  replacing holder's own `verify` then sees the other token and stops.

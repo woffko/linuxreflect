@@ -427,8 +427,8 @@ P3 = cleanup.
 | R04 | P0 | Btrfs send parents do not match catalog parents | 1.5 | ☑ |
 | R05 | P0 | Swap recreation can format a stale partition extent | 1.1 | ☑ |
 | R06 | P1 | File and Stream restores are not confined to the target | 1.6 | ☑ |
-| R07 | P1 | Catalog temporary-file symlink redirects root writes | 2.1 | ☐ |
-| R08 | P1 | Shared scratch spool permits manifest substitution | 2.1 | ☐ |
+| R07 | P1 | Catalog temporary-file symlink redirects root writes | 2.1 | ☑ |
+| R08 | P1 | Shared scratch spool permits manifest substitution | 2.1 | ☑ |
 | R09 | P1 | NBD inspection mounts keep setuid and device nodes | 2.6 | ☐ |
 | R10 | P2 | Read permission can cancel another user's job | 3 | ☐ |
 | R11 | P2 | Unauthenticated Argon2 parameters choose resource use | 1.2 | ☑ |
@@ -438,10 +438,10 @@ P3 = cleanup.
 | R15 | P1 | Requested encryption ignored on a plaintext chain | 2.2 | ☐ |
 | R16 | P1 | Live file backups lack per-file stability checks | 2.2 | ☐ |
 | R17 | P1 | Incrementals miss changes that keep size and mtime | 2.2 | ☐ |
-| R18 | P1 | SFTP retry can delete an already published image | 2.1 | ☐ |
-| R19 | P1 | SFTP success does not establish durability | 2.1 | ☐ |
+| R18 | P1 | SFTP retry can delete an already published image | 2.1 | ☑ |
+| R19 | P1 | SFTP success does not establish durability | 2.1 | ☑ |
 | R20 | P1 | Retention can delete the last usable chain | 2.3 | ☐ |
-| R21 | P1 | Lease refresh can overwrite a replacement lock | 2.1 | ☐ |
+| R21 | P1 | Lease refresh can overwrite a replacement lock | 2.1 | ☑ |
 | R22 | P1 | `verify --chain` misses corrupted superseded payloads | 2.3 | ☐ |
 | R23 | P2 | Default verification rejects valid non-full members | 2.3 | ☐ |
 | R24 | P1 | Whole-disk manifests can restore an incomplete region | 2.3 | ☐ |
@@ -459,7 +459,7 @@ P3 = cleanup.
 | R36 | P2 | Accepted scheduling fields are ignored | 3 | ☐ |
 | R37 | P2 | Whole-disk backup rejects legal partition numbering | 3 | ☐ |
 | R38 | P2 | Filesystem-tool parse errors can deadlock a job | 3 | ☐ |
-| R39 | P3 | Block-backup failure cleanup targets the wrong spool | 2.1 | ☐ |
+| R39 | P3 | Block-backup failure cleanup targets the wrong spool | 2.1 | ☑ |
 | R40 | P2 | Integration tests pass when setup fails | 0.2 | ☑ |
 | A1 | P0 | Restore writes over a filesystem mounted in another mount namespace (no `O_EXCL`) | 1.1 | ☑ |
 | A2 | P0 | A device mounted elsewhere is backed up as `consistency: offline` | 1.1 | ☑ |
@@ -469,7 +469,7 @@ P3 = cleanup.
 | A6 | P1 | SFTP unusable through the daemon from the GUI; list calls drop SSH options | 2.5 | ☐ |
 | A7 | P1 | Infinite stop timeout can hang shutdown | 2.7 | ☐ |
 | A8 | P1 | One panic ends every job, including a running restore | 2.7 | ☐ |
-| A9 | P2 | Read-only operations create set directories | 2.1 | ☐ |
+| A9 | P2 | Read-only operations create set directories | 2.1 | ☑ |
 | A10 | P2 | The GUI cannot restore files into a non-empty folder | 2.8 | ☐ |
 | A11 | P2 | Restore tokens are reusable and not bound to the caller | 3 | ☐ |
 | A12 | P3 | NBD socket chmod after bind, failure ignored | 2.6 | ☐ |
