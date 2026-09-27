@@ -315,8 +315,8 @@ operations have different idempotency:
 ### 2.7 Daemon resilience — A7, A8, A5
 
 - **A8:** build the daemon with `panic = "unwind"` and wrap every job in
-  `catch_unwind`, recording a panic as a job failure. Run destructive restores
-  in a separate process.
+  `catch_unwind`, recording a panic as a job failure. (A separate process for
+  restores was considered and not adopted, D-122.)
 - **A7:** a finite, documented `TimeoutStopSec`; log and notify which job
   holds the stop; time out destination I/O; refuse new restores during
   shutdown (D-113, refining D-107).

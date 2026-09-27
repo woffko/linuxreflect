@@ -1545,3 +1545,21 @@ session, and the root daemon would then read whatever file a client names
   the backup wizard and uses them by name.
 - `ListSets` and `ListChains` now forward the SSH options a request carries,
   for callers that do pass them.
+
+## D-122 — A panic fails its own job, not the daemon
+
+The release profile used `panic = "abort"`, and every job runs in the daemon
+process, so a panic in any job, including a verification any session user can
+start, ended the daemon and every job with it, a restore halfway through a disk
+among them. In debug builds the panicking job stayed "running" forever (A8).
+
+- The release profile unwinds, and `run_job` wraps every job in
+  `catch_unwind`: a panic is logged and recorded as that job's failure
+  ("internal error: the job panicked"), and the daemon keeps serving.
+- **Not adopted: restores in a separate process.** Under systemd the daemon's
+  children share its control group, and `KillMode=control-group` stops them
+  when the daemon dies, so a worker process would not survive the failure it
+  is meant to survive (an abort, such as a stack overflow) unless it ran in
+  its own scope, which would in turn escape the job drain of D-107. The panic
+  isolation above covers the failure the audit observed; a process abort
+  remains a whole-daemon failure.

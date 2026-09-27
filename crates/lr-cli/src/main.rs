@@ -29,7 +29,7 @@ use lr_store::{DestinationOptions, SetHandle};
 
 /// Exit quietly when stdout is closed early (`linuxreflect disk list | head`).
 ///
-/// `println!` panics on `EPIPE`, and the release profile aborts on panic, so
+/// `println!` panics on `EPIPE`, which would end in a panic message, so
 /// a closed pipe used to end with "Aborted". Resetting `SIGPIPE` instead would
 /// also kill the process on a daemon socket that closes, so only this one
 /// panic is turned into the conventional exit status of a SIGPIPE death.

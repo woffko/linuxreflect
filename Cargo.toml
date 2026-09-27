@@ -131,7 +131,9 @@ doc_markdown = "allow"
 [profile.release]
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# Unwinding lets the daemon turn a panic in one job into that job's failure
+# instead of ending every job with the process (A8).
+panic = "unwind"
 
 [profile.dev.package."*"]
 opt-level = 1

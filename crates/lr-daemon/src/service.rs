@@ -323,7 +323,21 @@ impl DaemonService {
 
         let task_job_id = job_id;
         tokio::task::spawn_blocking(move || {
-            let outcome = work(context);
+            // A panic ends this job as a failure and nothing else: the other
+            // jobs, a restore halfway through a disk among them, keep running
+            // (A8). The release profile unwinds for this to work.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(context)))
+                .unwrap_or_else(|payload| {
+                    let message = payload
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| payload.downcast_ref::<&str>().copied())
+                        .unwrap_or("no message");
+                    tracing::error!(job = %task_job_id, message, "a job panicked");
+                    Err(Error::Io(std::io::Error::other(format!(
+                        "internal error: the job panicked ({message}); please report it"
+                    ))))
+                });
             if let Err(error) = jobs.finish(&task_job_id, outcome) {
                 tracing::warn!(%error, "cannot record a job outcome");
             }
@@ -1013,4 +1027,63 @@ pub fn restore_supported(kind: ImageKind) -> bool {
 pub fn verify_outcome(json: &str) -> VerifyOutcome {
     let _ = json;
     VerifyOutcome::default()
+}
+
+#[cfg(test)]
+mod panicking_jobs {
+    use super::{DaemonService, Jobs};
+    use std::sync::Arc;
+    use tokio_stream::StreamExt;
+
+    async fn steps(
+        mut stream: tokio_stream::wrappers::ReceiverStream<
+            std::result::Result<lr_proto::v1::Progress, tonic::Status>,
+        >,
+    ) -> Vec<lr_proto::v1::progress::Step> {
+        let mut steps = Vec::new();
+        while let Ok(Some(progress)) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), stream.next()).await
+        {
+            if let Some(step) = progress.expect("progress").step {
+                steps.push(step);
+            }
+        }
+        steps
+    }
+
+    /// A job that panics fails on its own: it is recorded as failed, and the
+    /// daemon keeps running other jobs (A8).
+    #[tokio::test]
+    async fn a_panicking_job_fails_alone() {
+        use lr_proto::v1::progress::Step;
+        let auth = crate::auth::build(Some("static:0"), true)
+            .await
+            .expect("auth");
+        let service = DaemonService::new(auth, Arc::new(Jobs::new()), true);
+        let panicking = service
+            .run_job("boom".to_owned(), "boom".to_owned(), |_| {
+                panic!("a deliberate panic in a job")
+            })
+            .expect("start");
+        let failed = steps(panicking).await;
+        assert!(
+            failed.iter().any(|step| matches!(
+                step,
+                Step::Failure(failure) if failure.message.contains("deliberate")
+            )),
+            "{failed:?}"
+        );
+        let healthy = service
+            .run_job("after".to_owned(), "after".to_owned(), |_| {
+                Ok("{}".to_owned())
+            })
+            .expect("start");
+        let finished = steps(healthy).await;
+        assert!(
+            finished
+                .iter()
+                .any(|step| matches!(step, Step::Finished(_))),
+            "{finished:?}"
+        );
+    }
 }
