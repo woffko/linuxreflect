@@ -56,13 +56,8 @@ fn main() -> ExitCode {
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            let code = if err.downcast_ref::<NotImplemented>().is_some() {
-                2
-            } else {
-                1
-            };
             eprintln!("linuxreflect: {err:#}");
-            ExitCode::from(code)
+            ExitCode::FAILURE
         }
     }
 }
@@ -442,22 +437,6 @@ fn job_show(json: bool, socket: Option<&Path>, job_id: &str, cancel: bool) -> an
     }
     Ok(())
 }
-
-/// Marker error for commands reserved for a later slice.
-#[derive(Debug)]
-struct NotImplemented(&'static str, &'static str);
-
-impl std::fmt::Display for NotImplemented {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "`{}` is not implemented yet; it arrives in slice {}",
-            self.0, self.1
-        )
-    }
-}
-
-impl std::error::Error for NotImplemented {}
 
 fn snapshot_id(choice: cli::SnapshotChoice) -> &'static str {
     match choice {

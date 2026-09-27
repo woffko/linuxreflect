@@ -3,7 +3,9 @@
 //! A passphrase is never a command-line argument. It comes from
 //! `--passphrase-file` or `LINUXREFLECT_PASSPHRASE_FILE`, is read through an
 //! `O_NOFOLLOW` descriptor whose mode must be exactly 0600, and is zeroized on
-//! drop. The interactive TTY prompt arrives with Slice S11.
+//! drop. There is no interactive prompt: a passphrase only ever comes from a
+//! file, so it never passes through a terminal, an argument or the daemon's
+//! socket.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -128,8 +130,8 @@ pub fn passphrase_file_path(explicit: Option<&Path>) -> Option<PathBuf> {
 pub fn resolve_passphrase(explicit: Option<&Path>) -> Result<Passphrase> {
     let path = passphrase_file_path(explicit).ok_or_else(|| {
         Error::unsupported(format!(
-            "no passphrase: pass --passphrase-file <path> or set {PASSPHRASE_FILE_ENV} \
-             (the interactive prompt arrives in Slice S11), or use --no-encrypt"
+            "no passphrase: pass --passphrase-file <path> (a 0600 file) or set \
+             {PASSPHRASE_FILE_ENV}, or use --no-encrypt"
         ))
     })?;
     load_passphrase_file(&path)
