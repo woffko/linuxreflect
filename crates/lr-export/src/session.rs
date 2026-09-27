@@ -72,9 +72,16 @@ pub fn resolve_image(
 }
 
 /// Mount options for a filesystem type (spec §K S13).
+///
+/// An inspection mount never honours setuid bits or device nodes from the
+/// image, and does not execute its programs: an image can carry a root-owned
+/// setuid binary or a device node for a live host disk, and read-only does
+/// not disable either (R09).
 #[must_use]
 pub fn mount_options(fs_type: &str) -> Vec<String> {
-    let mut options = vec!["ro".to_owned()];
+    let mut options = ["ro", "nosuid", "nodev", "noexec"]
+        .map(str::to_owned)
+        .to_vec();
     match fs_type {
         "ext4" | "ext3" | "ext2" => options.push("noload".to_owned()),
         "xfs" => {
@@ -325,12 +332,16 @@ mod tests {
 
     #[test]
     fn the_spec_mount_options_are_used() {
-        assert_eq!(mount_options("ext4"), vec!["ro", "noload"]);
-        assert_eq!(mount_options("ext3"), vec!["ro", "noload"]);
-        assert_eq!(mount_options("xfs"), vec!["ro", "nouuid", "norecovery"]);
+        let safe = ["ro", "nosuid", "nodev", "noexec"];
+        assert_eq!(mount_options("ext4"), [&safe[..], &["noload"]].concat());
+        assert_eq!(mount_options("ext3"), [&safe[..], &["noload"]].concat());
+        assert_eq!(
+            mount_options("xfs"),
+            [&safe[..], &["nouuid", "norecovery"]].concat()
+        );
         // Something else still mounts read-only.
-        assert_eq!(mount_options("vfat"), vec!["ro"]);
-        assert_eq!(mount_options("btrfs"), vec!["ro"]);
+        assert_eq!(mount_options("vfat"), safe);
+        assert_eq!(mount_options("btrfs"), safe);
     }
 
     #[test]

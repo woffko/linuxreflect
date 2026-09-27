@@ -115,6 +115,23 @@ impl SourceImage {
             payload(9, 32 * 1024),
         )
         .expect("file");
+        // Harmless fixtures an inspection mount must not honour (R09): a
+        // setuid-root program and a device node (the kernel's null device).
+        std::fs::copy("/bin/true", mountpoint.join("setuid-true")).expect("program");
+        std::fs::set_permissions(
+            mountpoint.join("setuid-true"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o4755),
+        )
+        .expect("setuid");
+        assert!(run(
+            "mknod",
+            &[
+                &mountpoint.join("null-device").display().to_string(),
+                "c",
+                "1",
+                "3"
+            ]
+        ));
         let _ = run("umount", &[&mountpoint.display().to_string()]);
         // The loop device stays attached: the backup reads it offline, and only
         // a source that still exists can be imaged at all.
@@ -253,9 +270,37 @@ fn export_case(fs: &str, size_mib: u64) {
         payload(9, 32 * 1024)
     );
 
-    // 4. The export is read-only.
+    // 4. The export is read-only, and the kernel really mounted it nosuid,
+    // nodev and noexec: the image's setuid program cannot run and its device
+    // node cannot be opened (R09).
     let write = std::fs::write(mountpoint.join("hello.txt"), b"changed\n");
     assert!(write.is_err(), "writing through the export must fail");
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").expect("mountinfo");
+    let flags = mountinfo
+        .lines()
+        .map(|line| line.split(' ').collect::<Vec<_>>())
+        .find(|fields| fields.get(4) == Some(&mountpoint.display().to_string().as_str()))
+        .and_then(|fields| fields.get(5).map(|flags| (*flags).to_owned()))
+        .expect("the export is in mountinfo");
+    for flag in ["ro", "nosuid", "nodev", "noexec"] {
+        assert!(
+            flags.split(',').any(|set| set == flag),
+            "{flag} missing: {flags}"
+        );
+    }
+    let program = mountpoint.join("setuid-true");
+    let mode = std::os::unix::fs::PermissionsExt::mode(
+        &std::fs::metadata(&program).expect("program").permissions(),
+    );
+    assert_eq!(mode & 0o4000, 0o4000, "the fixture keeps its setuid bit");
+    assert!(
+        Command::new(&program).status().is_err(),
+        "a program on the export must not execute"
+    );
+    assert!(
+        std::fs::File::open(mountpoint.join("null-device")).is_err(),
+        "a device node on the export must not open"
+    );
 
     // 5. Unmount and unexport cleanly.
     let unmounted = cli(&[
