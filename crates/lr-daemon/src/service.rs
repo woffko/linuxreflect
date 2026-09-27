@@ -232,59 +232,6 @@ impl DaemonService {
         Ok(peer)
     }
 
-    /// Build a request from a `BackupSpec`.
-    fn backup_request(spec: &BackupSpec) -> Result<lr_engine::backup::BackupRequest> {
-        let encryption = lr_engine::options::backup_encryption(
-            spec.no_encrypt,
-            (!spec.passphrase_file.is_empty())
-                .then(|| PathBuf::from(&spec.passphrase_file))
-                .as_deref(),
-        )?;
-        let mut request =
-            lr_engine::backup::BackupRequest::new(&spec.source, &spec.dest, &spec.set, encryption)?;
-        request.dest = spec.dest.clone();
-        if !spec.dest.is_empty() && !spec.dest.contains("://") {
-            request.dest_root = PathBuf::from(&spec.dest);
-        }
-        // An empty optional field means "the documented default" rather than
-        // an error: a client that leaves one out (the GUI, a future SDK) should
-        // not have to repeat the CLI's defaults.
-        let member_type = if spec.member_type.is_empty() {
-            "full"
-        } else {
-            spec.member_type.as_str()
-        };
-        request.member_type = lr_engine::options::parse_member_type(member_type)?;
-        request.parent = (!spec.parent.is_empty()).then(|| spec.parent.clone());
-        request.snapshot_provider = lr_engine::options::parse_snapshot(&spec.snapshot);
-        request.compression = if spec.compress.is_empty() {
-            lr_engine::backup::Compression::default()
-        } else {
-            lr_engine::options::parse_compression(&spec.compress)?
-        };
-        request.on_bad_sector = if spec.on_bad_sector.is_empty() {
-            lr_engine::backup::BadSectorPolicy::Abort
-        } else {
-            lr_engine::options::parse_bad_sector(&spec.on_bad_sector)?
-        };
-        if !spec.chunk_size.is_empty() {
-            request.chunk_size =
-                u32::try_from(lr_engine::options::parse_size(&spec.chunk_size)?)
-                    .map_err(|_| Error::unsupported("chunk size does not fit in 32 bits"))?;
-        }
-        request.allow_freeze = spec.allow_freeze;
-        request.allow_inconsistent = spec.allow_inconsistent;
-        request.exclude_nested_subvolumes = spec.exclude_nested_subvolumes;
-        request.lvm_cow_size = (!spec.lvm_cow_size.is_empty()).then(|| spec.lvm_cow_size.clone());
-        request.destination_options = lr_store::DestinationOptions {
-            set_name: spec.set.clone(),
-            identity: (!spec.identity.is_empty()).then(|| PathBuf::from(&spec.identity)),
-            known_hosts: (!spec.known_hosts.is_empty()).then(|| PathBuf::from(&spec.known_hosts)),
-            insecure_ignore_host_key: spec.insecure_ignore_host_key,
-        };
-        Ok(request)
-    }
-
     /// Run a job on a blocking thread, streaming its progress.
     fn run_job<F>(
         &self,
@@ -484,33 +431,16 @@ impl LinuxReflect for DaemonService {
     ) -> std::result::Result<Response<Self::CreateBackupStream>, Status> {
         self.authorize(&request, Action::BackupCreate).await?;
         let spec = request.get_ref().clone();
-        let request = DaemonService::backup_request(&spec).map_err(status::status_of)?;
+        // The same conversion the CLI's direct route uses (R31).
+        let job = lr_request::backup_job(&spec).map_err(status::status_of)?;
         let job_id = if spec.job_id.is_empty() {
-            format!("backup-{}", request.image_uuid)
+            format!("backup-{}", job.request.image_uuid)
         } else {
             spec.job_id.clone()
         };
-        let mode = lr_engine::options::parse_mode(&spec.mode).map_err(status::status_of)?;
-        let file_options = lr_engine::file::FileBackupOptions {
-            verify_content: spec.verify_content,
-            ..lr_engine::file::FileBackupOptions::default()
-        };
         let stream = self
             .run_job(job_id, spec.set.clone(), move |context| {
-                let mut request = request;
-                request.context = context;
-                let report = match mode {
-                    lr_engine::options::Mode::File => lr_engine::backup::ImageReport::File(
-                        lr_engine::file::backup_file(&request, &file_options)?,
-                    ),
-                    lr_engine::options::Mode::Auto if request.source.is_dir() => {
-                        lr_engine::backup::ImageReport::File(lr_engine::file::backup_file(
-                            &request,
-                            &file_options,
-                        )?)
-                    }
-                    _ => lr_engine::backup_image(&request)?,
-                };
+                let report = lr_request::run_backup(job, context)?;
                 serde_json::to_string(&report)
                     .map_err(|error| Error::corrupt(format!("report json: {error}")))
             })

@@ -3261,6 +3261,7 @@ dependencies = [
  "lr-format",
  "lr-fuse",
  "lr-proto",
+ "lr-request",
  "lr-snapshot",
  "lr-store",
  "lr-testkit",
@@ -3317,6 +3318,7 @@ dependencies = [
  "lr-export",
  "lr-format",
  "lr-proto",
+ "lr-request",
  "lr-snapshot",
  "lr-store",
  "lr-testkit",
@@ -3450,6 +3452,17 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+]
+
+[[package]]
+name = "lr-request"
+version = "0.1.0"
+dependencies = [
+ "lr-core",
+ "lr-engine",
+ "lr-proto",
+ "lr-store",
+ "tempfile",
 ]
 
 [[package]]

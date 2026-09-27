@@ -734,3 +734,62 @@ async fn a_second_sigterm_cancels_the_running_job() {
     let status = wait_for_exit(&mut daemon);
     assert!(status.success(), "{status:?}");
 }
+
+/// Options sent through the daemon reach the engine exactly as a direct run
+/// would honour them; --one-file-system was dropped before (R31).
+#[tokio::test]
+async fn file_options_survive_the_daemon_route() {
+    let daemon = Daemon::start(&format!("static:{}", uid()));
+    let work = tempfile::tempdir().expect("workdir");
+    let source = work.path().join("tree");
+    std::fs::create_dir_all(source.join("sub")).expect("tree");
+    std::fs::write(source.join("sub/file"), b"data").expect("file");
+    let dest = work.path().join("out");
+    let mut client = daemon.client().await;
+    let mut stream = client
+        .create_backup(BackupSpec {
+            source: source.display().to_string(),
+            dest: dest.display().to_string(),
+            set: "options".to_owned(),
+            mode: "file".to_owned(),
+            member_type: "full".to_owned(),
+            no_encrypt: true,
+            one_file_system: true,
+            ..BackupSpec::default()
+        })
+        .await
+        .expect("create_backup")
+        .into_inner();
+    let mut progress = Vec::new();
+    while let Some(step) = stream.message().await.expect("stream") {
+        progress.push(step);
+    }
+    assert!(failure_code(&progress).is_none(), "{progress:?}");
+
+    let options = lr_store::DestinationOptions::new("options");
+    let destination = lr_store::open(&dest.display().to_string(), &options).expect("destination");
+    let set = destination
+        .open_existing_set(&lr_core::SetId::ZERO)
+        .expect("set");
+    let image = destination
+        .list(&set)
+        .expect("list")
+        .into_iter()
+        .find(|name| name.ends_with(".lrimg"))
+        .expect("an image");
+    let files = lr_engine::chain::resolve_chain(&*destination, &set, &image).expect("chain");
+    let mut members = lr_engine::chain::open_chain(
+        &*destination,
+        &set,
+        &files,
+        &lr_engine::keys::Encryption::NoEncrypt,
+    )
+    .expect("open");
+    let metadata =
+        lr_engine::file::read_file_metadata(members.last_mut().expect("member")).expect("metadata");
+    assert_eq!(
+        metadata.get("one_file_system").map(String::as_str),
+        Some("true"),
+        "{metadata:?}"
+    );
+}

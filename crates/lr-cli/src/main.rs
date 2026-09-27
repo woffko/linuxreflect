@@ -20,11 +20,10 @@ use cli::{
 };
 use lr_core::catalog::Catalog;
 use lr_core::{Capabilities, discover_source};
-use lr_engine::backup::BackupRequest;
 use lr_engine::catalog as engine_catalog;
 
+use lr_engine::ImageReport;
 use lr_engine::restore::{ApplyRequest, PrepareRequest, apply_restore, prepare_restore};
-use lr_engine::{ImageReport, backup_image};
 use lr_export::BlockBackend;
 use lr_store::{DestinationOptions, SetHandle};
 
@@ -514,15 +513,6 @@ struct BackupOptions<'a> {
     max_incrementals: u64,
 }
 
-/// Resolve `--mode`/`auto` to a concrete mode for the in-process path.
-fn resolve_mode(mode: cli::ModeChoice, source: &Path) -> anyhow::Result<lr_engine::options::Mode> {
-    let parsed = lr_engine::options::parse_mode(mode_id(mode))?;
-    Ok(match parsed {
-        lr_engine::options::Mode::Auto if source.is_dir() => lr_engine::options::Mode::File,
-        other => other,
-    })
-}
-
 /// A mode name for the daemon and the engine (spec §D.1).
 fn mode_id(mode: cli::ModeChoice) -> &'static str {
     match mode {
@@ -533,50 +523,60 @@ fn mode_id(mode: cli::ModeChoice) -> &'static str {
     }
 }
 
+/// The backup a command line describes, as the daemon receives it. Both
+/// routes run exactly this description (R31).
+fn backup_spec(options: &BackupOptions<'_>) -> lr_proto::v1::BackupSpec {
+    lr_proto::v1::BackupSpec {
+        source: options.source.display().to_string(),
+        dest: options.dest.to_owned(),
+        set: options.set.to_owned(),
+        member_type: match options.backup_type {
+            BackupType::Full => "full",
+            BackupType::Incremental => "incremental",
+            BackupType::Differential => "differential",
+        }
+        .to_owned(),
+        parent: options.parent.clone().unwrap_or_default(),
+        mode: mode_id(options.mode).to_owned(),
+        snapshot: options.snapshot.clone().unwrap_or_default(),
+        compress: options.compress.to_owned(),
+        no_encrypt: options.no_encrypt,
+        passphrase_file: options
+            .passphrase_file
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        on_bad_sector: match options.on_bad_sector {
+            BadSectorChoice::Abort => "abort",
+            BadSectorChoice::Record => "record",
+        }
+        .to_owned(),
+        chunk_size: options.chunk_size.to_owned(),
+        allow_freeze: options.allow_freeze,
+        allow_inconsistent: options.allow_inconsistent,
+        lvm_cow_size: options.lvm_cow_size.clone().unwrap_or_default(),
+        identity: options
+            .identity
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        known_hosts: options
+            .known_hosts
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        insecure_ignore_host_key: options.insecure_ignore_host_key,
+        max_incrementals: options.max_incrementals,
+        one_file_system: options.one_file_system,
+        freeze_timeout_secs: options.freeze_timeout,
+        deadman_grace_secs: options.deadman_grace,
+        break_stale_lock: options.break_stale_lock,
+        verify_content: options.verify_content,
+        exclude_nested_subvolumes: options.exclude_nested_subvolumes,
+        ..lr_proto::v1::BackupSpec::default()
+    }
+}
+
 fn backup_create(json: bool, options: &BackupOptions<'_>) -> anyhow::Result<()> {
+    let spec = backup_spec(options);
     if let Some(mut client) = client_if_available(options.socket) {
-        let spec = lr_proto::v1::BackupSpec {
-            source: options.source.display().to_string(),
-            dest: options.dest.to_owned(),
-            set: options.set.to_owned(),
-            member_type: match options.backup_type {
-                BackupType::Full => "full",
-                BackupType::Incremental => "incremental",
-                BackupType::Differential => "differential",
-            }
-            .to_owned(),
-            parent: options.parent.clone().unwrap_or_default(),
-            mode: mode_id(options.mode).to_owned(),
-            snapshot: options.snapshot.clone().unwrap_or_default(),
-            compress: options.compress.to_owned(),
-            no_encrypt: options.no_encrypt,
-            passphrase_file: options
-                .passphrase_file
-                .map(|path| path.display().to_string())
-                .unwrap_or_default(),
-            on_bad_sector: match options.on_bad_sector {
-                BadSectorChoice::Abort => "abort",
-                BadSectorChoice::Record => "record",
-            }
-            .to_owned(),
-            chunk_size: options.chunk_size.to_owned(),
-            allow_freeze: options.allow_freeze,
-            allow_inconsistent: options.allow_inconsistent,
-            lvm_cow_size: options.lvm_cow_size.clone().unwrap_or_default(),
-            identity: options
-                .identity
-                .map(|path| path.display().to_string())
-                .unwrap_or_default(),
-            known_hosts: options
-                .known_hosts
-                .map(|path| path.display().to_string())
-                .unwrap_or_default(),
-            insecure_ignore_host_key: options.insecure_ignore_host_key,
-            max_incrementals: options.max_incrementals,
-            verify_content: options.verify_content,
-            exclude_nested_subvolumes: options.exclude_nested_subvolumes,
-            ..lr_proto::v1::BackupSpec::default()
-        };
         let summary = client.create_backup(spec, |progress| {
             if let Some(line) = client::progress_line(progress) {
                 println!("{line}");
@@ -589,23 +589,6 @@ fn backup_create(json: bool, options: &BackupOptions<'_>) -> anyhow::Result<()> 
         }
         return Ok(());
     }
-    let encryption =
-        lr_engine::options::backup_encryption(options.no_encrypt, options.passphrase_file)?;
-    let mut request = BackupRequest::new(options.source, options.dest, options.set, encryption)?;
-    request.dest = options.dest.to_owned();
-    request.dest_root = if options.dest.contains("://") {
-        // A remote destination has no local path; the freeze provider is told
-        // through `destination_options`/`snapshot_opts`.
-        PathBuf::new()
-    } else {
-        PathBuf::from(options.dest)
-    };
-    request.destination_options = DestinationOptions {
-        set_name: options.set.to_owned(),
-        identity: options.identity.map(Path::to_path_buf),
-        known_hosts: options.known_hosts.map(Path::to_path_buf),
-        insecure_ignore_host_key: options.insecure_ignore_host_key,
-    };
     if !options.dest.contains("://")
         && let Ok(facts) = lr_store::local_mount_facts(Path::new(options.dest))
         && !facts.is_mount
@@ -615,44 +598,10 @@ fn backup_create(json: bool, options: &BackupOptions<'_>) -> anyhow::Result<()> 
             options.dest
         );
     }
-    request.member_type = match options.backup_type {
-        BackupType::Full => lr_engine::backup::MemberType::Full,
-        BackupType::Incremental => lr_engine::backup::MemberType::Incremental,
-        BackupType::Differential => lr_engine::backup::MemberType::Differential,
-    };
-    request.parent = options.parent.clone();
-    request.break_stale_lock = options.break_stale_lock;
-    request.chunk_size = u32::try_from(lr_engine::options::parse_size(options.chunk_size)?)
-        .context("chunk size does not fit in 32 bits")?;
-    request.compression = lr_engine::options::parse_compression(options.compress)?;
-    request.on_bad_sector = match options.on_bad_sector {
-        BadSectorChoice::Abort => lr_engine::backup::BadSectorPolicy::Abort,
-        BadSectorChoice::Record => lr_engine::backup::BadSectorPolicy::Record,
-    };
-    request.snapshot_provider = options.snapshot.clone().filter(|name| name != "auto");
-    request.allow_freeze = options.allow_freeze;
-    request.freeze_timeout_secs = Some(options.freeze_timeout);
-    request.allow_inconsistent = options.allow_inconsistent;
-    request.lvm_cow_size = options.lvm_cow_size.clone();
-    request.deadman_grace_secs = Some(options.deadman_grace);
-    request.max_incrementals_per_chain =
-        (options.max_incrementals > 0).then_some(options.max_incrementals);
-    request.exclude_nested_subvolumes = options.exclude_nested_subvolumes;
-
-    let report = match resolve_mode(options.mode, options.source)? {
-        lr_engine::options::Mode::File => {
-            let file_options = lr_engine::file::FileBackupOptions {
-                one_file_system: options.one_file_system,
-                verify_content: options.verify_content,
-                ..lr_engine::file::FileBackupOptions::default()
-            };
-            lr_engine::backup::ImageReport::File(lr_engine::file::backup_file(
-                &request,
-                &file_options,
-            )?)
-        }
-        _ => backup_image(&request)?,
-    };
+    // The daemon's own conversion, so a command behaves the same whichever
+    // route runs it (R31).
+    let job = lr_request::backup_job(&spec)?;
+    let report = lr_request::run_backup(job, lr_engine::progress::EngineContext::silent())?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());

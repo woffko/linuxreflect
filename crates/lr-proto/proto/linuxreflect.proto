@@ -106,6 +106,14 @@ message BackupSpec {
   // Btrfs: back up although nested subvolumes are not mounted; they are
   // named in the report (D-112).
   bool exclude_nested_subvolumes = 23;
+  // File mode: stay on one filesystem (spec §K S12).
+  bool one_file_system = 24;
+  // Freeze provider: seconds before the freeze is abandoned; 0 = default.
+  uint64 freeze_timeout_secs = 25;
+  // Freeze provider: extra seconds before the deadman thaws; 0 = default.
+  uint64 deadman_grace_secs = 26;
+  // Break a set lock whose lease has expired.
+  bool break_stale_lock = 27;
 }
 
 message MemberInfo {

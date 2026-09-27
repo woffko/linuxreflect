@@ -1,0 +1,20 @@
+[package]
+name = "lr-request"
+description = "One validated backup request model shared by the CLI and the daemon (R31)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+lr-core.workspace = true
+lr-engine.workspace = true
+lr-proto.workspace = true
+lr-store.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -20,6 +20,7 @@ lr-export.workspace = true
 lr-format.workspace = true
 lr-snapshot.workspace = true
 lr-proto.workspace = true
+lr-request.workspace = true
 tonic.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true

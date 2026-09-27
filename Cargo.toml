@@ -16,6 +16,7 @@ members = [
     "crates/lr-gui",
     "crates/lr-rescue",
     "crates/lr-proto",
+    "crates/lr-request",
     "crates/lr-daemon",
     "crates/lr-cli",
     "crates/lr-testkit",
@@ -111,6 +112,7 @@ lr-gui = { path = "crates/lr-gui" }
 lr-rescue = { path = "crates/lr-rescue" }
 lr-proto = { path = "crates/lr-proto" }
 lr-daemon = { path = "crates/lr-daemon" }
+lr-request = { path = "crates/lr-request" }
 lr-testkit = { path = "crates/lr-testkit" }
 
 [workspace.lints.rust]

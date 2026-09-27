@@ -16,6 +16,7 @@ lr-snapshot.workspace = true
 lr-store.workspace = true
 lr-format.workspace = true
 lr-proto.workspace = true
+lr-request.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tonic.workspace = true
