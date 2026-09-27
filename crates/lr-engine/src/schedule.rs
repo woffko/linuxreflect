@@ -2,8 +2,13 @@
 //!
 //! The config file is the single description of what a scheduled job does, and
 //! the daemon materializes it as `linuxreflect-job@<name>.timer` plus
-//! `.service` units under `/etc/systemd/system/` (spec §J.4). `OnCalendar`,
-//! `Persistent` and `RandomizedDelaySec` are copied verbatim; a network
+//! `.service` units under `/etc/systemd/system/` (spec §J.4). Every
+//! `ExecStart=` argument is quoted for systemd (R35): double quotes with `\\`
+//! and `\"` escaped, `%%` for `%` and `$$` for `$`, so a path with spaces or
+//! these characters reaches the program as one unchanged argument. No value
+//! with a control character is accepted, since a newline would end the line
+//! and start a directive of its own; `OnCalendar` and `RandomizedDelaySec`,
+//! which are copied as they are, also refuse `%`. A network
 //! destination adds `Wants=network-online.target`/`After=network-online.target`
 //! so the job does not start before the network is up.
 //!
@@ -212,9 +217,99 @@ pub fn load(path: &Path) -> Result<Config> {
     })
 }
 
+/// Refuse a value that could break out of its unit-file line (R35).
+fn unit_safe(owner: &str, field: &str, value: &str) -> Result<()> {
+    if let Some(bad) = value.chars().find(|c| c.is_control()) {
+        return Err(Error::corrupt(format!(
+            "{owner}: {field} contains the control character {bad:?}, which cannot go into \
+             a systemd unit"
+        )));
+    }
+    Ok(())
+}
+
+/// A path as unit-safe text.
+fn unit_safe_path(owner: &str, field: &str, path: &Path) -> Result<()> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| Error::corrupt(format!("{owner}: {field} is not valid UTF-8")))?;
+    unit_safe(owner, field, text)
+}
+
+/// A timer value copied into the unit as it is: no control character, and
+/// no `%`, which systemd would expand as a specifier.
+fn timer_safe(owner: &str, field: &str, value: &str) -> Result<()> {
+    unit_safe(owner, field, value)?;
+    if value.contains('%') {
+        return Err(Error::corrupt(format!(
+            "{owner}: {field} contains `%`, which systemd would expand"
+        )));
+    }
+    Ok(())
+}
+
+/// One `ExecStart=` argument, quoted for systemd; the value was checked by
+/// [`unit_safe`].
+fn quote(argument: &str) -> String {
+    let escaped = argument
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%")
+        .replace('$', "$$");
+    format!("\"{escaped}\"")
+}
+
+/// A command line of quoted arguments.
+fn command_line(arguments: &[String]) -> String {
+    arguments
+        .iter()
+        .map(|argument| quote(argument))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn validate(config: &Config) -> Result<()> {
     let mut names = std::collections::BTreeSet::new();
+    for (name, destination) in &config.destinations {
+        let owner = format!("destination {name}");
+        for (field, value) in [
+            ("kind", Some(destination.kind.as_str())),
+            ("host", destination.host.as_deref()),
+            ("user", destination.user.as_deref()),
+            ("path", destination.path.as_deref()),
+        ] {
+            unit_safe(&owner, field, value.unwrap_or_default())?;
+        }
+        for (field, path) in [
+            ("identity", &destination.identity),
+            ("known_hosts", &destination.known_hosts),
+        ] {
+            if let Some(path) = path {
+                unit_safe_path(&owner, field, path)?;
+            }
+        }
+    }
     for job in &config.jobs {
+        let owner = format!("job {}", job.name);
+        for source in &job.source {
+            unit_safe(&owner, "source", source)?;
+        }
+        for (field, value) in [
+            ("dest", Some(job.dest.as_str())),
+            ("parent", job.parent.as_deref()),
+            ("mode", job.mode.as_deref()),
+            ("snapshot", job.snapshot.as_deref()),
+            ("compress", job.compress.as_deref()),
+        ] {
+            unit_safe(&owner, field, value.unwrap_or_default())?;
+        }
+        if let Some(path) = &job.passphrase_file {
+            unit_safe_path(&owner, "passphrase_file", path)?;
+        }
+        timer_safe(&owner, "on_calendar", &job.on_calendar)?;
+        if let Some(delay) = &job.randomized_delay {
+            timer_safe(&owner, "randomized_delay", delay)?;
+        }
         lr_core::validate_job_name(&job.name).map_err(|error| Error::corrupt(error.to_string()))?;
         lr_core::validate_set_name(&job.set)
             .map_err(|error| Error::corrupt(format!("job {}: {error}", job.name)))?;
@@ -321,55 +416,76 @@ pub fn render_job(config: &Config, job: &JobConfig, cli: &Path) -> Result<JobUni
     service.push_str("\n[Service]\n");
     service.push_str("Type=oneshot\n");
     service.push_str("User=root\n");
+    let program = cli.display().to_string();
     for source in &job.source {
-        let mut command = format!(
-            "{} backup create --source {} --dest {} --set {} --type {}",
-            cli.display(),
+        let mut command: Vec<String> = [
+            program.as_str(),
+            "backup",
+            "create",
+            "--source",
             source,
-            destination,
-            job.set,
-            job.member_type
-        );
+            "--dest",
+            &destination,
+            "--set",
+            &job.set,
+            "--type",
+            &job.member_type,
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let mut option = |name: &str, value: String| {
+            command.push(name.to_owned());
+            command.push(value);
+        };
         if job.member_type != "full" {
-            command.push_str(&format!(
-                " --parent {}",
-                job.parent.clone().unwrap_or_else(|| "latest".to_owned())
-            ));
+            option(
+                "--parent",
+                job.parent.clone().unwrap_or_else(|| "latest".to_owned()),
+            );
         }
         if let Some(mode) = &job.mode {
-            command.push_str(&format!(" --mode {mode}"));
+            option("--mode", mode.clone());
         }
         if let Some(snapshot) = &job.snapshot {
-            command.push_str(&format!(" --snapshot {snapshot}"));
+            option("--snapshot", snapshot.clone());
         }
         if let Some(compress) = &job.compress {
-            command.push_str(&format!(" --compress {compress}"));
+            option("--compress", compress.clone());
         }
-        if !job.encrypt {
-            command.push_str(" --no-encrypt");
-        } else if let Some(passphrase) = &job.passphrase_file {
-            command.push_str(&format!(" --passphrase-file {}", passphrase.display()));
+        if job.encrypt
+            && let Some(passphrase) = &job.passphrase_file
+        {
+            option("--passphrase-file", passphrase.display().to_string());
         }
         if let Some(retention) = &job.retention
             && let Some(max) = retention.max_incrementals_per_chain
         {
-            command.push_str(&format!(" --max-incrementals {max}"));
+            option("--max-incrementals", max.to_string());
         }
-        command.push_str(" --json");
-        service.push_str(&format!("ExecStart={command}\n"));
+        if !job.encrypt {
+            command.push("--no-encrypt".to_owned());
+        }
+        command.push("--json".to_owned());
+        service.push_str(&format!("ExecStart={}\n", command_line(&command)));
     }
     // Retention runs right after the backup, against the same set, so
     // `keep_chains` holds without a second timer.
     if let Some(retention) = &job.retention
         && let Some(keep) = retention.keep_chains
     {
-        service.push_str(&format!(
-            "ExecStart={} retention apply --dest {} --set {} --keep-chains {}\n",
-            cli.display(),
-            destination,
-            job.set,
-            keep
-        ));
+        let command = [
+            program.as_str(),
+            "retention",
+            "apply",
+            "--dest",
+            &destination,
+            "--set",
+            &job.set,
+            "--keep-chains",
+            &keep.to_string(),
+        ]
+        .map(str::to_owned);
+        service.push_str(&format!("ExecStart={}\n", command_line(&command)));
     }
 
     let mut timer = String::new();
@@ -571,6 +687,144 @@ mod tests {
     };
     use std::path::Path;
 
+    /// Split an `ExecStart=` line the way systemd does for the quoting the
+    /// renderer uses: double-quoted words with `\\` and `\"` escapes,
+    /// `%%` for `%` (specifiers) and `$$` for `$` (variables).
+    fn systemd_words(line: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut chars = line.chars().peekable();
+        loop {
+            while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                chars.next();
+            }
+            let Some(first) = chars.next() else {
+                return words;
+            };
+            let mut word = String::new();
+            if first == '"' {
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' => break,
+                        '\\' => word.push(chars.next().expect("escaped character")),
+                        other => word.push(other),
+                    }
+                }
+            } else {
+                word.push(first);
+                while chars.peek().is_some_and(|c| !c.is_whitespace()) {
+                    word.push(chars.next().expect("peeked"));
+                }
+            }
+            words.push(word.replace("%%", "%").replace("$$", "$"));
+        }
+    }
+
+    /// Values with spaces, quotes, `%` and `$` reach the program as one
+    /// argument each, unchanged (R35).
+    #[test]
+    fn exec_start_arguments_survive_systemd_parsing() {
+        let text = r#"
+[[job]]
+name = "odd"
+source = ["/data/My Files", "/srv/100%$HOME"]
+dest = '/backups/a "quoted" dir\'
+set = "odd-set"
+type = "full"
+passphrase_file = "/etc/linuxreflect/key with space"
+on_calendar = "daily"
+[job.retention]
+keep_chains = 3
+"#;
+        let config = parse(text).expect("config");
+        let units = render_job(
+            &config,
+            &config.jobs[0],
+            Path::new("/opt/linux reflect/bin/linuxreflect"),
+        )
+        .expect("render");
+        let commands: Vec<Vec<String>> = units
+            .service
+            .lines()
+            .filter_map(|line| line.strip_prefix("ExecStart="))
+            .map(systemd_words)
+            .collect();
+        assert_eq!(commands.len(), 3, "{}", units.service);
+        let expected = |source: &'static str| {
+            vec![
+                "/opt/linux reflect/bin/linuxreflect",
+                "backup",
+                "create",
+                "--source",
+                source,
+                "--dest",
+                r#"/backups/a "quoted" dir\"#,
+                "--set",
+                "odd-set",
+                "--type",
+                "full",
+                "--passphrase-file",
+                "/etc/linuxreflect/key with space",
+                "--json",
+            ]
+        };
+        assert_eq!(commands[0], expected("/data/My Files"));
+        assert_eq!(commands[1], expected("/srv/100%$HOME"));
+        assert_eq!(
+            commands[2],
+            [
+                "/opt/linux reflect/bin/linuxreflect",
+                "retention",
+                "apply",
+                "--dest",
+                r#"/backups/a "quoted" dir\"#,
+                "--set",
+                "odd-set",
+                "--keep-chains",
+                "3",
+            ]
+        );
+    }
+
+    /// A value that could end a unit line or expand into something else
+    /// never reaches a unit file (R35).
+    #[test]
+    fn values_that_could_inject_into_a_unit_are_refused() {
+        let job = |field: &str, value: &str| {
+            let mut lines = vec![
+                ("name", "\"inject\"".to_owned()),
+                ("source", "[\"/data\"]".to_owned()),
+                ("dest", "\"/backups\"".to_owned()),
+                ("set", "\"s\"".to_owned()),
+                ("encrypt", "false".to_owned()),
+                ("on_calendar", "\"daily\"".to_owned()),
+            ];
+            let quoted = format!("{value:?}");
+            match field {
+                "source" => lines[1].1 = format!("[{quoted}]"),
+                "dest" => lines[2].1 = quoted,
+                "on_calendar" => lines[5].1 = quoted,
+                other => lines.push((other, quoted)),
+            }
+            let body: Vec<String> = lines
+                .iter()
+                .map(|(key, value)| format!("{key} = {value}"))
+                .collect();
+            format!("[[job]]\n{}\n", body.join("\n"))
+        };
+        for (field, value) in [
+            ("source", "/data\nExecStartPre=/bin/sh -c evil"),
+            ("dest", "/backups\r\n[Service]"),
+            ("on_calendar", "daily\nExecStartPre=/bin/true"),
+            ("on_calendar", "%h"),
+            ("randomized_delay", "5m\nUser=nobody"),
+            ("mode", "auto\n"),
+        ] {
+            let text = job(field, value);
+            assert!(parse(&text).is_err(), "{field} = {value:?} must be refused");
+        }
+        assert!(parse(&job("randomized_delay", "15m")).is_ok());
+    }
+
     /// The spec's §J.2 example, verbatim.
     const SPEC_EXAMPLE: &str = r#"
 [daemon]
@@ -652,15 +906,15 @@ identity = "/etc/linuxreflect/id_ed25519"
         assert!(
             units
                 .service
-                .contains("ExecStart=/usr/bin/linuxreflect backup create"),
+                .contains(r#"ExecStart="/usr/bin/linuxreflect" "backup" "create""#),
             "{}",
             units.service
         );
-        assert!(units.service.contains("--type incremental"));
-        assert!(units.service.contains("--parent latest"));
-        assert!(units.service.contains("--max-incrementals 14"));
-        assert!(units.service.contains("retention apply"));
-        assert!(units.service.contains("--keep-chains 2"));
+        assert!(units.service.contains(r#""--type" "incremental""#));
+        assert!(units.service.contains(r#""--parent" "latest""#));
+        assert!(units.service.contains(r#""--max-incrementals" "14""#));
+        assert!(units.service.contains(r#""retention" "apply""#));
+        assert!(units.service.contains(r#""--keep-chains" "2""#));
         // A network destination waits for the network.
         assert!(units.service.contains("Wants=network-online.target"));
         assert!(units.service.contains("After=network-online.target"));
