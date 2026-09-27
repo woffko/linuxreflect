@@ -16,6 +16,7 @@ pub mod inspect;
 pub mod keys;
 pub mod keystore;
 pub mod options;
+pub mod plan;
 pub mod progress;
 pub mod restore;
 pub mod retention;

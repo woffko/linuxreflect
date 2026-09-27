@@ -527,8 +527,14 @@ pub fn prepare_restore(request: &PrepareRequest) -> Result<RestorePlan> {
         let files = crate::chain::resolve_chain(&*destination, &set, &location.name)?;
         // Open and authenticate every member now: a missing or damaged
         // ancestor must fail before a token is issued.
-        let _validated =
-            crate::chain::open_chain(&*destination, &set, &files, &request.encryption)?;
+        let validated = crate::chain::open_chain(&*destination, &set, &files, &request.encryption)?;
+        // What a block restore would write, checked before any token: a
+        // malformed manifest or a recorded bad sector is refused here, not
+        // halfway through the target (R26).
+        if superblock.image_kind == ImageKind::Block {
+            let summary = crate::plan::block_chain(validated, &superblock)?;
+            crate::plan::refuse_bad_sectors(&summary)?;
+        }
         files.into_iter().map(|file| file.file_name).collect()
     };
 
@@ -858,6 +864,10 @@ pub fn apply_restore(request: &ApplyRequest) -> Result<RestoreOutcome> {
             })
         })
         .collect::<Result<_>>()?;
+    // The same plan check as `prepare`, again before the first write: the
+    // images may have changed on the destination since the token was issued.
+    let checked = crate::chain::open_chain(&*destination, &set, &files, &request.encryption)?;
+    crate::plan::refuse_bad_sectors(&crate::plan::block_chain(checked, &superblock)?)?;
     let members = crate::chain::open_chain(&*destination, &set, &files, &request.encryption)?;
     write_block_chain(members, &superblock, &token, target, &mut reporter)
         .map(RestoreOutcome::Block)

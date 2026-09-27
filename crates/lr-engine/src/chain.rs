@@ -619,6 +619,8 @@ mod tests {
         Unused,
         /// A delta manifest carries no entry for this chunk.
         Inherit,
+        /// The member records the chunk as unreadable on the source.
+        Bad,
     }
 
     /// Keys an unencrypted member derives from the public chain key.
@@ -723,6 +725,10 @@ mod tests {
                 Cell::Zero => entries.push(Some(BlockEntry::zero())),
                 Cell::Unused => entries.push(Some(BlockEntry::unused())),
                 Cell::Inherit => entries.push(None),
+                Cell::Bad => entries.push(Some(BlockEntry::bad_sector(
+                    entries.len() as u64 * u64::from(CHUNK),
+                    CHUNK,
+                ))),
             }
         }
         let delta = superblock.flags & flags::DELTA_MANIFEST != 0;
@@ -921,6 +927,43 @@ mod tests {
         assert_eq!(payloads[1], b"bbbb");
         assert_eq!(payloads[2], b"bbbb");
         assert_eq!(payloads[3], b"aaaa");
+    }
+
+    /// An image that records unreadable source chunks cannot be restored,
+    /// so `prepare` refuses it before a token exists and before the target
+    /// is touched (R26).
+    #[test]
+    fn a_recorded_bad_sector_is_refused_before_the_target_is_touched() {
+        let dir = set_dir();
+        // `<dest>/<set>/<chain>/<file>`, as `prepare` reads an image URI.
+        std::fs::create_dir(dir.path().join("chain")).expect("chain dir");
+        let image = dir.path().join("chain/000-full.lrimg");
+        write_image(
+            &image,
+            &superblock(0, 0, 0xB1, false),
+            &[
+                Cell::Stored(&[0xAA; CHUNK as usize]),
+                Cell::Stored(&[0xBB; CHUNK as usize]),
+                Cell::Zero,
+                Cell::Bad,
+            ],
+        );
+        let target_dir = tempfile::tempdir().expect("target dir");
+        let target = target_dir.path().join("target.img");
+        let sentinel = vec![0x5Au8; CHUNK as usize * 4];
+        std::fs::write(&target, &sentinel).expect("target");
+
+        let error = crate::restore::prepare_restore(&crate::restore::PrepareRequest::from_path(
+            &image,
+            &target,
+            crate::keys::Encryption::NoEncrypt,
+        ))
+        .expect_err("a recorded bad sector cannot be restored");
+        assert!(error.to_string().contains("could not read"), "{error}");
+        assert!(
+            std::fs::read(&target).expect("target") == sentinel,
+            "the target was written"
+        );
     }
 
     #[test]

@@ -469,28 +469,33 @@ fn dm_flakey_bad_sectors_are_recorded_and_a_restore_refuses_them() {
     })
     .expect("a recorded bad sector is not corruption");
     assert!(verified.chunks > 0);
+    // ...but it does not call the image fully restorable (R26).
+    assert_eq!(verified.recorded_bad_chunks, report.bad_chunks);
+    assert!(
+        verified
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("cannot be restored completely")),
+        "{:?}",
+        verified.warnings
+    );
 
-    // A restore refuses to invent the missing data.
+    // A restore refuses to invent the missing data, before the target is
+    // touched (R26).
     let Some(target) = LoopDevice::attach(dir.path(), "target.img", SIZE) else {
         return;
     };
-    let plan = prepare_restore(&PrepareRequest::from_path(
+    let before = std::fs::read(dir.path().join("target.img")).expect("target");
+    let error = prepare_restore(&PrepareRequest::from_path(
         &report.image_path,
         target.path(),
         Encryption::NoEncrypt,
     ))
-    .expect("prepare");
-    let error = apply_restore(&ApplyRequest {
-        token: plan.token,
-        confirm: true,
-        accept_inconsistent: false,
-        encryption: Encryption::NoEncrypt,
-        context: lr_engine::progress::EngineContext::silent(),
-    })
     .expect_err("a recorded bad sector cannot be restored");
+    assert!(error.to_string().contains("could not read"), "{error}");
     assert!(
-        matches!(error, lr_core::Error::BadSector { .. }),
-        "expected BadSector, got {error}"
+        std::fs::read(dir.path().join("target.img")).expect("target") == before,
+        "the target was written"
     );
     let _ = run("dmsetup", &["remove", &flakey.replace("/dev/mapper/", "")]);
 }

@@ -59,6 +59,10 @@ pub struct VerifyReport {
     /// Findings that do not fail verification but need the user's attention.
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// Chunks the source could not read when the image was taken; a
+    /// non-zero count means the image cannot be restored completely (R26).
+    #[serde(default)]
+    pub recorded_bad_chunks: u64,
 }
 
 impl VerifyReport {
@@ -128,6 +132,7 @@ pub fn verify_image(request: &VerifyRequest) -> Result<VerifyReport> {
         chunks: 0,
         bytes_checked: 0,
         warnings: Vec::new(),
+        recorded_bad_chunks: 0,
     };
 
     // 1. Structure, MACs and page tags, member by member.
@@ -214,8 +219,15 @@ fn verify_block_chain(
 ) -> Result<()> {
     let opened = crate::chain::open_chain(destination, set, members, encryption)?;
     let mut walk = crate::chain::ChainWalk::new(opened)?;
+    let mut bad = 0u64;
+    let mut first_bad = None;
+    let chunk_size = u64::from(walk.chunk_size());
     walk.walk(|index, state, access| {
         reporter.report(index)?;
+        if state == ChunkState::BadSector {
+            bad += 1;
+            first_bad.get_or_insert(index * chunk_size);
+        }
         let ChunkState::Stored {
             member,
             offset,
@@ -237,7 +249,16 @@ fn verify_block_chain(
         report.chunks += 1;
         report.bytes_checked += plaintext.len() as u64;
         Ok(())
-    })
+    })?;
+    // Recorded bad sectors are not corruption, but the image cannot be
+    // restored completely, and `prepare` refuses it (R26).
+    report.recorded_bad_chunks += bad;
+    if bad > 0 {
+        report
+            .warnings
+            .push(crate::plan::bad_sector_message(bad, first_bad));
+    }
+    Ok(())
 }
 
 /// Re-hash every chunk of every subvolume section of a stream image.
