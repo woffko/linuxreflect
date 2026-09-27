@@ -18,10 +18,11 @@ fn main() -> anyhow::Result<()> {
     match args.next().as_deref() {
         Some("ci") => ci(),
         Some("root") => root(),
+        Some("scale") => scale(),
         Some("fixture") => fixture(args.next()),
         Some("help") | None => {
             println!(
-                "xtask commands:\n  ci               run fmt/clippy/test/deny as CI does\n  root             run every root acceptance test binary (LR_ROOT_RUNNER prefixes the command, e.g. `wsl.exe -u root --`)\n  fixture <path>   build the S2 GPT fixture image\n  help             show this message"
+                "xtask commands:\n  ci               run fmt/clippy/test/deny as CI does\n  root             run every root acceptance test binary (LR_ROOT_RUNNER prefixes the command, e.g. `wsl.exe -u root --`)\n  scale            run the scale profiles in release mode and hold them to their memory budgets (docs/performance.md)\n  fixture <path>   build the S2 GPT fixture image\n  help             show this message"
             );
             Ok(())
         }
@@ -259,6 +260,37 @@ fn root() -> anyhow::Result<()> {
     }
     if !failed.is_empty() || unavailable > 0 || !leaks.is_empty() {
         anyhow::bail!("the root run is not clean");
+    }
+    Ok(())
+}
+
+/// Run the scale profiles (`crates/lr-cli/tests/scale.rs`) in release mode.
+/// Each holds the CLI's peak memory on a large input to a budget from
+/// `docs/performance.md`; they need no root, but minutes and gigabytes of
+/// scratch space (`LR_SCALE_DIR` chooses where).
+fn scale() -> anyhow::Result<()> {
+    let log = unavailable_log("scale")?;
+    let mut tally = Tally::default();
+    let mut command = Command::new("cargo");
+    command
+        .args([
+            "test",
+            "--release",
+            "-p",
+            "lr-cli",
+            "--test",
+            "scale",
+            "--",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("LR_SCALE_TESTS", "1")
+        .env("LR_UNAVAILABLE_LOG", &log);
+    let passed = run_counted(command, &mut tally)?;
+    let unavailable = tally.report(&log);
+    if !passed || unavailable > 0 {
+        anyhow::bail!("the scale run is not clean");
     }
     Ok(())
 }

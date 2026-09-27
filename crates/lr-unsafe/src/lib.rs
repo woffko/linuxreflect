@@ -322,6 +322,33 @@ pub fn open_readonly_nofollow(path: &std::path::Path) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+/// Wait for the child `pid` and return its raw wait status and its peak
+/// resident set in KiB (`ru_maxrss` from `wait4(2)`), exactly, however
+/// briefly it ran. The child must not have been reaped yet.
+///
+/// # Errors
+/// Propagates `wait4(2)` failures.
+pub fn wait_with_peak_rss(pid: u32) -> io::Result<(i32, u64)> {
+    let pid = libc::pid_t::try_from(pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pid out of range"))?;
+    let mut status: libc::c_int = 0;
+    // SAFETY: `rusage` is plain old data, so all-zero bytes are a valid value.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    loop {
+        // SAFETY: `status` and `usage` are valid, writable and live for the
+        // call; `wait4` writes only into them.
+        let waited = unsafe { libc::wait4(pid, &raw mut status, 0, &raw mut usage) };
+        if waited == pid {
+            break;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    Ok((status, u64::try_from(usage.ru_maxrss).unwrap_or(0)))
+}
+
 /// `st_mode` of an open descriptor.
 ///
 /// # Errors

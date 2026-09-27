@@ -3265,6 +3265,7 @@ dependencies = [
  "lr-snapshot",
  "lr-store",
  "lr-testkit",
+ "lr-unsafe",
  "serde",
  "serde_json",
  "tempfile",
