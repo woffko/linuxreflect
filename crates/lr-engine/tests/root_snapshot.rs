@@ -485,7 +485,11 @@ fn mounted_ext4(work: &Path, name: &str) -> Option<(PathBuf, tempfile::TempDir, 
     if !run("mkfs.ext4", &["-F", "-q", &loop_disk.label()]) {
         lr_testkit::fixture_failed!("mkfs.ext4 failed");
     }
-    let mountpoint = tempfile::tempdir_in(work).expect("mountpoint dir");
+    // The name prefixes the mountpoint, so a test can make it awkward.
+    let mountpoint = tempfile::Builder::new()
+        .prefix(name)
+        .tempdir_in(work)
+        .expect("mountpoint dir");
     if !run(
         "mount",
         &[&loop_disk.label(), &mountpoint.path().display().to_string()],
@@ -493,7 +497,6 @@ fn mounted_ext4(work: &Path, name: &str) -> Option<(PathBuf, tempfile::TempDir, 
         lr_testkit::fixture_failed!("mount failed");
     }
     let path = mountpoint.path().to_path_buf();
-    let _ = name;
     Some((path, mountpoint, loop_disk))
 }
 
@@ -566,7 +569,8 @@ fn kill_9_is_recovered_by_the_deadman() {
         return;
     }
     let work = tempfile::tempdir().expect("workdir");
-    let Some((mountpoint, _guard, loop_disk)) = mounted_ext4(work.path(), "dmn") else {
+    // An apostrophe and a space broke both deadman layers before (R28).
+    let Some((mountpoint, _guard, loop_disk)) = mounted_ext4(work.path(), "John's disk ") else {
         return;
     };
     let ready = work.path().join("freeze-child.ready");
@@ -603,10 +607,11 @@ fn kill_9_is_recovered_by_the_deadman() {
     let mut thawed = false;
     while Instant::now() < deadline {
         if run(
-            "sh",
+            "timeout",
             &[
-                "-c",
-                &format!("touch {}/after-deadman", mountpoint.display()),
+                "5",
+                "touch",
+                &mountpoint.join("after-deadman").display().to_string(),
             ],
         ) {
             thawed = true;

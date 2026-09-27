@@ -23,6 +23,9 @@ use std::time::{Duration, Instant};
 use lr_core::{Consistency, Error, Result, SnapshotOpts, SourceLayout, Support};
 
 use crate::probe::is_running_root;
+
+/// `O_NOFOLLOW`: fail instead of opening a symlink.
+const O_NOFOLLOW: i32 = 0o400_000;
 use crate::{BlockSnapshot, BlockSnapshotProvider, SnapshotHealth};
 
 /// Provider identifier.
@@ -239,6 +242,78 @@ fn writable(dir: &Path) -> bool {
     }
 }
 
+/// The deadman helper script (R28). `$1` is the marker, `$2` an optional
+/// delay. The mountpoint is read from the marker, so no path is ever
+/// interpolated into shell text, and a failed thaw is retried while the
+/// marker exists; the job removes the marker only after its own thaw.
+fn thaw_helper(path: &str) -> String {
+    format!(
+        "#!/bin/sh\n\
+         # LinuxReflect freeze deadman: thaw the filesystem the marker names\n\
+         # unless the job removed the marker after thawing it itself.\n\
+         PATH='{path}'\n\
+         marker=$1\n\
+         [ -n \"$2\" ] && sleep \"$2\"\n\
+         tries=0\n\
+         while [ -f \"$marker\" ] && [ \"$tries\" -lt 30 ]; do\n\
+         \x20   mountpoint=$(cat \"$marker\")\n\
+         \x20   if fsfreeze -u \"$mountpoint\"; then\n\
+         \x20       rm -f \"$marker\" \"$0\"\n\
+         \x20       exit 0\n\
+         \x20   fi\n\
+         \x20   tries=$((tries + 1))\n\
+         \x20   sleep 1\n\
+         done\n"
+    )
+}
+
+/// `PATH` for the helper: where `fsfreeze` lives.
+const HELPER_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Create `path` exclusively with `mode` and `contents`; a name planted
+/// beforehand, including a symlink, is refused.
+fn create_private(path: &Path, mode: u32, contents: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| {
+            Error::Io(std::io::Error::new(
+                error.kind(),
+                format!("{}: {error}", path.display()),
+            ))
+        })?;
+    file.write_all(contents).map_err(Error::Io)
+}
+
+/// Write the marker (holding the mountpoint) and the helper next to it, and
+/// return the helper's path.
+fn write_deadman_files(mountpoint: &Path, marker: &Path, path: &str) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    if path.contains('\'') {
+        return Err(Error::unsupported(
+            "the helper PATH may not contain a quote",
+        ));
+    }
+    let mut contents = mountpoint.as_os_str().as_bytes().to_vec();
+    contents.push(b'\n');
+    create_private(marker, 0o600, &contents)?;
+    let helper = helper_path(marker);
+    if let Err(error) = create_private(&helper, 0o700, thaw_helper(path).as_bytes()) {
+        remove_marker(marker);
+        return Err(error);
+    }
+    Ok(helper)
+}
+
+fn helper_path(marker: &Path) -> PathBuf {
+    marker.with_extension("thaw")
+}
+
 fn arm_deadman(
     job: &str,
     mountpoint: &Path,
@@ -246,15 +321,12 @@ fn arm_deadman(
     after: Duration,
     log: &FreezeLog,
 ) -> Result<()> {
-    std::fs::write(marker, format!("{}\n", mountpoint.display())).map_err(Error::Io)?;
+    let helper = write_deadman_files(mountpoint, marker, HELPER_PATH)?;
     let seconds = after.as_secs().max(1);
-    let guard = format!(
-        "if [ -f '{marker}' ]; then fsfreeze -u '{mp}'; rm -f '{marker}'; fi",
-        marker = marker.display(),
-        mp = mountpoint.display()
-    );
 
-    // Layer 1: a transient systemd timer, when systemd is available.
+    // Layer 1: a transient systemd timer, when systemd is available. Its
+    // command holds two paths of safe characters and nothing systemd could
+    // expand (`$`, `%`).
     let unit = format!("lr-thaw-{job}");
     if which("systemd-run") {
         let status = Command::new("systemd-run")
@@ -262,8 +334,8 @@ fn arm_deadman(
             .arg(format!("--unit={unit}"))
             .arg("--collect")
             .arg("/bin/sh")
-            .arg("-c")
-            .arg(&guard)
+            .arg(&helper)
+            .arg(marker)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -281,10 +353,10 @@ fn arm_deadman(
     }
 
     // Layer 2: a detached helper that survives this process being killed.
-    let fallback = format!("sleep {seconds}; {guard}");
     Command::new("/bin/sh")
-        .arg("-c")
-        .arg(&fallback)
+        .arg(&helper)
+        .arg(marker)
+        .arg(seconds.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -302,8 +374,10 @@ fn which(program: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Stop the deadman helpers from thawing: remove the marker and the helper.
 fn remove_marker(marker: &Path) {
     let _ = std::fs::remove_file(marker);
+    let _ = std::fs::remove_file(helper_path(marker));
 }
 
 fn disarm_deadman(job: &str) {
@@ -338,20 +412,29 @@ impl Drop for FreezeGuard {
         if self.thawed {
             return;
         }
-        // Removing the marker first stops the deadman from thawing twice.
-        remove_marker(&self.marker);
-        if let Some(dir) = self.dir.take() {
-            match lr_unsafe::thaw_fs(&dir) {
-                Ok(()) => self
-                    .log
-                    .record(&format!("thawed {}", self.mountpoint.display())),
-                Err(error) => self.log.record(&format!(
-                    "FITHAW on {} failed: {error}",
-                    self.mountpoint.display()
-                )),
-            }
+        // The deadman stays armed until a thaw succeeds (R28): the marker is
+        // removed and the timer disarmed only after this thaw worked.
+        let thawed = self
+            .dir
+            .take()
+            .is_none_or(|dir| match lr_unsafe::thaw_fs(&dir) {
+                Ok(()) => {
+                    self.log
+                        .record(&format!("thawed {}", self.mountpoint.display()));
+                    true
+                }
+                Err(error) => {
+                    self.log.record(&format!(
+                        "FITHAW on {} failed: {error}; the deadman will retry",
+                        self.mountpoint.display()
+                    ));
+                    false
+                }
+            });
+        if thawed {
+            remove_marker(&self.marker);
+            disarm_deadman(&self.job);
         }
-        disarm_deadman(&self.job);
         self.log.flush();
         self.thawed = true;
     }
@@ -400,6 +483,73 @@ impl SnapshotHealth for FreezeHealth {
 
 #[cfg(test)]
 mod tests {
+    /// The deadman helper hands an awkward mountpoint to `fsfreeze -u`
+    /// verbatim and removes the marker; the quoted shell text used before
+    /// broke on the same path (R28).
+    #[test]
+    fn the_thaw_helper_passes_awkward_mountpoints_verbatim() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).expect("bin");
+        let fake = bin.join("fsfreeze");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/called\"\n",
+        )
+        .expect("fake fsfreeze");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let path = format!("{}:/usr/bin:/bin", bin.display());
+        let mountpoint = std::path::PathBuf::from("/mnt/John's disk $HOME `id`");
+        let marker = dir.path().join("lr-job.freeze");
+
+        let helper = super::write_deadman_files(&mountpoint, &marker, &path).expect("files");
+        let status = std::process::Command::new("/bin/sh")
+            .arg(&helper)
+            .arg(&marker)
+            .status()
+            .expect("helper");
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(bin.join("called")).expect("fsfreeze was called"),
+            format!("-u\n{}\n", mountpoint.display())
+        );
+        assert!(!marker.exists(), "a successful thaw removes the marker");
+
+        // Control: the interpolated guard of the previous version.
+        std::fs::remove_file(bin.join("called")).expect("reset");
+        std::fs::write(&marker, format!("{}\n", mountpoint.display())).expect("marker");
+        let old = format!(
+            "if [ -f '{m}' ]; then fsfreeze -u '{mp}'; rm -f '{m}'; fi",
+            m = marker.display(),
+            mp = mountpoint.display()
+        );
+        let _ = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&old)
+            .env("PATH", &path)
+            .status();
+        let called = std::fs::read_to_string(bin.join("called")).unwrap_or_default();
+        assert_ne!(
+            called,
+            format!("-u\n{}\n", mountpoint.display()),
+            "the old guard unexpectedly handled the path"
+        );
+    }
+
+    /// A marker or helper name planted beforehand, such as a symlink, is
+    /// refused instead of written through.
+    #[test]
+    fn deadman_files_are_created_exclusively() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"keep").expect("victim");
+        let marker = dir.path().join("lr-job.freeze");
+        std::os::unix::fs::symlink(&victim, &marker).expect("plant");
+        assert!(super::write_deadman_files(std::path::Path::new("/mnt"), &marker, "/bin").is_err());
+        assert_eq!(std::fs::read(&victim).expect("victim"), b"keep");
+    }
+
     use super::{DEFAULT_GRACE_SECS, FreezeProvider, marker_path};
     use crate::BlockSnapshotProvider;
     use crate::test_layout::offline;
