@@ -474,3 +474,4 @@ P3 = cleanup.
 | A11 | P2 | Restore tokens are reusable and not bound to the caller | 3 | ☐ |
 | A12 | P3 | NBD socket chmod after bind, failure ignored | 2.6 | ☑ |
 | A13 | P1 | `--parent latest` picks an arbitrary chain when two chains start in the same second (found while fixing R04, D-116) | 1.5 | ☑ |
+| A14 | P2 | Disks with 4096-byte logical blocks are misread: the GPT is looked for at byte 512, MBR and sysfs offsets count 512-byte units, and a whole-disk image of such a disk is refused (found in the beta.1 acceptance) | 3 | ☑ |

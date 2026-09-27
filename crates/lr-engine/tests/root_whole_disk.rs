@@ -89,6 +89,11 @@ struct LoopDisk {
 
 impl LoopDisk {
     fn attach(dir: &Path, name: &str, size: u64) -> Option<Self> {
+        Self::attach_with_blocks(dir, name, size, 512)
+    }
+
+    /// Attach with `block_size`-byte logical blocks (4096 for a 4Kn disk).
+    fn attach_with_blocks(dir: &Path, name: &str, size: u64, block_size: u32) -> Option<Self> {
         let backing = dir.join(name);
         sparse(&backing, size);
         let free = Command::new("losetup")
@@ -103,6 +108,8 @@ impl LoopDisk {
             "losetup",
             &[
                 "-P",
+                "-b",
+                &block_size.to_string(),
                 &device.display().to_string(),
                 &backing.display().to_string(),
             ],
@@ -680,6 +687,191 @@ fn an_mbr_disk_round_trips_and_boots() {
     dst.seek(SeekFrom::Start(0)).expect("seek");
     dst.read_exact(&mut after).expect("read");
     assert_eq!(before, after, "the MBR boot code must be identical");
+}
+
+/// `sgdisk -p` partition rows: number, start and end (in the disk's own
+/// logical blocks) and type code.
+fn gpt_rows(device: &Path) -> Vec<String> {
+    output("sgdisk", &["-p", &device.display().to_string()])
+        .lines()
+        .filter(|line| {
+            line.split_whitespace()
+                .next()
+                .is_some_and(|first| first.parse::<u32>().is_ok())
+        })
+        .map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            format!("{} {} {} {}", fields[0], fields[1], fields[2], fields[5])
+        })
+        .collect()
+}
+
+fn wait_for_partitions(disk: &LoopDisk, count: u32) {
+    let label = disk.label();
+    let _ = run("blockdev", &["--rereadpt", &label]);
+    let _ = run("partx", &["-u", &label]);
+    let _ = run("partx", &["-a", &label]);
+    for _ in 0..50 {
+        if (1..=count).all(|index| disk.partition(index).exists()) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A 4Kn disk (4096-byte logical blocks): its GPT sits at LBA 1 of 4 KiB.
+/// Both partitions are imaged and restored to the same blocks of a larger
+/// 4Kn disk, and a disk with 512-byte blocks is refused, because the table
+/// would place every partition elsewhere (A14).
+#[test]
+#[ignore = "requires root and loop devices"]
+fn a_4kn_disk_round_trips_and_needs_a_4kn_target() {
+    if !root_tests_enabled() {
+        return;
+    }
+    for tool in ["sgdisk", "mkfs.ext4", "e2fsck", "debugfs", "partx"] {
+        if !have(tool) {
+            lr_testkit::unavailable!("{tool} missing");
+        }
+    }
+    let work = tempfile::tempdir().expect("workdir");
+    let Some(source) = LoopDisk::attach_with_blocks(work.path(), "4kn-src.img", SRC_SIZE, 4096)
+    else {
+        return;
+    };
+    let label = source.label();
+    if !run(
+        "sgdisk",
+        &[
+            "--clear",
+            "-n",
+            "1:0:+64M",
+            "-t",
+            "1:8300",
+            "-n",
+            "2:0:+128M",
+            "-t",
+            "2:8300",
+            &label,
+        ],
+    ) {
+        lr_testkit::fixture_failed!("sgdisk failed on the 4Kn disk");
+    }
+    wait_for_partitions(&source, 2);
+    for index in 1..=2 {
+        if !run(
+            "mkfs.ext4",
+            &["-F", "-q", &source.partition(index).display().to_string()],
+        ) {
+            lr_testkit::fixture_failed!("mkfs.ext4 failed on partition {index}");
+        }
+    }
+    let payload: Vec<u8> = (0..3 * 1024 * 1024u32)
+        .map(|index| (index.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let local = work.path().join("payload.bin");
+    std::fs::write(&local, &payload).expect("payload");
+    if !run(
+        "debugfs",
+        &[
+            "-w",
+            "-R",
+            &format!("write {} payload.bin", local.display()),
+            &source.partition(2).display().to_string(),
+        ],
+    ) {
+        lr_testkit::fixture_failed!("debugfs could not write the payload");
+    }
+    let source_rows = gpt_rows(&source.device);
+    assert_eq!(source_rows.len(), 2, "fixture: {source_rows:?}");
+
+    let outcome = work.path().join("4kn-out");
+    let mut request =
+        BackupRequest::new(&source.device, &outcome, "4kn-set", Encryption::NoEncrypt)
+            .expect("request");
+    request.chunk_size = CHUNK_SIZE;
+    request.compression = Compression::None;
+    let report = backup_image(&request).expect("whole-disk backup of a 4Kn disk");
+    let disk = whole_disk_report(&report);
+    assert_eq!(disk.pt_type, "gpt", "the 4Kn GPT must be found");
+    let partitions: Vec<&lr_engine::whole_disk::RegionReport> = disk
+        .regions
+        .iter()
+        .filter(|region| region.index > 0)
+        .collect();
+    assert_eq!(partitions.len(), 2, "{:?}", disk.regions);
+    for region in &partitions {
+        assert_eq!(region.fs_type, "ext4", "{region:?}");
+        assert!(
+            region.start_lba * 4096 + region.size_bytes <= SRC_SIZE,
+            "a region past the end of the disk: {region:?}"
+        );
+    }
+
+    // A disk with 512-byte blocks is refused before anything is written.
+    let Some(small_blocks) =
+        LoopDisk::attach_with_blocks(work.path(), "512-dst.img", DST_SIZE, 512)
+    else {
+        return;
+    };
+    let refused = prepare_restore(&PrepareRequest::from_path(
+        &disk.image_path,
+        &small_blocks.device,
+        Encryption::NoEncrypt,
+    ))
+    .expect_err("a 512-byte-block target must be refused");
+    assert!(
+        format!("{refused}").contains("4096-byte blocks"),
+        "{refused}"
+    );
+
+    let Some(target) = LoopDisk::attach_with_blocks(work.path(), "4kn-dst.img", DST_SIZE, 4096)
+    else {
+        return;
+    };
+    let plan = prepare_restore(&PrepareRequest::from_path(
+        &disk.image_path,
+        &target.device,
+        Encryption::NoEncrypt,
+    ))
+    .expect("prepare onto a 4Kn disk");
+    apply_restore(&ApplyRequest {
+        token: plan.token,
+        confirm: true,
+        accept_inconsistent: false,
+        encryption: Encryption::NoEncrypt,
+        context: lr_engine::progress::EngineContext::silent(),
+    })
+    .expect("apply onto a 4Kn disk");
+    wait_for_partitions(&target, 2);
+
+    assert_eq!(
+        gpt_rows(&target.device),
+        source_rows,
+        "the partitions moved on the 4Kn target"
+    );
+    let verify = output("sgdisk", &["-v", &target.label()]);
+    assert!(verify.contains("No problems found"), "sgdisk -v: {verify}");
+    for index in 1..=2 {
+        let partition = target.partition(index).display().to_string();
+        assert!(
+            run("e2fsck", &["-fn", &partition]),
+            "e2fsck reports errors on restored partition {index}"
+        );
+    }
+    let restored = work.path().join("restored.bin");
+    assert!(run(
+        "debugfs",
+        &[
+            "-R",
+            &format!("dump payload.bin {}", restored.display()),
+            &target.partition(2).display().to_string(),
+        ],
+    ));
+    assert!(
+        std::fs::read(&restored).expect("restored payload") == payload,
+        "the file on the restored 4Kn partition differs"
+    );
 }
 
 #[test]

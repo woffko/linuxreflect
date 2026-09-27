@@ -717,7 +717,7 @@ pub(crate) fn restore_whole_disk<R: std::io::Read + std::io::Seek>(
     // fresh backup LBA and rewrites both headers with valid CRCs.
     if disk_header.pt_type == PtType::Gpt {
         target.sync()?;
-        regenerate_gpt(&target, &token.target_path)?;
+        regenerate_gpt(&target, &token.target_path, superblock.logical_block_size)?;
     }
 
     target.sync()?;
@@ -734,9 +734,18 @@ pub(crate) fn restore_whole_disk<R: std::io::Read + std::io::Seek>(
 }
 
 /// Rewrite the primary and backup GPT for the current target size, through
-/// the claimed target (`path` only names it in messages).
-fn regenerate_gpt(target: &DirectBlockTarget, path: &Path) -> Result<()> {
+/// the claimed target (`path` only names it in messages). The table's LBAs
+/// are in the image's logical blocks, which `prepare` matched to the target's
+/// (A14).
+fn regenerate_gpt(target: &DirectBlockTarget, path: &Path, logical_block_size: u32) -> Result<()> {
+    let block =
+        gpt::disk::LogicalBlockSize::try_from(u64::from(logical_block_size)).map_err(|_| {
+            Error::corrupt(format!(
+                "the image's logical block size {logical_block_size} cannot hold a GPT"
+            ))
+        })?;
     let config = gpt::GptConfig::new()
+        .logical_block_size(block)
         .writable(true)
         .only_valid_headers(false)
         .change_partition_count(true);

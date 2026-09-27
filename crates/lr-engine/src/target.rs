@@ -101,6 +101,22 @@ pub fn check_kinds(
                 target.display()
             )));
         }
+        // The partition table counts in the source disk's logical blocks; on
+        // a disk with another block size every partition would move (A14).
+        // An image file has no block size of its own.
+        let target_lbs = layout.device_facts.logical_block_size;
+        if layout.device_facts.dev_type != lr_core::BlockDeviceType::RegularFile
+            && target_lbs != superblock.logical_block_size
+        {
+            return Err(Error::unsupported(format!(
+                "{} uses {target_lbs}-byte logical blocks, but this whole-disk image comes \
+                 from a disk with {}-byte blocks, and its partition table cannot describe \
+                 the target; restore it to a disk with {}-byte blocks or to an image file",
+                target.display(),
+                superblock.logical_block_size,
+                superblock.logical_block_size
+            )));
+        }
         return Ok(Vec::new());
     }
     if !layout.is_whole_disk() {

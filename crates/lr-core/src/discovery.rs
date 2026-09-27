@@ -288,20 +288,12 @@ pub fn discover_source(device: &Path) -> crate::Result<SourceLayout> {
         sysfs_partitions.clear();
     }
 
-    let table = probe_partition_table(device, logical_block_size, &mut warnings)?;
-    let mut partitions = Vec::new();
-    if let Some(info) = &table {
-        partitions = match info.kind {
-            PartitionTableKind::Gpt => gpt_partitions(
-                device,
-                logical_block_size,
-                &mut warnings,
-                &mut sysfs_partitions,
-            ),
-            PartitionTableKind::Mbr => mbr_partitions(device, 512, &sysfs_partitions),
-            PartitionTableKind::None => Vec::new(),
-        };
-    }
+    let (table, mut partitions) = read_table(
+        device,
+        logical_block_size,
+        &mut warnings,
+        &mut sysfs_partitions,
+    )?;
     // Sysfs may know partitions the table parse missed (for example when the
     // table could not be read). Keep them in index order.
     for (index, sys) in &sysfs_partitions {
@@ -310,7 +302,7 @@ pub fn discover_source(device: &Path) -> crate::Result<SourceLayout> {
                 index: *index,
                 name: Some(sys.name.clone()),
                 path: Some(sys.path.clone()),
-                start_lba: sys.start_lba,
+                start_lba: sysfs_start_in_blocks(sys.start_lba, logical_block_size),
                 size_bytes: sys.size_bytes,
                 type_guid: None,
                 type_name: None,
@@ -535,6 +527,45 @@ fn classify_block_device(name: &str, class_dir: &Path) -> BlockDeviceType {
     }
 }
 
+/// The partition table and its partitions. Table LBAs, the GPT header's
+/// location and MBR entry sizes are all in the device's logical blocks, which
+/// are 4096 bytes on a 4Kn disk (A14).
+fn read_table(
+    device: &Path,
+    logical_block_size: u32,
+    warnings: &mut Vec<String>,
+    sysfs_partitions: &mut BTreeMap<u32, SysfsPartition>,
+) -> crate::Result<(Option<PartitionTableInfo>, Vec<PartitionLayout>)> {
+    let table = probe_partition_table(device, logical_block_size, warnings)?;
+    let partitions = match table.as_ref().map(|info| info.kind) {
+        Some(PartitionTableKind::Gpt) => {
+            gpt_partitions(device, logical_block_size, warnings, sysfs_partitions)
+        }
+        Some(PartitionTableKind::Mbr) => mbr_partitions(
+            device,
+            u32::try_from(block_bytes(logical_block_size)).unwrap_or(512),
+            sysfs_partitions,
+        ),
+        Some(PartitionTableKind::None) | None => Vec::new(),
+    };
+    Ok((table, partitions))
+}
+
+/// A sysfs `start` (always 512-byte units) in the device's logical blocks,
+/// which is what every other `start_lba` counts in (A14).
+fn sysfs_start_in_blocks(start_512: u64, logical_block_size: u32) -> u64 {
+    start_512 * 512 / block_bytes(logical_block_size)
+}
+
+/// The logical block size in bytes, 512 when it is unknown.
+fn block_bytes(logical_block_size: u32) -> u64 {
+    u64::from(if logical_block_size == 0 {
+        512
+    } else {
+        logical_block_size
+    })
+}
+
 fn probe_partition_table(
     device: &Path,
     logical_block_size: u32,
@@ -553,9 +584,12 @@ fn probe_partition_table(
     }
     let has_mbr_signature = mbr_sector[510] == 0x55 && mbr_sector[511] == 0xAA;
 
+    // The GPT header is LBA 1, one logical block in.
     let mut gpt_header = [0u8; 92];
-    let gpt_read_ok =
-        file.seek(SeekFrom::Start(512)).is_ok() && file.read_exact(&mut gpt_header).is_ok();
+    let gpt_read_ok = file
+        .seek(SeekFrom::Start(block_bytes(logical_block_size)))
+        .is_ok()
+        && file.read_exact(&mut gpt_header).is_ok();
     if gpt_read_ok && &gpt_header[0..8] == b"EFI PART" {
         let config = gpt::GptConfig::new()
             .writable(false)
@@ -596,12 +630,8 @@ fn probe_partition_table(
 }
 
 fn disk_block_size(logical_block_size: u32) -> gpt::disk::LogicalBlockSize {
-    let bytes = u64::from(if logical_block_size == 0 {
-        512
-    } else {
-        logical_block_size
-    });
-    gpt::disk::LogicalBlockSize::try_from(bytes).unwrap_or(gpt::disk::LogicalBlockSize::Lb512)
+    gpt::disk::LogicalBlockSize::try_from(block_bytes(logical_block_size))
+        .unwrap_or(gpt::disk::LogicalBlockSize::Lb512)
 }
 
 fn gpt_partitions(
@@ -610,11 +640,7 @@ fn gpt_partitions(
     warnings: &mut Vec<String>,
     sysfs_partitions: &mut BTreeMap<u32, SysfsPartition>,
 ) -> Vec<PartitionLayout> {
-    let lbs = u64::from(if logical_block_size == 0 {
-        512
-    } else {
-        logical_block_size
-    });
+    let lbs = block_bytes(logical_block_size);
     let config = gpt::GptConfig::new()
         .writable(false)
         .logical_block_size(disk_block_size(logical_block_size))
@@ -912,7 +938,88 @@ pub fn parse_btrfs_subvolume_line(line: &str) -> Option<BtrfsSubvolume> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PartitionTableKind, parse_btrfs_subvolume_line};
+    use std::collections::BTreeMap;
+    use std::io::{Seek, SeekFrom, Write};
+
+    use super::{
+        PartitionTableKind, parse_btrfs_subvolume_line, read_table, sysfs_start_in_blocks,
+    };
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// A 64 MiB image with a protective MBR (spanning the maximum, as on a
+    /// real disk) and a GPT in `lbs`-byte blocks with two partitions.
+    fn gpt_image(lbs: u32) -> tempfile::NamedTempFile {
+        let image = tempfile::NamedTempFile::new().expect("image");
+        image.as_file().set_len(64 * MIB).expect("size");
+        let mut file = image.reopen().expect("reopen");
+        gpt::mbr::ProtectiveMBR::with_lb_size(u32::MAX)
+            .overwrite_lba0(&mut file)
+            .expect("protective MBR");
+        let block = gpt::disk::LogicalBlockSize::try_from(u64::from(lbs)).expect("lbs");
+        let mut disk = gpt::GptConfig::new()
+            .writable(true)
+            .logical_block_size(block)
+            .create_from_device(file, None)
+            .expect("create GPT");
+        disk.update_partitions(std::collections::BTreeMap::new())
+            .expect("empty table");
+        disk.add_partition("one", 16 * MIB, gpt::partition_types::LINUX_FS, 0, None)
+            .expect("one");
+        disk.add_partition("two", 24 * MIB, gpt::partition_types::LINUX_FS, 0, None)
+            .expect("two");
+        disk.write().expect("write GPT");
+        image
+    }
+
+    #[test]
+    fn a_gpt_is_found_at_the_devices_block_size() {
+        for lbs in [512u32, 4096] {
+            let image = gpt_image(lbs);
+            let mut warnings = Vec::new();
+            let (table, partitions) =
+                read_table(image.path(), lbs, &mut warnings, &mut BTreeMap::new())
+                    .expect("read table");
+            let table = table.expect("a table");
+            assert_eq!(table.kind, PartitionTableKind::Gpt, "{lbs}: {warnings:?}");
+            let sizes: Vec<u64> = partitions.iter().map(|p| p.size_bytes).collect();
+            assert_eq!(sizes, [16 * MIB, 24 * MIB], "{lbs}: {partitions:?}");
+        }
+    }
+
+    #[test]
+    fn sysfs_starts_are_converted_to_logical_blocks() {
+        assert_eq!(sysfs_start_in_blocks(2048, 512), 2048);
+        assert_eq!(sysfs_start_in_blocks(2048, 4096), 256);
+        assert_eq!(sysfs_start_in_blocks(2048, 0), 2048, "unknown means 512");
+    }
+
+    #[test]
+    fn mbr_entries_are_in_the_devices_blocks() {
+        let image = tempfile::NamedTempFile::new().expect("image");
+        image.as_file().set_len(64 * MIB).expect("size");
+        let mut file = image.reopen().expect("reopen");
+        let mut mbr = mbrman::MBR::new_from(&mut file, 4096, [1, 2, 3, 4]).expect("mbr");
+        mbr[1] = mbrman::MBRPartitionEntry {
+            boot: mbrman::BOOT_INACTIVE,
+            first_chs: mbrman::CHS::empty(),
+            sys: 0x83,
+            last_chs: mbrman::CHS::empty(),
+            starting_lba: 256,
+            sectors: 4096,
+        };
+        mbr.write_into(&mut file).expect("write mbr");
+        file.seek(SeekFrom::Start(0)).expect("seek");
+        file.flush().expect("flush");
+
+        let mut warnings = Vec::new();
+        let (table, partitions) =
+            read_table(image.path(), 4096, &mut warnings, &mut BTreeMap::new()).expect("read");
+        assert_eq!(table.expect("a table").kind, PartitionTableKind::Mbr);
+        assert_eq!(partitions.len(), 1, "{partitions:?}");
+        assert_eq!(partitions[0].start_lba, 256);
+        assert_eq!(partitions[0].size_bytes, 16 * MIB, "4096 blocks of 4 KiB");
+    }
 
     #[test]
     fn parses_btrfs_subvolume_line() {
