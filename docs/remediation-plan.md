@@ -10,8 +10,8 @@ Together they report 52 findings. Many share a root cause, so the plan is
 organised around the mechanisms that fix them rather than by finding number.
 The [finding index](#finding-index) at the end maps every ID to its work item.
 
-Status of this document: **phases 0–2 done, phases 3–4 open**. Tick items off
-in the index as they land.
+Status of this document: **phases 0–3 done, phase 4 open**. Tick items off in
+the index as they land.
 
 ## Contents
 
@@ -462,10 +462,10 @@ P3 = cleanup.
 | R31 | P1 | Backup options disappear when the CLI uses the daemon | 2.5 | ☑ |
 | R32 | P2 | Restore apply cannot request its polkit dialog | 2.8 | ☑ |
 | R33 | P2 | File restore drops metadata failures | 3 | ☑ |
-| R34 | P2 | File restore reports success without a durability barrier | 3 | ☐ |
-| R35 | P2 | Generated systemd commands are not escaped | 3 | ☐ |
-| R36 | P2 | Accepted scheduling fields are ignored | 3 | ☐ |
-| R37 | P2 | Whole-disk backup rejects legal partition numbering | 3 | ☐ |
+| R34 | P2 | File restore reports success without a durability barrier | 3 | ☑ |
+| R35 | P2 | Generated systemd commands are not escaped | 3 | ☑ |
+| R36 | P2 | Accepted scheduling fields are ignored | 3 | ☑ |
+| R37 | P2 | Whole-disk backup rejects legal partition numbering | 3 | ☑ |
 | R38 | P2 | Filesystem-tool parse errors can deadlock a job | 3 | ☑ |
 | R39 | P3 | Block-backup failure cleanup targets the wrong spool | 2.1 | ☑ |
 | R40 | P2 | Integration tests pass when setup fails | 0.2 | ☑ |
