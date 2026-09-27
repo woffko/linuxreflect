@@ -642,7 +642,7 @@ impl LinuxReflect for DaemonService {
         &self,
         request: GrpcRequest<RestoreSpec>,
     ) -> std::result::Result<Response<RestorePlanInfo>, Status> {
-        self.authorize(&request, Action::RestorePrepare).await?;
+        let peer = self.authorize(&request, Action::RestorePrepare).await?;
         let spec = request.get_ref().clone();
         let encryption = lr_engine::options::restore_encryption(
             (!spec.passphrase_file.is_empty())
@@ -661,7 +661,9 @@ impl LinuxReflect for DaemonService {
         if spec.ttl_secs > 0 {
             prepare.ttl = std::time::Duration::from_secs(spec.ttl_secs.min(600));
         }
-        let plan = lr_engine::restore::prepare_restore(&prepare).map_err(status::status_of)?;
+        // The plan's token is bound to this caller (A11).
+        let plan = lr_engine::restore::prepare_restore_as(&prepare, peer.uid)
+            .map_err(status::status_of)?;
         Ok(Response::new(RestorePlanInfo {
             dest: plan.dest,
             set: plan.set,
@@ -684,7 +686,8 @@ impl LinuxReflect for DaemonService {
         &self,
         request: GrpcRequest<RestoreToken>,
     ) -> std::result::Result<Response<Self::RestoreImageStream>, Status> {
-        self.authorize(&request, Action::RestoreApply).await?;
+        let peer = self.authorize(&request, Action::RestoreApply).await?;
+        let uid = peer.uid;
         let spec = request.get_ref().clone();
         let encryption = lr_engine::options::restore_encryption(
             (!spec.passphrase_file.is_empty())
@@ -706,11 +709,11 @@ impl LinuxReflect for DaemonService {
         };
         let stream = self
             .run_job(job_id, "restore".to_owned(), move |context| {
-                let outcome =
-                    lr_engine::restore::apply_restore(&lr_engine::restore::ApplyRequest {
-                        context,
-                        ..apply
-                    })?;
+                // Only the user who prepared the token may use it, once (A11).
+                let outcome = lr_engine::restore::apply_restore_as(
+                    &lr_engine::restore::ApplyRequest { context, ..apply },
+                    uid,
+                )?;
                 serde_json::to_string(&outcome)
                     .map_err(|error| Error::corrupt(format!("report json: {error}")))
             })

@@ -334,6 +334,63 @@ fn a_tampered_token_is_rejected() {
     assert!(matches!(error, lr_core::Error::Corrupt { .. }), "{error}");
 }
 
+/// A token is bound to the user who prepared it and is used once: another
+/// uid is refused without a write, and a second apply of a used token is
+/// refused (A11).
+#[test]
+fn a_token_is_used_once_by_the_user_who_prepared_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = dir.path().join("source.img");
+    if !make_ext4(&source, &backups()) {
+        return;
+    }
+    let backup =
+        backup_block_full(&request(&source, dir.path(), Encryption::NoEncrypt)).expect("backup");
+    let target = dir.path().join("target.img");
+    sparse(&target, DEVICE_SIZE);
+    let owner = 4242;
+    let plan = lr_engine::restore::prepare_restore_as(
+        &PrepareRequest::from_path(&backup.image_path, &target, Encryption::NoEncrypt),
+        owner,
+    )
+    .expect("prepare");
+    let apply = |uid: u32| {
+        lr_engine::restore::apply_restore_as(
+            &ApplyRequest {
+                token: plan.token.clone(),
+                confirm: true,
+                accept_inconsistent: false,
+                encryption: Encryption::NoEncrypt,
+                context: lr_engine::progress::EngineContext::silent(),
+            },
+            uid,
+        )
+    };
+
+    let other = apply(owner + 1).expect_err("another user must be refused");
+    assert!(matches!(other, lr_core::Error::Denied { .. }), "{other}");
+    assert!(
+        std::fs::read(&target)
+            .expect("target")
+            .iter()
+            .all(|byte| *byte == 0),
+        "a refused apply must not write"
+    );
+
+    apply(owner).expect("the owner's first apply");
+    // Put the target back as it was prepared, so only the used token can
+    // stop a replay.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&target)
+        .expect("reopen target");
+    file.set_len(0).expect("clear");
+    file.set_len(DEVICE_SIZE).expect("size");
+    drop(file);
+    let again = apply(owner).expect_err("a used token must be refused");
+    assert!(format!("{again}").contains("already used"), "{again}");
+}
+
 /// Every file below `root` whose name ends with one of `suffixes`.
 fn files_ending(root: &Path, suffixes: &[&str]) -> Vec<PathBuf> {
     let mut found = Vec::new();

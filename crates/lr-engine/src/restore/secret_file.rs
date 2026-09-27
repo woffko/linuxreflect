@@ -125,6 +125,51 @@ pub(super) fn load(path: &Path) -> Result<[u8; 32]> {
     read(&final_path).map_err(Error::Io)
 }
 
+/// Record `nonce` as used, in a `consumed` directory beside the key; `false`
+/// when it was used before (A11).
+///
+/// Records are named `<expires_at>-<nonce>` and created exclusively, so two
+/// concurrent applies of one token cannot both succeed; a record is pruned
+/// once its token has expired, because an expired token is refused anyway.
+pub(super) fn consume(
+    key_directory: &Path,
+    nonce: &str,
+    expires_at: u64,
+    now: u64,
+) -> Result<bool> {
+    if nonce.is_empty() || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::corrupt("restore token nonce is not hex"));
+    }
+    let directory = directory(&key_directory.join("consumed"))?;
+    let directory_path = pinned(&directory);
+    for entry in std::fs::read_dir(&directory_path)?.flatten() {
+        let name = entry.file_name();
+        let expired = name
+            .to_str()
+            .and_then(|name| name.split_once('-'))
+            .and_then(|(expiry, _)| expiry.parse::<u64>().ok())
+            .is_some_and(|expiry| now > expiry);
+        if expired {
+            let _ = std::fs::remove_file(directory_path.join(&name));
+        }
+    }
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(directory_path.join(format!("{expires_at}-{nonce}")))
+    {
+        Ok(file) => {
+            file.sync_all()?;
+            directory.sync_all()?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(Error::Io(error)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// A 0700 directory whatever the umask: under umask 002 a plain temporary
@@ -139,6 +184,23 @@ mod tests {
 
     use super::*;
     use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
+
+    #[test]
+    fn a_nonce_is_consumed_once_and_pruned_after_expiry() {
+        let dir = private_dir();
+        assert!(super::consume(dir.path(), "00ff", 100, 50).unwrap());
+        assert!(!super::consume(dir.path(), "00ff", 100, 60).unwrap());
+        assert!(super::consume(dir.path(), "abcd", 300, 70).unwrap());
+        // After its expiry the record is pruned by the next consumer.
+        assert!(super::consume(dir.path(), "1234", 400, 200).unwrap());
+        let names: Vec<String> = std::fs::read_dir(dir.path().join("consumed"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert!(!names.contains(&"100-00ff".to_owned()), "{names:?}");
+        assert!(names.contains(&"300-abcd".to_owned()), "{names:?}");
+        assert!(super::consume(dir.path(), "../x", 400, 200).is_err());
+    }
 
     #[test]
     fn preserves_socket_directory_and_existing_key() {

@@ -149,7 +149,10 @@ pub struct RestoreToken {
     pub merge: bool,
     /// Expiry, seconds since the Unix epoch.
     pub expires_at: u64,
-    /// Random nonce, so two tokens for the same plan differ.
+    /// The user who prepared the plan; only that user may apply it (A11).
+    pub uid: u32,
+    /// Random nonce, so two tokens for the same plan differ; recorded when
+    /// the token is used, so it is used once (A11).
     pub nonce: String,
     /// MAC over the payload, hex.
     pub mac: String,
@@ -179,6 +182,7 @@ impl RestoreToken {
     ///
     /// # Errors
     /// Propagates RNG and serialization failures.
+    #[allow(clippy::too_many_arguments)]
     pub fn issue(
         image: TokenImage,
         target_path: &Path,
@@ -187,6 +191,7 @@ impl RestoreToken {
         directory: Option<crate::target::DirectoryFacts>,
         merge: bool,
         ttl: Duration,
+        uid: u32,
     ) -> Result<Self> {
         let nonce = hex::encode(lr_crypto::rand::random_bytes::<16>()?);
         let expires_at = now_unix() + ttl.as_secs();
@@ -204,6 +209,7 @@ impl RestoreToken {
             target_directory: directory,
             merge,
             expires_at,
+            uid,
             nonce,
             mac: String::new(),
         };
@@ -272,6 +278,37 @@ impl RestoreToken {
         serde_json::from_str(json).map_err(|e| Error::corrupt(format!("restore token: {e}")))
     }
 
+    /// Check that `uid` prepared this token, then record it as used. Called
+    /// after the target is re-checked and before the first write, so a
+    /// refused apply leaves the token usable and two applies of one token
+    /// cannot both write (A11).
+    ///
+    /// # Errors
+    /// [`Error::Denied`] for another user, [`Error::Corrupt`] for a token that
+    /// was used before, and I/O errors from the record.
+    pub fn redeem(&self, uid: u32) -> Result<()> {
+        if uid != self.uid {
+            return Err(Error::denied(
+                "org.linuxreflect.restore.apply",
+                format!(
+                    "this restore token was prepared by uid {}, not uid {uid}",
+                    self.uid
+                ),
+            ));
+        }
+        if !secret_file::consume(
+            &token_key_directory()?,
+            &self.nonce,
+            self.expires_at,
+            now_unix(),
+        )? {
+            return Err(Error::corrupt(
+                "this restore token was already used; prepare the restore again",
+            ));
+        }
+        Ok(())
+    }
+
     /// Seconds until the token expires, saturating at zero.
     #[must_use]
     pub fn remaining_seconds(&self) -> u64 {
@@ -299,6 +336,22 @@ pub fn token_secret() -> &'static [u8; 32] {
 }
 
 static TOKEN_SECRET: OnceLock<[u8; 32]> = OnceLock::new();
+/// The directory of an explicitly installed key; used-token records live
+/// beside the key (A11).
+static TOKEN_KEY_DIRECTORY: OnceLock<PathBuf> = OnceLock::new();
+
+/// Where used-token records are kept: beside the key in use.
+fn token_key_directory() -> Result<PathBuf> {
+    if let Some(directory) = TOKEN_KEY_DIRECTORY.get() {
+        return Ok(directory.clone());
+    }
+    let path = token_secret_path()?;
+    Ok(path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .to_path_buf())
+}
 
 /// Load the process's token key from an explicit path before serving requests.
 ///
@@ -320,7 +373,15 @@ pub fn init_token_secret(path: &Path) -> Result<()> {
         return Err(already_initialized());
     }
     let secret = secret_file::load(path)?;
-    TOKEN_SECRET.set(secret).map_err(|_| already_initialized())
+    TOKEN_SECRET
+        .set(secret)
+        .map_err(|_| already_initialized())?;
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let _ = TOKEN_KEY_DIRECTORY.set(directory.to_path_buf());
+    Ok(())
 }
 
 /// Resolve the environment/default token-secret location, not the path of a
@@ -505,6 +566,15 @@ fn open_image(
 /// image kinds this slice cannot restore, and propagates destination, chain and
 /// decryption errors.
 pub fn prepare_restore(request: &PrepareRequest) -> Result<RestorePlan> {
+    prepare_restore_as(request, lr_unsafe::effective_uid())
+}
+
+/// [`prepare_restore`] on behalf of `uid`, who alone may apply the plan; the
+/// daemon passes its peer's uid (A11).
+///
+/// # Errors
+/// As [`prepare_restore`].
+pub fn prepare_restore_as(request: &PrepareRequest, uid: u32) -> Result<RestorePlan> {
     let location = lr_store::uri::split_image(&request.image)?;
     let options = lr_store::DestinationOptions {
         set_name: location.set.clone(),
@@ -670,6 +740,7 @@ pub fn prepare_restore(request: &PrepareRequest) -> Result<RestorePlan> {
         target_directory,
         request.merge,
         request.ttl,
+        uid,
     )?;
 
     Ok(RestorePlan {
@@ -786,6 +857,17 @@ impl RestoreOutcome {
 /// [`Error::Corrupt`] for an invalid or expired token, and [`Error::BadSector`]
 /// when an image records an unreadable region (which cannot be reproduced).
 pub fn apply_restore(request: &ApplyRequest) -> Result<RestoreOutcome> {
+    apply_restore_as(request, lr_unsafe::effective_uid())
+}
+
+/// [`apply_restore`] on behalf of `uid`, which must be the user who prepared
+/// the token; the token is used up by the first apply that passes its checks
+/// (A11).
+///
+/// # Errors
+/// As [`apply_restore`], plus [`Error::Denied`] for another user and
+/// [`Error::Corrupt`] for a used token.
+pub fn apply_restore_as(request: &ApplyRequest, uid: u32) -> Result<RestoreOutcome> {
     if !request.confirm {
         return Err(Error::unsupported(
             "restore apply requires --confirm; nothing has been written",
@@ -811,6 +893,7 @@ pub fn apply_restore(request: &ApplyRequest) -> Result<RestoreOutcome> {
         if !current.matches(expected) {
             return Err(Error::TargetChanged);
         }
+        token.redeem(uid)?;
         let chain = if token.chain.is_empty() {
             vec![token.image.clone()]
         } else {
@@ -847,6 +930,7 @@ pub fn apply_restore(request: &ApplyRequest) -> Result<RestoreOutcome> {
         return Err(Error::TargetChanged);
     }
     crate::target::preflight_target(&token.target_path)?;
+    token.redeem(uid)?;
 
     let mut reporter = request
         .context
@@ -1057,6 +1141,7 @@ mod tests {
             None,
             false,
             Duration::from_secs(60),
+            1000,
         )
         .expect("issue");
         let encoded = token.encode();
@@ -1089,6 +1174,7 @@ mod tests {
             None,
             false,
             Duration::from_secs(60),
+            1000,
         )
         .expect("issue");
         let mut tampered = token.clone();
