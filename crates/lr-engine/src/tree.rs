@@ -368,6 +368,20 @@ fn sparse_holes(
     ))
 }
 
+/// The hole map of the open `file` of `size` bytes, read from the same
+/// descriptor as its content (R16).
+pub fn holes_of(file: &File, size: u64, name: &str, warnings: &mut Vec<String>) -> Vec<(u64, u64)> {
+    if size == 0 {
+        return Vec::new();
+    }
+    holes_from(
+        size,
+        |offset| lr_unsafe::filemeta::seek_data(file, offset),
+        |offset| lr_unsafe::filemeta::seek_hole(file, offset),
+        |error| warnings.push(format!("{name}: cannot inspect sparse regions: {error}")),
+    )
+}
+
 /// The hole map of a file of `size` bytes, from its `SEEK_DATA` and
 /// `SEEK_HOLE` answers.
 ///

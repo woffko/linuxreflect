@@ -85,6 +85,34 @@ impl<W: Write + Seek> ImageWriter<W> {
         })
     }
 
+    /// Rewrite the superblock before [`Self::finish`], for a writer that
+    /// learns while writing that the image is weaker than it first claimed
+    /// (a live file backup whose file kept changing, R16). The footer copies
+    /// the rewritten superblock. The image's identity must not change, since
+    /// the records already written are bound to it.
+    ///
+    /// # Errors
+    /// Returns [`Error::Corrupt`] when the identity changes or the
+    /// superblock is invalid, and propagates I/O errors.
+    pub fn rewrite_superblock(
+        &mut self,
+        superblock: &Superblock,
+        meta_key: Option<&[u8; 32]>,
+    ) -> Result<()> {
+        let bytes = superblock.encode(meta_key)?;
+        // Bytes 26..42 hold the image UUID (`Superblock::encode`).
+        if bytes[26..42] != self.superblock_bytes[26..42] {
+            return Err(lr_core::Error::corrupt(
+                "a rewritten superblock must keep the image identity",
+            ));
+        }
+        self.writer.seek(SeekFrom::Start(0))?;
+        self.writer.write_all(&bytes)?;
+        self.writer.seek(SeekFrom::Start(self.position))?;
+        self.superblock_bytes = bytes;
+        Ok(())
+    }
+
     /// Current write offset.
     #[must_use]
     pub const fn position(&self) -> u64 {

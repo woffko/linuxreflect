@@ -595,3 +595,114 @@ fn an_incremental_notices_same_size_changes_with_a_restored_mtime() {
         "the restore holds the stale bytes of the full"
     );
 }
+
+/// Runs `action` once, when the backup starts reading file contents, which
+/// is after the walk recorded every file's metadata.
+struct OnFilesPhase(std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>);
+
+impl lr_engine::progress::ProgressSink for OnFilesPhase {
+    fn phase(&self, name: &str) {
+        if name == "files"
+            && let Some(action) = self.0.lock().expect("lock").take()
+        {
+            action();
+        }
+    }
+
+    fn bytes(&self, _done: u64, _total: u64) {}
+}
+
+/// A file that grows and has its hole filled between the walk and the read
+/// is recorded as it was read, so the restore reproduces it (R16).
+#[test]
+fn a_file_changed_between_walk_and_read_is_recorded_as_read() {
+    use std::os::unix::fs::FileExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = dir.path().join("source");
+    let dest = dir.path().join("backups");
+    let target = dir.path().join("restored");
+    std::fs::create_dir_all(&source).expect("source");
+    std::fs::create_dir_all(&target).expect("target");
+    let path = source.join("growing.bin");
+    std::fs::write(&path, payload(3, 1024 * 1024)).expect("data");
+    // A trailing hole the walk records.
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .expect("open")
+        .set_len(2 * 1024 * 1024)
+        .expect("hole");
+
+    let mutated = path.clone();
+    let mut full = request(&source, &dest, "laptop-tree");
+    full.member_type = MemberType::Full;
+    full.context.progress = Some(std::sync::Arc::new(OnFilesPhase(std::sync::Mutex::new(
+        Some(Box::new(move || {
+            let file = std::fs::File::options()
+                .write(true)
+                .open(&mutated)
+                .expect("open");
+            file.write_all_at(&[0xABu8; 4096], 1536 * 1024)
+                .expect("fill the hole");
+            file.write_all_at(b"appended", 2 * 1024 * 1024)
+                .expect("append");
+        })),
+    ))));
+    let report = backup_file(&full, &FileBackupOptions::default()).expect("full");
+
+    let plan = prepare_restore(&PrepareRequest::from_path(
+        &report.image_path,
+        &target,
+        Encryption::NoEncrypt,
+    ))
+    .expect("prepare");
+    restore(&plan);
+    assert!(
+        std::fs::read(target.join("growing.bin")).expect("restored")
+            == std::fs::read(&path).expect("source"),
+        "the restored file differs from what was read"
+    );
+}
+
+/// A file that keeps changing while it is read is never claimed as
+/// consistent: the image is marked inconsistent and names the file (R16).
+#[test]
+fn a_file_that_keeps_changing_is_not_claimed_consistent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = dir.path().join("source");
+    let dest = dir.path().join("backups");
+    std::fs::create_dir_all(&source).expect("source");
+    let path = source.join("busy.log");
+    std::fs::write(&path, payload(4, 16 * 1024 * 1024)).expect("data");
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let stop = std::sync::Arc::clone(&stop);
+        let path = path.clone();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let mut file = std::fs::File::options()
+                .append(true)
+                .open(&path)
+                .expect("open");
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                file.write_all(b"line\n").expect("append");
+            }
+        })
+    };
+    let mut full = request(&source, &dest, "laptop-tree");
+    full.member_type = MemberType::Full;
+    let outcome = backup_file(&full, &FileBackupOptions::default());
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    writer.join().expect("writer");
+    let report = outcome.expect("the backup completes");
+    assert_eq!(report.consistency, lr_core::Consistency::None, "{report:?}");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("busy.log") && warning.contains("changed")),
+        "{:?}",
+        report.warnings
+    );
+}

@@ -228,7 +228,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
     let walk_root = snapshot
         .as_ref()
         .map_or_else(|| request.source.clone(), |snapshot| snapshot.root.clone());
-    let consistency = snapshot
+    let mut consistency = snapshot
         .as_ref()
         .map_or(options.consistency, |snapshot| snapshot.consistency);
 
@@ -314,7 +314,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
             xattrs: options.xattrs,
         },
     )?;
-    let superblock = Superblock {
+    let mut superblock = Superblock {
         format_major: FORMAT_MAJOR,
         min_reader: MIN_READER,
         flags: sb_flags,
@@ -377,6 +377,9 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
     let mut index: BTreeMap<[u8; 32], BlockEntry> = BTreeMap::new();
     let mut records: Vec<FileRecord> = Vec::with_capacity(walk.entries.len());
     let mut changes: Vec<ChangeToken> = Vec::new();
+    // Files that kept changing while they were read, and what reading noted.
+    let mut unstable: Vec<String> = Vec::new();
+    let mut read_warnings: Vec<String> = Vec::new();
     let mut counts = [0u64; 5];
     let mut unchanged_files = 0u64;
     let mut chunked_bytes = 0u64;
@@ -393,6 +396,9 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
             lr_format::FILE_KIND_SPECIAL => counts[4] += 1,
             _ => counts[0] += 1,
         }
+        // What reading the file found, when it was read (R16).
+        let mut read_holes: Option<Vec<(u64, u64)>> = None;
+        let mut read_change: Option<(u64, i64, u32)> = None;
         if entry.file_kind == lr_format::FILE_KIND_REGULAR {
             // Reused only when the tree fields, the inode and the ctime all
             // match what the reference member recorded (R17, D-111).
@@ -419,31 +425,44 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
                     reporter.report(seen_content)?;
                 }
                 None => {
-                    let hashes = chunk_file(
-                        &mut image_writer,
-                        &writer_keys,
-                        chunk_options,
-                        &mut nonce_seq,
-                        walk.open_file(walked)?,
-                        &String::from_utf8_lossy(&entry.path),
-                        &mut index,
-                        &mut stored_chunks,
-                        &mut deduplicated_chunks,
-                        &mut reporter,
+                    let name = String::from_utf8_lossy(&entry.path).into_owned();
+                    let captured = capture_file(
+                        &mut Capture {
+                            writer: &mut image_writer,
+                            writer_keys: &writer_keys,
+                            options: chunk_options,
+                            nonce_seq: &mut nonce_seq,
+                            index: &mut index,
+                            stored_chunks: &mut stored_chunks,
+                            deduplicated_chunks: &mut deduplicated_chunks,
+                            reporter: &mut reporter,
+                            seq_in_chain,
+                            warnings: &mut read_warnings,
+                        },
+                        &walk,
+                        walked,
+                        &name,
                         seen_content,
-                        seq_in_chain,
                     )?;
-                    seen_content += entry.size;
-                    chunked_bytes += entry.size;
-                    entry.chunk_refs_total = hashes.len() as u64;
-                    entry.chunk_refs_here = hashes;
+                    if !captured.stable {
+                        unstable.push(name);
+                    }
+                    // Record the file as it was read, not as the walk saw it.
+                    entry.size = captured.size;
+                    (entry.mtime_sec, entry.mtime_nsec) = captured.mtime;
+                    seen_content += captured.size;
+                    chunked_bytes += captured.size;
+                    entry.chunk_refs_total = captured.hashes.len() as u64;
+                    entry.chunk_refs_here = captured.hashes;
+                    read_holes = Some(captured.holes);
+                    read_change = Some(captured.change);
                 }
             }
         } else if entry.file_kind == lr_format::FILE_KIND_HARDLINK {
             // A hard link has no content of its own; its group's first file
             // carries it. Nothing to chunk.
         }
-        if let Some((ino, ctime_sec, ctime_nsec)) = walked.change {
+        if let Some((ino, ctime_sec, ctime_nsec)) = read_change.or(walked.change) {
             changes.push(ChangeToken {
                 index: u32::try_from(records.len())
                     .map_err(|_| Error::unsupported("more than 4 billion files"))?,
@@ -454,10 +473,25 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
         }
         records.push(FileRecord {
             entry,
-            holes: walked.holes.clone(),
+            holes: read_holes.unwrap_or_else(|| walked.holes.clone()),
         });
     }
 
+    // A file that kept changing while it was read may be torn, so the image
+    // cannot claim per-file consistency (R16).
+    if !unstable.is_empty() {
+        consistency = Consistency::None;
+        superblock.consistency = Consistency::None;
+        superblock.flags |= flags::INCONSISTENT;
+        image_writer.rewrite_superblock(&superblock, mac_key)?;
+        for name in &unstable {
+            read_warnings.push(format!(
+                "{name} changed while it was read ({STABLE_ATTEMPTS} attempts); its content in \
+                 this image may be torn, so the image is marked inconsistent. Back up from a \
+                 snapshot to avoid this"
+            ));
+        }
+    }
     {
         let mut manifest = image_writer.page_stream(StreamId::Manifest, request.aead, meta_key);
         for record in &records {
@@ -541,6 +575,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
     }
 
     let mut warnings = walk.warnings;
+    warnings.append(&mut read_warnings);
     warnings.extend(durability.warning("the image"));
     if consistency == Consistency::PerFile {
         warnings.push(
@@ -591,6 +626,109 @@ fn unchanged(previous: &FileEntry, fresh: &FileEntry) -> bool {
         && previous.acl == fresh.acl
 }
 
+/// How often a file that changes while it is read is read (R16).
+const STABLE_ATTEMPTS: u32 = 3;
+
+/// The chunking state `capture_file` passes to `chunk_file`.
+struct Capture<'a, W: Write + Seek> {
+    writer: &'a mut ImageWriter<W>,
+    writer_keys: &'a WriterKeys,
+    options: ChunkOptions,
+    nonce_seq: &'a mut NonceSeq,
+    index: &'a mut BTreeMap<[u8; 32], BlockEntry>,
+    stored_chunks: &'a mut u64,
+    deduplicated_chunks: &'a mut u64,
+    reporter: &'a mut crate::progress::Reporter,
+    seq_in_chain: u32,
+    warnings: &'a mut Vec<String>,
+}
+
+/// One regular file as it was read.
+struct Captured {
+    hashes: Vec<[u8; 32]>,
+    /// Bytes read, which is the size recorded.
+    size: u64,
+    mtime: (i64, u32),
+    /// `(inode, ctime_sec, ctime_nsec)` after reading (D-111).
+    change: (u64, i64, u32),
+    /// Holes from the same descriptor; empty (all data) for an unstable file.
+    holes: Vec<(u64, u64)>,
+    /// Whether the file stayed the same while it was read.
+    stable: bool,
+}
+
+/// Read one regular file through the walk's confined descriptor and record
+/// it as read (R16).
+///
+/// Size, mtime, ctime and holes come from the same descriptor as the
+/// content, compared before and after the read, so a file changed between
+/// the walk and the read is recorded as it was read. A file that changes
+/// while it is read is read again, up to [`STABLE_ATTEMPTS`] times; if it
+/// never holds still, the last read is kept without holes (every byte
+/// written on restore) and reported as unstable.
+fn capture_file<W: Write + Seek>(
+    capture: &mut Capture<'_, W>,
+    walk: &tree::WalkedTree,
+    walked: &tree::WalkedEntry,
+    name: &str,
+    processed: u64,
+) -> Result<Captured> {
+    use std::os::unix::fs::MetadataExt;
+    let stamp = |metadata: &std::fs::Metadata| {
+        (
+            metadata.size(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        )
+    };
+    let mut last = None;
+    for _ in 0..STABLE_ATTEMPTS {
+        let file = walk.open_file(walked)?;
+        let before = file.metadata().map_err(Error::Io)?;
+        let holes = tree::holes_of(&file, before.size(), name, capture.warnings);
+        // SEEK_DATA/SEEK_HOLE moved the shared offset; read from the start.
+        (&file).rewind().map_err(Error::Io)?;
+        let (hashes, read) = chunk_file(
+            capture.writer,
+            capture.writer_keys,
+            capture.options,
+            capture.nonce_seq,
+            file.try_clone().map_err(Error::Io)?,
+            name,
+            capture.index,
+            capture.stored_chunks,
+            capture.deduplicated_chunks,
+            capture.reporter,
+            processed,
+            capture.seq_in_chain,
+        )?;
+        let after = file.metadata().map_err(Error::Io)?;
+        let stable = stamp(&before) == stamp(&after) && read == after.size();
+        let captured = Captured {
+            hashes,
+            size: read,
+            mtime: (
+                after.mtime(),
+                u32::try_from(after.mtime_nsec()).unwrap_or(0),
+            ),
+            change: (
+                after.ino(),
+                after.ctime(),
+                u32::try_from(after.ctime_nsec()).unwrap_or(0),
+            ),
+            holes: if stable { holes } else { Vec::new() },
+            stable,
+        };
+        if stable {
+            return Ok(captured);
+        }
+        last = Some(captured);
+    }
+    last.ok_or_else(|| Error::corrupt(format!("{name} was never read")))
+}
+
 /// Chunk one regular file and return its content hashes in order.
 #[allow(clippy::too_many_arguments)]
 fn chunk_file<W: Write + Seek>(
@@ -606,7 +744,7 @@ fn chunk_file<W: Write + Seek>(
     reporter: &mut crate::progress::Reporter,
     processed: u64,
     seq_in_chain: u32,
-) -> Result<Vec<[u8; 32]>> {
+) -> Result<(Vec<[u8; 32]>, u64)> {
     let reader: Box<dyn Read> = Box::new(file);
     let chunker = StreamCDC::with_level(
         reader,
@@ -645,7 +783,7 @@ fn chunk_file<W: Write + Seek>(
         )?;
         index.insert(hash, entry);
     }
-    Ok(hashes)
+    Ok((hashes, reported - processed))
 }
 
 /// What `restore_file` needs.
