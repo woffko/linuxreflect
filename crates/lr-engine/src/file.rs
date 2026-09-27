@@ -13,7 +13,7 @@
 //! ordinary stored chunks (a compressed zero chunk is tiny and repeats dedupe),
 //! which keeps the reader free of a special "how long is a zero chunk" case.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Cursor, Read, Seek, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -384,6 +384,14 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
     // Every chunk this image stores, keyed by its content hash; entries whose
     // content is unchanged are inherited from the base instead.
     let mut index: BTreeMap<[u8; 32], BlockEntry> = BTreeMap::new();
+    // Content the reference member already refers to. A file that is read
+    // again (a change, or `--verify-content`) refers to these chunks instead
+    // of storing them again; the ancestry a restore opens resolves them
+    // (D-111).
+    let known: HashSet<[u8; 32]> = base
+        .values()
+        .flat_map(|entry| entry.chunk_refs_here.iter().copied())
+        .collect();
     let mut records: Vec<FileRecord> = Vec::with_capacity(walk.entries.len());
     let mut changes: Vec<ChangeToken> = Vec::new();
     // Files that kept changing while they were read, and what reading noted.
@@ -442,6 +450,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
                             options: chunk_options,
                             nonce_seq: &mut nonce_seq,
                             index: &mut index,
+                            known: &known,
                             stored_chunks: &mut stored_chunks,
                             deduplicated_chunks: &mut deduplicated_chunks,
                             reporter: &mut reporter,
@@ -646,6 +655,7 @@ struct Capture<'a, W: Write + Seek> {
     options: ChunkOptions,
     nonce_seq: &'a mut NonceSeq,
     index: &'a mut BTreeMap<[u8; 32], BlockEntry>,
+    known: &'a HashSet<[u8; 32]>,
     stored_chunks: &'a mut u64,
     deduplicated_chunks: &'a mut u64,
     reporter: &'a mut crate::progress::Reporter,
@@ -708,6 +718,7 @@ fn capture_file<W: Write + Seek>(
             file.try_clone().map_err(Error::Io)?,
             name,
             capture.index,
+            capture.known,
             capture.stored_chunks,
             capture.deduplicated_chunks,
             capture.reporter,
@@ -749,6 +760,7 @@ fn chunk_file<W: Write + Seek>(
     file: std::fs::File,
     name: &str,
     index: &mut BTreeMap<[u8; 32], BlockEntry>,
+    known: &HashSet<[u8; 32]>,
     stored_chunks: &mut u64,
     deduplicated_chunks: &mut u64,
     reporter: &mut crate::progress::Reporter,
@@ -773,7 +785,7 @@ fn chunk_file<W: Write + Seek>(
         reporter.report(reported)?;
         let hash = lr_crypto::content_hash(&writer_keys.dedup_key, &chunk.data);
         hashes.push(hash);
-        if index.contains_key(&hash) {
+        if index.contains_key(&hash) || known.contains(&hash) {
             *deduplicated_chunks += 1;
             continue;
         }

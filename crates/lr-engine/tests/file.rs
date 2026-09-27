@@ -191,6 +191,111 @@ fn an_incremental_stores_only_the_changed_file() {
     );
 }
 
+/// Bytes without repeats, so content-defined chunks do not deduplicate
+/// against each other inside one file.
+fn noise(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect()
+}
+
+/// A file read again (`--verify-content`, or a real change) refers to the
+/// chunks its reference member already has instead of storing them again,
+/// so re-reading costs time, not space (D-111).
+#[test]
+fn re_read_content_is_not_stored_again() {
+    if !have("rsync") {
+        lr_testkit::unavailable!("rsync missing");
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = dir.path().join("source");
+    let dest = dir.path().join("backups");
+    let target = dir.path().join("restored");
+    std::fs::create_dir_all(source.join("data")).expect("dirs");
+    std::fs::create_dir_all(&target).expect("target");
+    std::fs::write(source.join("data/big.bin"), noise(11, 2 * 1024 * 1024)).expect("big");
+    std::fs::write(source.join("data/log.txt"), noise(12, 1024 * 1024)).expect("log");
+
+    let full = backup_file(
+        &request(&source, &dest, "reread"),
+        &FileBackupOptions::default(),
+    )
+    .expect("full");
+    assert!(full.stored_chunks >= 4, "{full:?}");
+
+    let mut again = request(&source, &dest, "reread");
+    again.member_type = MemberType::Incremental;
+    again.parent = Some("latest".to_owned());
+    let verified = backup_file(
+        &again,
+        &FileBackupOptions {
+            verify_content: true,
+            ..FileBackupOptions::default()
+        },
+    )
+    .expect("verify-content incremental");
+    assert!(
+        verified.chunked_bytes >= 3 * 1024 * 1024,
+        "--verify-content must read every file: {verified:?}"
+    );
+    assert_eq!(
+        verified.stored_chunks, 0,
+        "unchanged content must not be stored again: {verified:?}"
+    );
+
+    // Appending to a file stores the new tail, not the whole file again.
+    {
+        use std::io::Write;
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(source.join("data/log.txt"))
+            .expect("open log");
+        log.write_all(&noise(13, 64 * 1024)).expect("append");
+    }
+    let appended = backup_file(&again, &FileBackupOptions::default()).expect("append incremental");
+    assert!(
+        appended.stored_chunks < full.stored_chunks / 2 && appended.deduplicated_chunks > 0,
+        "an append must reuse the file's earlier chunks: {appended:?} after {full:?}"
+    );
+
+    // Both members verify on their own: the chunks they refer to live in
+    // their ancestry.
+    for member in [&verified.image_path, &appended.image_path] {
+        lr_engine::verify::verify_image(&lr_engine::verify::VerifyRequest {
+            image: member.display().to_string(),
+            encryption: Encryption::NoEncrypt,
+            chain: false,
+            destination_options: lr_store::DestinationOptions {
+                set_name: "reread".to_owned(),
+                identity: None,
+                known_hosts: None,
+                insecure_ignore_host_key: false,
+            },
+            context: lr_engine::progress::EngineContext::silent(),
+        })
+        .expect("a member that refers to its ancestry verifies");
+    }
+
+    let plan = prepare_restore(&PrepareRequest::from_path(
+        &appended.image_path,
+        &target,
+        Encryption::NoEncrypt,
+    ))
+    .expect("prepare");
+    restore(&plan);
+    let difference = rsync_difference(&source, &target);
+    assert!(
+        difference.is_empty(),
+        "rsync reports differences:\n{difference}"
+    );
+}
+
 #[test]
 fn a_differential_only_needs_the_full_to_restore() {
     if !have("rsync") {
