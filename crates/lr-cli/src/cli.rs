@@ -243,6 +243,11 @@ pub(crate) enum BackupCommand {
         /// File mode: stay on one filesystem (spec §K S12).
         #[arg(long)]
         one_file_system: bool,
+
+        /// File mode: read every file of an incremental instead of trusting
+        /// unchanged metadata, inode and ctime (slower, same storage).
+        #[arg(long)]
+        verify_content: bool,
     },
 
     /// List chains and members (Slice S9).

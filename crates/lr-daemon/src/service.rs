@@ -490,21 +490,22 @@ impl LinuxReflect for DaemonService {
             spec.job_id.clone()
         };
         let mode = lr_engine::options::parse_mode(&spec.mode).map_err(status::status_of)?;
+        let file_options = lr_engine::file::FileBackupOptions {
+            verify_content: spec.verify_content,
+            ..lr_engine::file::FileBackupOptions::default()
+        };
         let stream = self
             .run_job(job_id, spec.set.clone(), move |context| {
                 let mut request = request;
                 request.context = context;
                 let report = match mode {
-                    lr_engine::options::Mode::File => {
-                        lr_engine::backup::ImageReport::File(lr_engine::file::backup_file(
-                            &request,
-                            &lr_engine::file::FileBackupOptions::default(),
-                        )?)
-                    }
+                    lr_engine::options::Mode::File => lr_engine::backup::ImageReport::File(
+                        lr_engine::file::backup_file(&request, &file_options)?,
+                    ),
                     lr_engine::options::Mode::Auto if request.source.is_dir() => {
                         lr_engine::backup::ImageReport::File(lr_engine::file::backup_file(
                             &request,
-                            &lr_engine::file::FileBackupOptions::default(),
+                            &file_options,
                         )?)
                     }
                     _ => lr_engine::backup_image(&request)?,

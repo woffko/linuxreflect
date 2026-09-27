@@ -100,6 +100,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             deadman_grace,
             mode,
             one_file_system,
+            verify_content,
             max_incrementals,
         }) => backup_create(
             cli.json,
@@ -127,6 +128,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
                 deadman_grace: *deadman_grace,
                 mode: *mode,
                 one_file_system: *one_file_system,
+                verify_content: *verify_content,
                 max_incrementals: *max_incrementals,
             },
         ),
@@ -499,6 +501,7 @@ struct BackupOptions<'a> {
     deadman_grace: u64,
     mode: cli::ModeChoice,
     one_file_system: bool,
+    verify_content: bool,
     max_incrementals: u64,
 }
 
@@ -561,6 +564,7 @@ fn backup_create(json: bool, options: &BackupOptions<'_>) -> anyhow::Result<()> 
                 .unwrap_or_default(),
             insecure_ignore_host_key: options.insecure_ignore_host_key,
             max_incrementals: options.max_incrementals,
+            verify_content: options.verify_content,
             ..lr_proto::v1::BackupSpec::default()
         };
         let summary = client.create_backup(spec, |progress| {
@@ -628,6 +632,7 @@ fn backup_create(json: bool, options: &BackupOptions<'_>) -> anyhow::Result<()> 
         lr_engine::options::Mode::File => {
             let file_options = lr_engine::file::FileBackupOptions {
                 one_file_system: options.one_file_system,
+                verify_content: options.verify_content,
                 ..lr_engine::file::FileBackupOptions::default()
             };
             lr_engine::backup::ImageReport::File(lr_engine::file::backup_file(

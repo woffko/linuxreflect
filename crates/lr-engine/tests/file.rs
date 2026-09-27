@@ -540,3 +540,58 @@ fn walk_files(root: &Path) -> Vec<std::path::PathBuf> {
     }
     found
 }
+
+/// Same-length new content with the old mtime restored is still noticed by
+/// an incremental: the restore contains the new bytes (R17, D-111).
+#[test]
+fn an_incremental_notices_same_size_changes_with_a_restored_mtime() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = dir.path().join("source");
+    let dest = dir.path().join("backups");
+    let target = dir.path().join("restored");
+    std::fs::create_dir_all(&target).expect("target");
+    build_tree(&source);
+    let file = source.join("var/lib/data.bin");
+    let before = std::fs::read(&file).expect("original");
+
+    let mut full = request(&source, &dest, "laptop-tree");
+    full.member_type = MemberType::Full;
+    backup_file(&full, &FileBackupOptions::default()).expect("full");
+
+    let mtime = std::fs::metadata(&file)
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
+    let changed: Vec<u8> = before.iter().map(|byte| byte ^ 0x5A).collect();
+    std::fs::write(&file, &changed).expect("rewrite");
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .expect("open")
+        .set_modified(mtime)
+        .expect("restore the mtime");
+    assert_eq!(
+        std::fs::metadata(&file)
+            .expect("metadata")
+            .modified()
+            .expect("mtime"),
+        mtime
+    );
+
+    let mut incremental = request(&source, &dest, "laptop-tree");
+    incremental.member_type = MemberType::Incremental;
+    incremental.parent = Some("latest".to_owned());
+    let report = backup_file(&incremental, &FileBackupOptions::default()).expect("incremental");
+
+    let plan = prepare_restore(&PrepareRequest::from_path(
+        &report.image_path,
+        &target,
+        Encryption::NoEncrypt,
+    ))
+    .expect("prepare");
+    restore(&plan);
+    assert!(
+        std::fs::read(target.join("var/lib/data.bin")).expect("restored") == changed,
+        "the restore holds the stale bytes of the full"
+    );
+}

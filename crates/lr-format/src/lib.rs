@@ -48,10 +48,11 @@ pub use disk::{
     RegionRecord, SECTION_DISK_HEADER, SWAP_HEADER_BYTES, region_flags,
 };
 pub use extras::{
-    CDC_PARAMS_LEN, CdcParams, ChainMember, EXTRAS_BTRFS_LAYOUT, EXTRAS_CDC_PARAMS,
-    EXTRAS_CHAIN_MEMBERS, EXTRAS_FSTAB, EXTRAS_IMAGE_METADATA, EXTRAS_PARTITION_TABLE,
-    read_cdc_params, read_chain_members, read_record as read_extras_record, write_cdc_params,
-    write_chain_members, write_record as write_extras_record,
+    CDC_PARAMS_LEN, CdcParams, ChainMember, ChangeToken, EXTRAS_BTRFS_LAYOUT, EXTRAS_CDC_PARAMS,
+    EXTRAS_CHAIN_MEMBERS, EXTRAS_FILE_CHANGES, EXTRAS_FSTAB, EXTRAS_IMAGE_METADATA,
+    EXTRAS_PARTITION_TABLE, read_cdc_params, read_chain_members, read_file_changes,
+    read_record as read_extras_record, write_cdc_params, write_chain_members, write_file_changes,
+    write_record as write_extras_record,
 };
 pub use file_manifest::{
     FILE_KIND_DIRECTORY, FILE_KIND_HARDLINK, FILE_KIND_REGULAR, FILE_KIND_SPECIAL,

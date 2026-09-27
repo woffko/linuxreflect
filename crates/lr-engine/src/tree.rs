@@ -85,6 +85,9 @@ pub struct WalkedEntry {
     /// `(st_dev, st_ino)` of a regular file, from the descriptor the walk
     /// read it through; the content pass must find the same file.
     pub identity: Option<(u64, u64)>,
+    /// `(inode, ctime_sec, ctime_nsec)` of a regular file with content, for
+    /// an incremental's change detection (D-111).
+    pub change: Option<(u64, i64, u32)>,
 }
 
 /// The result of a walk.
@@ -269,6 +272,12 @@ fn record(
     };
     let mut holes = Vec::new();
     let mut identity = None;
+    let change_token = (
+        metadata.ino(),
+        metadata.ctime(),
+        u32::try_from(metadata.ctime_nsec()).unwrap_or(0),
+    );
+    let mut change = None;
     let total_bytes = &mut tree.total_bytes;
     let warnings = &mut tree.warnings;
 
@@ -296,6 +305,7 @@ fn record(
                     *total_bytes += metadata.size();
                     holes = sparse_holes(path, &metadata, warnings)?;
                     identity = Some(key);
+                    change = Some(change_token);
                 }
             }
         }
@@ -303,6 +313,7 @@ fn record(
             *total_bytes += metadata.size();
             holes = sparse_holes(path, &metadata, warnings)?;
             identity = Some((metadata.dev(), metadata.ino()));
+            change = Some(change_token);
         }
         _ => {}
     }
@@ -317,6 +328,7 @@ fn record(
         entry,
         holes,
         identity,
+        change,
     });
     Ok(())
 }

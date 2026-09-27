@@ -289,7 +289,7 @@ A sequence of records:
 | 8 | len | payload |
 
 Kinds: 1 chain member list, 2 partition table dump, 3 `fstab`, 4 Btrfs layout,
-5 image metadata, 6 CDC parameters.
+5 image metadata, 6 CDC parameters, 7 file change tokens.
 
 Kind 4 (Btrfs layout) is line-oriented so a reader can ignore unknown fields:
 
@@ -306,6 +306,13 @@ Kind 6 (CDC parameters) is 13 bytes: `min u32`, `avg u32`, `max u32`,
 `normalization u8`. The chain member list is a sequence of
 `u8 index ‖ u16 reserved ‖ 16 B image_uuid` entries (19 B each); `member`
 indices in manifests refer to this list.
+
+Kind 7 (file change tokens, file images only, D-111) is a sequence of 24-byte
+entries: `index u32` (the regular file's position in the file manifest),
+`ino u64`, `ctime_sec i64`, `ctime_nsec u32`. A file-mode incremental reuses a
+file's chunk references only when its tree fields and this token match the
+parent's. Large trees use several kind 7 records of at most 16 MiB each. An
+image without kind 7 has no tokens, so its successor reads every file.
 
 Unknown kinds are skipped using `len`, which is what keeps §G.8 forward
 compatibility cheap.

@@ -24,6 +24,8 @@ pub const EXTRAS_BTRFS_LAYOUT: u8 = 4;
 pub const EXTRAS_IMAGE_METADATA: u8 = 5;
 /// Kind: content-defined chunking parameters (stream/file images).
 pub const EXTRAS_CDC_PARAMS: u8 = 6;
+/// Kind: change-detection tokens of a file image's regular files (D-111).
+pub const EXTRAS_FILE_CHANGES: u8 = 7;
 
 /// Largest accepted extras payload, bounding allocations on corrupt input.
 pub const MAX_EXTRAS_PAYLOAD: usize = 16 * 1024 * 1024;
@@ -89,6 +91,71 @@ pub fn read_cdc_params(payload: &[u8]) -> Result<CdcParams> {
         max_size: wire::slice_u32(&payload[8..])?,
         normalization: payload[12],
     })
+}
+
+/// What a file-mode incremental compares, besides the spec §D.1 tree
+/// fields, before it reuses a file's chunks without reading it (D-111).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangeToken {
+    /// Index of the file's entry in the image's file manifest.
+    pub index: u32,
+    /// Inode number.
+    pub ino: u64,
+    /// Status-change time, seconds since the epoch.
+    pub ctime_sec: i64,
+    /// Status-change time, nanoseconds.
+    pub ctime_nsec: u32,
+}
+
+/// Encoded length of one [`ChangeToken`].
+pub const CHANGE_TOKEN_LEN: usize = 24;
+
+/// Write the change tokens, split into records of at most
+/// [`MAX_EXTRAS_PAYLOAD`] bytes.
+///
+/// # Errors
+/// Propagates sink errors.
+pub fn write_file_changes(out: &mut impl ByteSink, tokens: &[ChangeToken]) -> Result<()> {
+    for batch in tokens.chunks(MAX_EXTRAS_PAYLOAD / CHANGE_TOKEN_LEN) {
+        let mut payload = Vec::with_capacity(batch.len() * CHANGE_TOKEN_LEN);
+        for token in batch {
+            wire::put_u32(&mut payload, token.index)?;
+            wire::put_u64(&mut payload, token.ino)?;
+            wire::put_i64(&mut payload, token.ctime_sec)?;
+            wire::put_u32(&mut payload, token.ctime_nsec)?;
+        }
+        write_record(out, EXTRAS_FILE_CHANGES, &payload)?;
+    }
+    Ok(())
+}
+
+/// Parse one change-token record.
+///
+/// # Errors
+/// Returns [`Error::Corrupt`] when the payload is not a whole number of
+/// tokens.
+pub fn read_file_changes(payload: &[u8]) -> Result<Vec<ChangeToken>> {
+    if !payload.len().is_multiple_of(CHANGE_TOKEN_LEN) {
+        return Err(Error::corrupt(format!(
+            "file change payload of {} bytes is not a multiple of {CHANGE_TOKEN_LEN}",
+            payload.len()
+        )));
+    }
+    payload
+        .chunks_exact(CHANGE_TOKEN_LEN)
+        .map(|token| {
+            Ok(ChangeToken {
+                index: wire::slice_u32(&token[0..])?,
+                ino: wire::slice_u64(&token[4..])?,
+                ctime_sec: i64::from_le_bytes(
+                    token[12..20]
+                        .try_into()
+                        .map_err(|_| Error::corrupt("change token ctime"))?,
+                ),
+                ctime_nsec: wire::slice_u32(&token[20..])?,
+            })
+        })
+        .collect()
 }
 
 /// Write an extras record of any kind.
@@ -233,5 +300,31 @@ mod tests {
     fn a_truncated_member_list_is_rejected() {
         assert!(read_chain_members(&[0u8; 5]).is_err());
         assert!(read_chain_members(&[0u8; 19]).is_ok());
+    }
+
+    #[test]
+    fn change_tokens_round_trip() {
+        let tokens = [
+            super::ChangeToken {
+                index: 7,
+                ino: 0x0102_0304_0506_0708,
+                ctime_sec: -5,
+                ctime_nsec: 999_999_999,
+            },
+            super::ChangeToken {
+                index: 8,
+                ino: 42,
+                ctime_sec: 1_790_000_000,
+                ctime_nsec: 0,
+            },
+        ];
+        let mut bytes = Vec::new();
+        super::write_file_changes(&mut bytes, &tokens).expect("write");
+        let mut cursor = std::io::Cursor::new(bytes.as_slice());
+        let mut reader = crate::wire::Reader::new(&mut cursor);
+        let (kind, payload) = super::read_record(&mut reader).expect("record");
+        assert_eq!(kind, super::EXTRAS_FILE_CHANGES);
+        assert_eq!(super::read_file_changes(&payload).expect("parse"), tokens);
+        assert!(super::read_file_changes(&payload[1..]).is_err());
     }
 }

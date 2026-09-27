@@ -25,10 +25,10 @@ use lr_core::{
 };
 use lr_crypto::nonce::NonceSeq;
 use lr_format::{
-    BlockEntry, CdcParams, ChainMember, ChunkOptions, EXTRAS_IMAGE_METADATA, FORMAT_MAJOR,
-    FileEntry, FileRecord, ImageWriter, MIN_READER, StreamId, Superblock, WriterKeys, flags,
-    read_extras_record, read_manifest, write_cdc_params, write_chain_members, write_extras_record,
-    write_record,
+    BlockEntry, CdcParams, ChainMember, ChangeToken, ChunkOptions, EXTRAS_FILE_CHANGES,
+    EXTRAS_IMAGE_METADATA, FORMAT_MAJOR, FileEntry, FileRecord, ImageWriter, MIN_READER, StreamId,
+    Superblock, WriterKeys, flags, read_extras_record, read_file_changes, read_manifest,
+    write_cdc_params, write_chain_members, write_extras_record, write_file_changes, write_record,
 };
 
 use crate::backup::{
@@ -144,6 +144,9 @@ pub struct FileBackupOptions {
     pub source_override: Option<PathBuf>,
     /// Consistency of the walk; `PerFile` unless the source is a snapshot.
     pub consistency: Consistency,
+    /// Read and re-chunk every regular file of an incremental instead of
+    /// trusting unchanged metadata, inode and ctime (D-111).
+    pub verify_content: bool,
 }
 
 impl Default for FileBackupOptions {
@@ -154,6 +157,7 @@ impl Default for FileBackupOptions {
             xattrs: true,
             source_override: None,
             consistency: Consistency::PerFile,
+            verify_content: false,
         }
     }
 }
@@ -257,6 +261,9 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
     // The base state an incremental/differential compares against: the newest
     // member of the parent chain.
     let mut base: HashMap<Vec<u8>, FileEntry> = HashMap::new();
+    // What the reference member recorded to detect a change without
+    // reading the file (D-111); empty for a parent written before that.
+    let mut base_changes: HashMap<Vec<u8>, (u64, i64, u32)> = HashMap::new();
     if let Some(parent) = &parent {
         let mut members =
             crate::chain::open_chain(&*destination, &set, &parent.files, &request.encryption)?;
@@ -270,7 +277,9 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
             members.last_mut()
         };
         if let Some(reference) = reference {
-            for record in read_records(reference)? {
+            let records = read_records(reference)?;
+            base_changes = read_change_tokens(reference, &records)?;
+            for record in records {
                 base.insert(record.entry.path.clone(), record.entry);
             }
         }
@@ -367,6 +376,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
     // content is unchanged are inherited from the base instead.
     let mut index: BTreeMap<[u8; 32], BlockEntry> = BTreeMap::new();
     let mut records: Vec<FileRecord> = Vec::with_capacity(walk.entries.len());
+    let mut changes: Vec<ChangeToken> = Vec::new();
     let mut counts = [0u64; 5];
     let mut unchanged_files = 0u64;
     let mut chunked_bytes = 0u64;
@@ -384,9 +394,16 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
             _ => counts[0] += 1,
         }
         if entry.file_kind == lr_format::FILE_KIND_REGULAR {
+            // Reused only when the tree fields, the inode and the ctime all
+            // match what the reference member recorded (R17, D-111).
             let inherited = base
                 .get(&entry.path)
                 .filter(|previous| unchanged(previous, &entry))
+                .filter(|_| {
+                    !options.verify_content
+                        && walked.change.is_some()
+                        && base_changes.get(&entry.path) == walked.change.as_ref()
+                })
                 .cloned();
             match inherited {
                 Some(previous) => {
@@ -425,6 +442,15 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
         } else if entry.file_kind == lr_format::FILE_KIND_HARDLINK {
             // A hard link has no content of its own; its group's first file
             // carries it. Nothing to chunk.
+        }
+        if let Some((ino, ctime_sec, ctime_nsec)) = walked.change {
+            changes.push(ChangeToken {
+                index: u32::try_from(records.len())
+                    .map_err(|_| Error::unsupported("more than 4 billion files"))?,
+                ino,
+                ctime_sec,
+                ctime_nsec,
+            });
         }
         records.push(FileRecord {
             entry,
@@ -466,6 +492,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
             image_uuid: request.image_uuid,
         });
         write_chain_members(&mut extras, &members)?;
+        write_file_changes(&mut extras, &changes)?;
         write_cdc_params(
             &mut extras,
             CdcParams {
@@ -994,6 +1021,37 @@ fn prepare_target(target: &Path, merge: bool) -> Result<()> {
 pub fn read_records(member: &mut crate::chain::OpenMember) -> Result<Vec<FileRecord>> {
     let bytes = member.stream_bytes(StreamId::Manifest)?;
     read_manifest(&bytes)
+}
+
+/// The change tokens a file image recorded, by path (D-111).
+///
+/// # Errors
+/// Propagates stream and format errors.
+fn read_change_tokens(
+    member: &mut crate::chain::OpenMember,
+    records: &[FileRecord],
+) -> Result<HashMap<Vec<u8>, (u64, i64, u32)>> {
+    let extras = member.stream_bytes(StreamId::Extras)?;
+    let mut cursor = Cursor::new(extras.as_slice());
+    let mut tokens = HashMap::new();
+    while (cursor.position() as usize) < extras.len() {
+        let mut wire = lr_format::wire::Reader::new(&mut cursor);
+        let (kind, payload) = read_extras_record(&mut wire)?;
+        if kind != EXTRAS_FILE_CHANGES {
+            continue;
+        }
+        for token in read_file_changes(&payload)? {
+            let record = usize::try_from(token.index)
+                .ok()
+                .and_then(|index| records.get(index))
+                .ok_or_else(|| Error::corrupt("a change token names no manifest entry"))?;
+            tokens.insert(
+                record.entry.path.clone(),
+                (token.ino, token.ctime_sec, token.ctime_nsec),
+            );
+        }
+    }
+    Ok(tokens)
 }
 
 /// The consistency and source recorded in a file image's extras.
