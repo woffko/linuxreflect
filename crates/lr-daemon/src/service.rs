@@ -58,6 +58,57 @@ pub struct DaemonService {
     dev_mode: bool,
     /// Live exports the daemon serves itself, by mount point.
     exports: Arc<Mutex<HashMap<PathBuf, Arc<AtomicBool>>>>,
+    /// Bounds concurrent verifications (A5).
+    verifications: Arc<Slots>,
+}
+
+/// How many verifications may read at once; further ones wait.
+const MAX_VERIFICATIONS: usize = 4;
+
+/// A counting semaphore for blocking job threads.
+struct Slots {
+    free: std::sync::Mutex<usize>,
+    released: std::sync::Condvar,
+}
+
+impl Slots {
+    fn new(count: usize) -> Self {
+        Self {
+            free: std::sync::Mutex::new(count),
+            released: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Wait for a slot; it is returned when the guard drops.
+    fn acquire(self: &Arc<Self>) -> SlotGuard {
+        let mut free = self
+            .free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *free == 0 {
+            free = self
+                .released
+                .wait(free)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *free -= 1;
+        SlotGuard(Arc::clone(self))
+    }
+}
+
+/// Returns a verification slot on drop.
+struct SlotGuard(Arc<Slots>);
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        let mut free = self
+            .0
+            .free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *free += 1;
+        self.0.released.notify_one();
+    }
 }
 
 impl DaemonService {
@@ -69,6 +120,7 @@ impl DaemonService {
             jobs,
             dev_mode,
             exports: Arc::new(Mutex::new(HashMap::new())),
+            verifications: Arc::new(Slots::new(MAX_VERIFICATIONS)),
         }
     }
 
@@ -546,23 +598,28 @@ impl LinuxReflect for DaemonService {
             },
             context: EngineContext::silent(),
         };
+        // Every verification is its own job with its own set key, so one
+        // user's long verification never blocks another's; a counting
+        // semaphore bounds how many read at once (A5).
+        let id = format!(
+            "verify-{}",
+            lr_core::Id::generate().map_err(|error| status::status_of(Error::Io(error)))?
+        );
+        let slots = Arc::clone(&self.verifications);
         let stream = self
-            .run_job(
-                format!("verify-{}", spec.image),
-                "verify".to_owned(),
-                move |context| {
-                    let mut verify = verify;
-                    verify.context = context;
-                    let mut report = lr_engine::verify::verify_image(&verify)?;
-                    // A whole-chain verification is recorded for retention
-                    // (R20).
-                    if let Some(note) = lr_engine::verify::record_verification(&verify, &report)? {
-                        report.warnings.push(note);
-                    }
-                    serde_json::to_string(&report)
-                        .map_err(|error| Error::corrupt(format!("report json: {error}")))
-                },
-            )
+            .run_job(id.clone(), id, move |context| {
+                let _slot = slots.acquire();
+                let mut verify = verify;
+                verify.context = context;
+                let mut report = lr_engine::verify::verify_image(&verify)?;
+                // A whole-chain verification is recorded for retention
+                // (R20).
+                if let Some(note) = lr_engine::verify::record_verification(&verify, &report)? {
+                    report.warnings.push(note);
+                }
+                serde_json::to_string(&report)
+                    .map_err(|error| Error::corrupt(format!("report json: {error}")))
+            })
             .map_err(status::status_of)?;
         Ok(Response::new(stream))
     }

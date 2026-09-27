@@ -892,3 +892,57 @@ async fn a_named_destination_is_used_by_name() {
         .into_inner();
     assert!(list.destinations.is_empty());
 }
+
+/// Two verifications run side by side: they no longer share one job set,
+/// and two requests for the same image get distinct jobs (A5).
+#[tokio::test]
+async fn verifications_do_not_block_each_other() {
+    let daemon = Daemon::start(&format!("static:{}", uid()));
+    let work = tempfile::tempdir().expect("workdir");
+    let source = work.path().join("data.img");
+    let bytes: Vec<u8> = (0..64 * 1024 * 1024u32)
+        .map(|index| (index.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
+    std::fs::write(&source, bytes).expect("source");
+    let dest = work.path().join("out");
+    let mut client = daemon.client().await;
+    let mut stream = client
+        .create_backup(BackupSpec {
+            source: source.display().to_string(),
+            dest: dest.display().to_string(),
+            set: "verified".to_owned(),
+            mode: "block".to_owned(),
+            compress: "none".to_owned(),
+            no_encrypt: true,
+            ..BackupSpec::default()
+        })
+        .await
+        .expect("create_backup")
+        .into_inner();
+    let mut progress = Vec::new();
+    while let Some(step) = stream.message().await.expect("stream") {
+        progress.push(step);
+    }
+    let summary: serde_json::Value =
+        serde_json::from_str(finished_summary(&progress).expect("finished")).expect("json");
+    let image = summary["image_uri"].as_str().expect("image_uri").to_owned();
+
+    let spec = VerifySpec {
+        image,
+        chain: true,
+        ..VerifySpec::default()
+    };
+    let mut second_client = daemon.client().await;
+    let (first, second) = tokio::join!(
+        client.verify_image(spec.clone()),
+        second_client.verify_image(spec)
+    );
+    for started in [first, second] {
+        let mut stream = started.expect("a verification is not refused").into_inner();
+        let mut progress = Vec::new();
+        while let Some(step) = stream.message().await.expect("stream") {
+            progress.push(step);
+        }
+        assert!(failure_code(&progress).is_none(), "{progress:?}");
+    }
+}
