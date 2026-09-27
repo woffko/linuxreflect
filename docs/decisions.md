@@ -1463,3 +1463,31 @@ remediation plan replaces that with explicit operations:
 - **Remote limits.** SFTP has no compare-and-swap, so a replacement that lands
   between a refresh's token check and its write cannot be prevented; the
   replacing holder's own `verify` then sees the other token and stops.
+
+## D-111 — How file incrementals detect a changed file
+
+A file-mode incremental reuses a file's chunk references when the file looks
+unchanged, without reading it. Until now "unchanged" meant equal kind, mode,
+owner, size, mtime, xattrs and ACL (spec §D.1's tree fields). Rewriting a file
+with same-length content and restoring its mtime therefore kept stale bytes
+in every later incremental, even from a stable snapshot (R17).
+
+- **Default: metadata plus inode and ctime.** A file is reused only when its
+  spec §D.1 fields are equal *and* its inode number and ctime (seconds and
+  nanoseconds) equal those recorded for it in the parent image. ctime changes
+  on every content or metadata change, including an mtime reset, and cannot
+  be set by an ordinary program. This is the default of other deduplicating
+  backup tools (borg: `ctime,size,inode`). `st_dev` is not compared: it
+  changes with every Btrfs snapshot and with device renumbering, which would
+  turn every incremental from a snapshot into a full read.
+- **Where the tokens live.** A new extras record, `EXTRAS_FILE_CHANGES` (7),
+  holds `(manifest index, inode, ctime_sec, ctime_nsec)` for each regular
+  file, in records of at most 16 MiB. The file manifest and the format
+  version do not change; older readers skip the unknown record. A parent
+  without the record (an image from before this change) has no tokens, so
+  every file is read again once.
+- **Explicit content verification.** `--verify-content` (and the matching
+  option of the daemon request) reads and re-chunks every regular file;
+  unchanged content is still deduplicated against the chain, so it costs
+  reading time, not space. Metadata equality, even with ctime, is strong
+  evidence but not proof of equal content, and the documentation says so.
