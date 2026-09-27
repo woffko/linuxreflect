@@ -488,3 +488,55 @@ fn a_merge_restore_does_not_follow_a_planted_symlink() {
         b"from the image"
     );
 }
+
+/// Asking for encryption on a chain that is not encrypted is refused before
+/// anything is written, instead of silently continuing the plaintext chain
+/// (R15).
+#[test]
+fn an_encryption_request_on_a_plaintext_chain_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = dir.path().join("source");
+    let dest = dir.path().join("backups");
+    build_tree(&source);
+
+    let mut full = request(&source, &dest, "laptop-tree");
+    full.member_type = MemberType::Full;
+    backup_file(&full, &FileBackupOptions::default()).expect("plaintext full");
+
+    let mut encrypted = BackupRequest::new(
+        &source,
+        &dest,
+        "laptop-tree",
+        Encryption::Passphrase(lr_engine::keystore::Passphrase::new(
+            b"correct horse battery staple".to_vec(),
+        )),
+    )
+    .expect("request");
+    encrypted.member_type = MemberType::Incremental;
+    encrypted.parent = Some("latest".to_owned());
+    let outcome = backup_file(&encrypted, &FileBackupOptions::default());
+    let images: Vec<_> = walk_files(&dest)
+        .into_iter()
+        .filter(|path| path.to_string_lossy().ends_with(".lrimg"))
+        .collect();
+    assert_eq!(
+        images.len(),
+        1,
+        "no plaintext member was published: {images:?}"
+    );
+    let error = outcome.expect_err("encryption cannot be added to a plaintext chain");
+    assert!(error.to_string().contains("new encrypted chain"), "{error}");
+}
+
+fn walk_files(root: &Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(root).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(walk_files(&path));
+        } else {
+            found.push(path);
+        }
+    }
+    found
+}

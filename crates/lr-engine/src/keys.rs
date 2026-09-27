@@ -135,7 +135,8 @@ pub(crate) fn new_chain_keys(
 ///
 /// # Errors
 /// Returns [`Error::Aead`] for a wrong passphrase, and [`Error::Unsupported`]
-/// when the parent and the new member disagree about the chain or the cipher.
+/// when the parent and the new member disagree about the chain or the cipher,
+/// or when encryption is requested on an unencrypted chain.
 pub(crate) fn member_chain_keys(
     encryption: &Encryption,
     parent: &Superblock,
@@ -149,6 +150,16 @@ pub(crate) fn member_chain_keys(
         )));
     }
     if !parent.is_encrypted() {
+        // An explicit request for encryption must never publish plaintext
+        // (R15). A chain's key is fixed by its full, so encryption cannot be
+        // added to an existing chain.
+        if matches!(encryption, Encryption::Passphrase(_)) {
+            return Err(Error::unsupported(
+                "the parent chain is not encrypted, and encryption cannot be added to an \
+                 existing chain; start a new encrypted chain with a full backup, or back up \
+                 without a passphrase to continue this one",
+            ));
+        }
         // The public-key chain: nothing to unwrap or rewrap.
         let chain_key = ChainKey::from_bytes(fixed_public_mac_key());
         return Ok(NewChainKeys {
