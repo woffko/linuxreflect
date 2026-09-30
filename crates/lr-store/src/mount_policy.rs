@@ -1,5 +1,6 @@
 //! Required mount identities for named local destinations.
 
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 
 use lr_core::{Error, Result};
@@ -25,8 +26,22 @@ impl RequiredMount {
         validate_destination_path(path)?;
         let required_path = resolve_existing_prefix(&self.path)?;
         let destination_path = resolve_existing_prefix(path)?;
+        // Retain both mount observations through the table comparison. This
+        // does not pin the paths' visibility after this check.
+        let (required_observation, visible_required_id) = visible_mount(&required_path)?;
+        let (destination_observation, visible_destination_id) = visible_mount(&destination_path)?;
         let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").map_err(Error::Io)?;
-        check_mountinfo(self, &required_path, &destination_path, &mountinfo)
+        let result = check_mountinfo(
+            self,
+            &required_path,
+            &destination_path,
+            &mountinfo,
+            visible_required_id,
+            visible_destination_id,
+        );
+        drop(destination_observation);
+        drop(required_observation);
+        result
     }
 }
 
@@ -78,6 +93,8 @@ fn check_mountinfo(
     required_path: &Path,
     destination_path: &Path,
     text: &str,
+    visible_required_id: u64,
+    visible_destination_id: u64,
 ) -> Result<()> {
     if !destination_path.starts_with(required_path) {
         return Err(Error::unsupported(format!(
@@ -91,16 +108,20 @@ fn check_mountinfo(
     let expected =
         |mount: &MountInfo| mount.source == policy.source && mount.fs_type == policy.fs_type;
 
-    let mut required_matches = mounts.iter().filter(|mount| mount.target == required_path);
-    let required = required_matches.next().ok_or_else(|| {
-        Error::unsupported(format!(
-            "required mount {} is not mounted",
-            required_path.display()
-        ))
-    })?;
-    if required_matches.next().is_some() {
-        return Err(ambiguous_mount(required_path));
-    }
+    let target_is_mounted = mounts.iter().any(|mount| mount.target == required_path);
+    let required = mounts
+        .iter()
+        .find(|mount| mount.target == required_path && mount.id == visible_required_id)
+        .ok_or_else(|| {
+            if target_is_mounted {
+                unresolved_visible_mount(required_path)
+            } else {
+                Error::unsupported(format!(
+                    "required mount {} is not mounted",
+                    required_path.display()
+                ))
+            }
+        })?;
     if required.root != Path::new("/") {
         return Err(Error::unsupported(format!(
             "required mount {} is a non-root mount projection ({})",
@@ -114,7 +135,9 @@ fn check_mountinfo(
 
     // A destination subdirectory can itself be a mount point. Validate the
     // deepest containing mount too, so a different nested mount cannot silently
-    // replace the required share for this destination.
+    // replace the required share for this destination. Mountinfo may retain a
+    // deeper hidden target; if its record wins this lexical lookup but does
+    // not match the visible descriptor ID below, refuse rather than infer.
     let deepest_depth = mounts
         .iter()
         .filter(|mount| destination_path.starts_with(&mount.target))
@@ -126,19 +149,14 @@ fn check_mountinfo(
                 destination_path.display()
             ))
         })?;
-    let mut containing_matches = mounts.iter().filter(|mount| {
-        destination_path.starts_with(&mount.target)
-            && mount.target.components().count() == deepest_depth
-    });
-    let containing = containing_matches.next().ok_or_else(|| {
-        Error::unsupported(format!(
-            "no mounted filesystem contains local destination {}",
-            destination_path.display()
-        ))
-    })?;
-    if containing_matches.next().is_some() {
-        return Err(ambiguous_mount(&containing.target));
-    }
+    let containing = mounts
+        .iter()
+        .find(|mount| {
+            destination_path.starts_with(&mount.target)
+                && mount.target.components().count() == deepest_depth
+                && mount.id == visible_destination_id
+        })
+        .ok_or_else(|| unresolved_visible_mount(destination_path))?;
     if containing.id != required.id {
         return Err(Error::unsupported(format!(
             "local destination {} is on a nested or overmounted filesystem at {}, not required mount {}",
@@ -153,11 +171,65 @@ fn check_mountinfo(
     Ok(())
 }
 
-fn ambiguous_mount(path: &Path) -> Error {
+fn unresolved_visible_mount(path: &Path) -> Error {
     Error::unsupported(format!(
-        "mount table has ambiguous stacked mount records at {}",
+        "could not determine the visible mount record at {}",
         path.display()
     ))
+}
+
+fn visible_mount(path: &Path) -> Result<(OwnedFd, u64)> {
+    let mut existing = path.to_path_buf();
+    loop {
+        match std::fs::metadata(&existing) {
+            Ok(metadata) if metadata.is_dir() => break,
+            Ok(_) => {
+                if !existing.pop() {
+                    return Err(unresolved_visible_mount(path));
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                if !existing.pop() {
+                    return Err(Error::Io(error));
+                }
+            }
+            Err(error) => return Err(Error::Io(error)),
+        }
+    }
+
+    let directory = lr_unsafe::beneath::open_root(&existing).map_err(Error::Io)?;
+    let fdinfo_path = format!("/proc/self/fdinfo/{}", directory.as_raw_fd());
+    let fdinfo = std::fs::read_to_string(fdinfo_path).map_err(Error::Io)?;
+    let mount_id = fdinfo_mount_id(path, &fdinfo)?;
+    Ok((directory, mount_id))
+}
+
+fn fdinfo_mount_id(path: &Path, text: &str) -> Result<u64> {
+    parse_fdinfo_mount_id(text)?.ok_or_else(|| unresolved_visible_mount(path))
+}
+
+fn parse_fdinfo_mount_id(text: &str) -> Result<Option<u64>> {
+    let mut mount_id = None;
+    for line in text.lines() {
+        let Some(value) = line.strip_prefix("mnt_id:") else {
+            continue;
+        };
+        if mount_id.is_some() {
+            return Err(Error::corrupt("fdinfo has duplicate mount IDs"));
+        }
+        mount_id = Some(
+            value
+                .trim()
+                .parse()
+                .map_err(|_| Error::corrupt("could not parse mount ID in fdinfo"))?,
+        );
+    }
+    Ok(mount_id)
 }
 
 fn identity_mismatch(policy: &RequiredMount, actual: &MountInfo) -> Error {
@@ -294,9 +366,10 @@ fn resolve_existing_prefix(path: &Path) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::AsRawFd;
     use std::path::Path;
 
-    use super::{RequiredMount, check_mountinfo, validate};
+    use super::{RequiredMount, check_mountinfo, fdinfo_mount_id, validate, visible_mount};
 
     const BASE: &str =
         "36 25 0:32 / /mnt/backup rw,relatime shared:1 - nfs4 nas:/exports/backups rw\n";
@@ -318,6 +391,8 @@ mod tests {
                 Path::new("/mnt/backup"),
                 Path::new("/mnt/backup/deep/backup"),
                 BASE,
+                36,
+                36,
             )
             .is_ok()
         );
@@ -332,6 +407,8 @@ mod tests {
                 Path::new("/mnt/backup"),
                 Path::new("/mnt/backup/sub/backup"),
                 &nested,
+                36,
+                37,
             )
             .is_err()
         );
@@ -345,6 +422,8 @@ mod tests {
                 Path::new("/mnt/backup"),
                 Path::new("/mnt/backup/subdir"),
                 ROOT_MOUNT,
+                25,
+                25,
             )
             .is_err()
         );
@@ -359,6 +438,8 @@ mod tests {
                 Path::new("/mnt/backup"),
                 Path::new("/mnt/backup/subdir"),
                 &text,
+                36,
+                36,
             )
             .is_err()
         );
@@ -373,6 +454,8 @@ mod tests {
                 Path::new("/mnt/backup"),
                 Path::new("/mnt/backup/subdir"),
                 &text,
+                36,
+                36,
             )
             .is_err()
         );
@@ -386,6 +469,8 @@ mod tests {
                 Path::new("/mnt/backup"),
                 Path::new("/mnt/other/backup"),
                 BASE,
+                36,
+                25,
             )
             .is_err()
         );
@@ -401,13 +486,15 @@ mod tests {
                 Path::new("/mnt/backup"),
                 Path::new("/mnt/backup/sub/backup"),
                 &nested,
+                36,
+                37,
             )
             .is_err()
         );
     }
 
     #[test]
-    fn duplicate_records_at_required_mount_are_ambiguous() {
+    fn duplicate_records_without_a_visible_id_are_refused() {
         let stacked = format!("{BASE}37 36 0:32 / /mnt/backup rw - nfs4 nas:/exports/backups rw\n");
         assert!(
             check_mountinfo(
@@ -415,13 +502,15 @@ mod tests {
                 Path::new("/mnt/backup"),
                 Path::new("/mnt/backup/subdir"),
                 &stacked,
+                99,
+                99,
             )
             .is_err()
         );
     }
 
     #[test]
-    fn duplicate_records_at_deepest_destination_mount_are_ambiguous() {
+    fn duplicate_deepest_mount_records_without_visible_id_are_refused() {
         let stacked = format!(
             "{BASE}37 36 0:32 / /mnt/backup/sub rw - nfs4 nas:/exports/backups rw\n\
              38 37 0:32 / /mnt/backup/sub rw - nfs4 nas:/exports/backups rw\n"
@@ -432,6 +521,8 @@ mod tests {
                 Path::new("/mnt/backup"),
                 Path::new("/mnt/backup/sub/data"),
                 &stacked,
+                36,
+                99,
             )
             .is_err()
         );
@@ -446,6 +537,8 @@ mod tests {
                 Path::new("/mnt/backup"),
                 Path::new("/mnt/backup/subdir"),
                 &projected,
+                36,
+                36,
             )
             .is_err()
         );
@@ -476,9 +569,119 @@ mod tests {
                 Path::new("/mnt/shared dir"),
                 Path::new("/mnt/shared dir/subdir"),
                 text,
+                36,
+                36,
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn hidden_matching_mount_does_not_override_visible_wrong_share() {
+        let stacked = concat!(
+            "36 25 0:32 / /mnt/backup rw - cifs nas:/exports/backups rw\n",
+            "37 36 0:33 / /mnt/backup rw - cifs //wrong/share rw\n",
+        );
+        let expected = RequiredMount {
+            path: "/mnt/backup".into(),
+            source: "nas:/exports/backups".to_owned(),
+            fs_type: "cifs".to_owned(),
+        };
+        let visible_required_id =
+            super::parse_fdinfo_mount_id("pos:\t0\nflags:\t0100000\nmnt_id:\t37\n")
+                .expect("parse fdinfo")
+                .expect("mount ID");
+        let visible_destination_id = visible_required_id;
+        let error = check_mountinfo(
+            &expected,
+            Path::new("/mnt/backup"),
+            Path::new("/mnt/backup/subdir"),
+            stacked,
+            visible_required_id,
+            visible_destination_id,
+        )
+        .expect_err("the visible share is wrong despite a matching hidden record");
+        assert!(
+            error
+                .to_string()
+                .contains("found cifs source //wrong/share"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn systemd_autofs_and_cifs_stack_accepts_the_visible_share_independent_of_order() {
+        let expected = RequiredMount {
+            path: "/mnt/backup".into(),
+            source: "//nas/backups".to_owned(),
+            fs_type: "cifs".to_owned(),
+        };
+        let cases = [
+            (
+                concat!(
+                    "640 25 0:32 / /mnt/backup rw - autofs systemd-1 rw\n",
+                    "17 640 0:33 / /mnt/backup rw - cifs //nas/backups rw\n",
+                ),
+                17,
+            ),
+            (
+                concat!(
+                    "640 17 0:33 / /mnt/backup rw - cifs //nas/backups rw\n",
+                    "17 25 0:32 / /mnt/backup rw - autofs systemd-1 rw\n",
+                ),
+                640,
+            ),
+        ];
+
+        for (mountinfo, visible_id) in cases {
+            assert!(
+                check_mountinfo(
+                    &expected,
+                    Path::new("/mnt/backup"),
+                    Path::new("/mnt/backup/linuxreflect_backups"),
+                    mountinfo,
+                    visible_id,
+                    visible_id,
+                )
+                .is_ok(),
+                "visible mount ID {visible_id} should select the configured CIFS row"
+            );
+        }
+    }
+
+    #[test]
+    fn visible_mount_lookup_uses_existing_directory_for_missing_descendants() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("not-created/deeper");
+        let (root_fd, root_id) = visible_mount(dir.path()).expect("observe temp directory");
+        let (missing_fd, missing_id) =
+            visible_mount(&missing).expect("observe nearest existing directory");
+
+        assert_eq!(missing_id, root_id);
+        let descriptor_path = format!("/proc/self/fd/{}", missing_fd.as_raw_fd());
+        let opened_path = std::fs::read_link(descriptor_path).expect("read opened directory");
+        assert_eq!(
+            opened_path,
+            dir.path().canonicalize().expect("canonical temp directory")
+        );
+        drop(missing_fd);
+        drop(root_fd);
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn fdinfo_missing_or_malformed_mount_ids_fail_closed() {
+        let cases = [
+            "pos:\t0\nflags:\t0100000\n",
+            "pos:\t0\nflags:\t0100000\nmnt_id:\tnot-a-number\n",
+            "pos:\t0\nflags:\t0100000\nmnt_id:\t17\nmnt_id:\t18\n",
+        ];
+        for text in cases {
+            assert!(
+                fdinfo_mount_id(Path::new("/mnt/backup"), text).is_err(),
+                "fdinfo without one valid mount ID must fail closed: {text:?}"
+            );
+        }
     }
 
     #[test]
