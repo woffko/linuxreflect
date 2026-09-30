@@ -205,8 +205,20 @@ A restore has two steps, so that the target is written only on purpose:
    the target and prints the plan and a **token**. The token is valid for 10
    minutes, **once**, and only for the user who prepared it (A11).
 2. `linuxreflect restore apply --token … --confirm` checks the target again
-   (same device, same size, same partition table) and writes it. Through the
-   daemon this asks for the administrator password every time.
+   (same device, same size, same partition table), admits the one-use operation,
+   and verifies the selected recovery point's required payloads before writing.
+   Through the daemon this asks for the administrator password every time.
+
+Preverification covers block and file recovery points and every ancestor stream
+that a Btrfs restore must replay. A failed or cancelled verification leaves the
+target untouched and consumes the admitted token; prepare again to retry. The
+ten-minute expiry limits admission, not the duration of an admitted restore.
+Target identity and cancellation are checked again after verification (D-127).
+
+This extra read pass detects existing corruption before destructive work. It
+does not freeze the backup files or provide rollback: later source changes,
+I/O failures or interruption can still leave a partial target. Integrity checks
+remain active during writes. Keep a separate recovery copy and test restores.
 
 Restores refuse what would go wrong: a target in use anywhere (`O_EXCL`, even
 in another mount namespace), a whole-disk image onto a partition, an image

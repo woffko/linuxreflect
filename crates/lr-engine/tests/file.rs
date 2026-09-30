@@ -418,7 +418,11 @@ fn verify_names_a_corrupted_file_chunk() {
     let source = dir.path().join("source");
     let dest = dir.path().join("backups");
     std::fs::create_dir_all(&source).expect("dirs");
-    std::fs::write(source.join("important.bin"), payload(11, 120 * 1024)).expect("file");
+    std::fs::write(
+        source.join("important.bin"),
+        distinct_payload(2 * 1024 * 1024),
+    )
+    .expect("file");
 
     let report = backup_file(
         &request(&source, &dest, "verify"),
@@ -441,13 +445,40 @@ fn verify_names_a_corrupted_file_chunk() {
         })
     };
     let clean = verify(&report.image_path).expect("a fresh image verifies");
-    assert!(clean.chunks >= 1);
+    assert!(clean.chunks > 1, "the fixture has multiple payload chunks");
 
-    // Flip one byte inside the first chunk record's payload.
-    let offset = lr_format::SB_SIZE + 24;
-    let mut bytes = std::fs::read(&report.image_path).expect("read");
-    bytes[offset] ^= 0xFF;
-    std::fs::write(&report.image_path, &bytes).expect("write");
+    let set_root = dest.join("verify");
+    let image_name = report
+        .image_path
+        .strip_prefix(&set_root)
+        .expect("image path is under its set")
+        .to_string_lossy()
+        .into_owned();
+    let target = dir.path().join("direct-restore-target");
+    std::fs::create_dir_all(&target).expect("target");
+    let sentinel = b"keep existing merge target";
+    std::fs::write(target.join("important.bin"), sentinel).expect("sentinel file");
+    let mut prepare = PrepareRequest::from_path(&report.image_path, &target, Encryption::NoEncrypt);
+    prepare.merge = true;
+    let plan = prepare_restore(&prepare).expect("prepare before payload corruption");
+
+    // Flip the final physical chunk payload: the old restore path could
+    // replace the existing merge target and write earlier chunks first.
+    let offset = last_chunk_payload_offset(&report.image_path);
+    let mut image = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&report.image_path)
+        .expect("open image");
+    use std::io::{Read, Seek, SeekFrom, Write};
+    image.seek(SeekFrom::Start(offset)).expect("seek payload");
+    let mut original = [0u8; 1];
+    image.read_exact(&mut original).expect("read payload byte");
+    image.seek(SeekFrom::Start(offset)).expect("rewind payload");
+    image
+        .write_all(&[original[0] ^ 0xFF])
+        .expect("corrupt payload");
+    image.sync_all().expect("sync corruption");
 
     let error = verify(&report.image_path).expect_err("a corrupted chunk must fail");
     let text = format!("{error}");
@@ -455,6 +486,80 @@ fn verify_names_a_corrupted_file_chunk() {
         text.contains("important.bin") || text.contains("chunk"),
         "the failure must name the offender: {text}"
     );
+
+    let error = lr_engine::file::restore_file(&lr_engine::file::FileRestoreRequest {
+        dest: dest.to_string_lossy().into_owned(),
+        set: "verify".to_owned(),
+        images: vec![image_name],
+        destination_options: lr_store::DestinationOptions::new("verify"),
+        target: target.clone(),
+        encryption: Encryption::NoEncrypt,
+        confirm: true,
+        accept_inconsistent: false,
+        merge: true,
+        strict_metadata: false,
+        context: lr_engine::progress::EngineContext::silent(),
+    })
+    .expect_err("direct file restore verifies before mutating the target");
+    assert!(matches!(error, lr_core::Error::Corrupt { .. }), "{error}");
+    assert_eq!(
+        std::fs::read(target.join("important.bin")).expect("existing file remains"),
+        sentinel
+    );
+
+    let token_error = apply_restore(&ApplyRequest {
+        token: plan.token,
+        confirm: true,
+        accept_inconsistent: false,
+        encryption: Encryption::NoEncrypt,
+        context: lr_engine::progress::EngineContext::silent(),
+    })
+    .expect_err("token-based file restore verifies before mutating the target");
+    assert!(
+        matches!(token_error, lr_core::Error::Corrupt { .. }),
+        "{token_error}"
+    );
+    assert_eq!(
+        std::fs::read(target.join("important.bin")).expect("token target remains"),
+        sentinel
+    );
+}
+
+fn distinct_payload(len: usize) -> Vec<u8> {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect()
+}
+
+fn last_chunk_payload_offset(path: &Path) -> u64 {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let image = lr_format::ImageReader::open(std::fs::File::open(path).expect("open image"))
+        .expect("read footer");
+    let data_end = image.footer().data_end_offset;
+    let mut file = std::fs::File::open(path).expect("open chunk records");
+    let mut offset = lr_format::SB_SIZE as u64;
+    let mut last_payload = None;
+    let mut records = 0usize;
+    while offset < data_end {
+        file.seek(SeekFrom::Start(offset))
+            .expect("seek chunk header");
+        let mut bytes = [0u8; lr_format::CHUNK_HEADER_LEN];
+        file.read_exact(&mut bytes).expect("read chunk header");
+        let header = lr_format::decode_header(&bytes).expect("decode chunk header");
+        last_payload = Some(offset + lr_format::CHUNK_HEADER_LEN as u64);
+        offset += header.total_len() as u64;
+        records += 1;
+    }
+    assert_eq!(offset, data_end, "chunk records cover the chunk region");
+    assert!(records > 1, "fixture has earlier valid chunk records");
+    last_payload.expect("at least one chunk record")
 }
 
 /// A user restoring a tree that root owns cannot restore its ownership:

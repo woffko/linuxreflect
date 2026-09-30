@@ -804,6 +804,22 @@ pub struct StreamRestoreReport {
 /// Returns [`Error::Unsupported`] without `confirm`, [`Error::TargetBusy`] or
 /// [`Error::NoSpace`]-style failures from `mkfs`, and propagates receive errors.
 pub fn restore_stream(request: &StreamRestoreRequest) -> Result<StreamRestoreReport> {
+    restore_stream_inner(request, None, None)
+}
+
+pub(crate) fn restore_stream_for_apply(
+    request: &StreamRestoreRequest,
+    expected_target: &crate::restore::TargetFacts,
+    expected_members: &[crate::restore::RestoreMemberIdentity],
+) -> Result<StreamRestoreReport> {
+    restore_stream_inner(request, Some(expected_target), Some(expected_members))
+}
+
+fn restore_stream_inner(
+    request: &StreamRestoreRequest,
+    expected_target: Option<&crate::restore::TargetFacts>,
+    expected_members: Option<&[crate::restore::RestoreMemberIdentity]>,
+) -> Result<StreamRestoreReport> {
     if !request.confirm {
         return Err(Error::unsupported(
             "restore apply requires --confirm; nothing has been written",
@@ -812,8 +828,39 @@ pub fn restore_stream(request: &StreamRestoreRequest) -> Result<StreamRestoreRep
     if request.images.is_empty() {
         return Err(Error::unsupported("no images to restore"));
     }
+    let image_name = request
+        .images
+        .last()
+        .ok_or_else(|| Error::unsupported("no images to restore"))?;
+    let target = lr_blocksource::DirectBlockTarget::open_buffered(&request.target)?;
+    let starting_target = crate::restore::TargetFacts::read(&request.target)?;
+    if expected_target.is_some_and(|expected| !expected.matches(&starting_target))
+        || target.device_id()? != starting_target.dev_id
+    {
+        return Err(Error::TargetChanged);
+    }
+    crate::target::preflight_target(&request.target)?;
+
     let destination = lr_store::open(&request.dest, &request.destination_options)?;
     let set = destination.open_existing_set(&lr_core::SetId::ZERO)?;
+    let verified_members = crate::restore::verify_selected_payloads(
+        &*destination,
+        &set,
+        &crate::restore::SelectedPayloadRequest {
+            image_name,
+            selected_names: &request.images,
+            expected_members,
+            whole_disk: false,
+            verification: crate::verify::VerifyRequest {
+                image: image_name.clone(),
+                encryption: request.encryption.clone(),
+                chain: true,
+                destination_options: request.destination_options.clone(),
+                context: request.context.clone(),
+            },
+        },
+    )?;
+
     let contents = request
         .images
         .iter()
@@ -853,12 +900,29 @@ pub fn restore_stream(request: &StreamRestoreRequest) -> Result<StreamRestoreRep
         }
     }
 
+    crate::restore::validate_selected_members_current(
+        &*destination,
+        &set,
+        image_name,
+        &request.images,
+        &verified_members,
+        false,
+    )?;
+    request.context.check_cancel()?;
+    let current_target = crate::restore::TargetFacts::read(&request.target)?;
+    if !current_target.matches(&starting_target)
+        || expected_target.is_some_and(|expected| !expected.matches(&current_target))
+        || target.device_id()? != current_target.dev_id
+    {
+        return Err(Error::TargetChanged);
+    }
+    crate::target::preflight_target(&request.target)?;
+    request.context.check_cancel()?;
+
     // A fresh filesystem with the source's UUID and label. The exclusive
     // claim proves the target is not mounted in any namespace (A1); it is
     // released right before `mkfs.btrfs`, which claims the device itself.
-    drop(lr_blocksource::DirectBlockTarget::open_buffered(
-        &request.target,
-    )?);
+    drop(target);
     btrfs::create_filesystem(&request.target, &first.layout.fs_uuid, &first.layout.label)?;
     let mountpoint = request.mount_root.join(format!(
         "restore-{}",

@@ -905,6 +905,22 @@ pub struct FileRestoreReport {
 /// non-empty directory in non-merge mode, and propagates chain, decryption and
 /// filesystem errors.
 pub fn restore_file(request: &FileRestoreRequest) -> Result<FileRestoreReport> {
+    restore_file_inner(request, None, None)
+}
+
+pub(crate) fn restore_file_for_apply(
+    request: &FileRestoreRequest,
+    expected_directory: &crate::target::DirectoryFacts,
+    expected_members: &[crate::restore::RestoreMemberIdentity],
+) -> Result<FileRestoreReport> {
+    restore_file_inner(request, Some(expected_directory), Some(expected_members))
+}
+
+fn restore_file_inner(
+    request: &FileRestoreRequest,
+    expected_directory: Option<&crate::target::DirectoryFacts>,
+    expected_members: Option<&[crate::restore::RestoreMemberIdentity]>,
+) -> Result<FileRestoreReport> {
     if !request.confirm {
         return Err(Error::unsupported(
             "restore apply requires --confirm; nothing has been written",
@@ -913,21 +929,40 @@ pub fn restore_file(request: &FileRestoreRequest) -> Result<FileRestoreReport> {
     if request.images.is_empty() {
         return Err(Error::unsupported("no images to restore"));
     }
+    let starting_directory = match crate::target::DirectoryFacts::read(&request.target) {
+        Ok(facts) => Some(facts),
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if expected_directory.is_some_and(|expected| starting_directory.as_ref() != Some(expected)) {
+        return Err(Error::TargetChanged);
+    }
     let destination = lr_store::open(&request.dest, &request.destination_options)?;
     let set = destination.open_existing_set(&SetId::ZERO)?;
-    let files = request
+    let image_name = request
         .images
-        .iter()
-        .map(|name| {
-            let member = crate::chain::read_superblock(&*destination, &set, name)?;
-            Ok(crate::chain::ChainMemberFile {
-                file_name: name.clone(),
-                seq_in_chain: member.seq_in_chain,
-                image_uuid: member.image_uuid,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+        .last()
+        .ok_or_else(|| Error::unsupported("no images to restore"))?;
+    let approved_members = crate::restore::verify_selected_payloads(
+        &*destination,
+        &set,
+        &crate::restore::SelectedPayloadRequest {
+            image_name,
+            selected_names: &request.images,
+            expected_members,
+            whole_disk: false,
+            verification: crate::verify::VerifyRequest {
+                image: image_name.clone(),
+                encryption: request.encryption.clone(),
+                chain: false,
+                destination_options: request.destination_options.clone(),
+                context: request.context.clone(),
+            },
+        },
+    )?;
+    let files = crate::restore::chain_files_from_identities(&approved_members);
     let mut members = crate::chain::open_chain(&*destination, &set, &files, &request.encryption)?;
+    crate::restore::validate_open_chain_members(&*destination, &set, &members, &approved_members)?;
     if members
         .iter()
         .any(|member| member.superblock.image_kind != ImageKind::File)
@@ -996,8 +1031,28 @@ pub fn restore_file(request: &FileRestoreRequest) -> Result<FileRestoreReport> {
     // Paths, holes and hard-link groups, before anything is written (R06,
     // R25).
     crate::plan::file_tree(&final_entries)?;
+    check_directory_target(
+        &request.target,
+        starting_directory.as_ref(),
+        expected_directory,
+    )?;
+    request.context.check_cancel()?;
     prepare_target(&request.target, request.merge)?;
+    let prepared_directory = crate::target::DirectoryFacts::read(&request.target)?;
+    if starting_directory
+        .as_ref()
+        .is_some_and(|starting| !starting.matches(&prepared_directory))
+        || expected_directory.is_some_and(|expected| !expected.matches(&prepared_directory))
+    {
+        return Err(Error::TargetChanged);
+    }
     let root = tree::RestoreRoot::open(&request.target)?;
+    let opened_directory = crate::target::DirectoryFacts::read(&request.target)?;
+    if !prepared_directory.matches(&opened_directory)
+        || expected_directory.is_some_and(|expected| !expected.matches(&opened_directory))
+    {
+        return Err(Error::TargetChanged);
+    }
 
     let total_bytes: u64 = final_entries
         .values()
@@ -1011,6 +1066,7 @@ pub fn restore_file(request: &FileRestoreRequest) -> Result<FileRestoreReport> {
         .sum();
     let mut reporter = request.context.clone().reporter(total_bytes)?;
     reporter.phase("restore");
+    request.context.check_cancel()?;
 
     let mut ordered: Vec<&FileRecord> = final_entries.values().collect();
     ordered.sort_by_key(|record| {
@@ -1127,6 +1183,28 @@ pub fn restore_file(request: &FileRestoreRequest) -> Result<FileRestoreReport> {
         warnings,
         metadata_losses: losses,
     })
+}
+
+fn check_directory_target(
+    target: &Path,
+    starting: Option<&crate::target::DirectoryFacts>,
+    expected: Option<&crate::target::DirectoryFacts>,
+) -> Result<()> {
+    if let Some(starting) = starting {
+        let current = crate::target::DirectoryFacts::read(target)?;
+        if !starting.matches(&current)
+            || expected.is_some_and(|expected| !expected.matches(&current))
+        {
+            return Err(Error::TargetChanged);
+        }
+        return Ok(());
+    }
+
+    match std::fs::symlink_metadata(target) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::Io(error)),
+        Ok(_) => Err(Error::TargetChanged),
+    }
 }
 
 /// One line about metadata losses: how many entries lost what, and the

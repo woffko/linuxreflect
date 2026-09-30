@@ -18,7 +18,9 @@ use std::time::Duration;
 
 use lr_blocksource::DirectBlockTarget;
 use lr_core::io::ReadSeek;
-use lr_core::{Consistency, Error, ImageId, ImageKind, Result, discovery::discover_source};
+use lr_core::{
+    ChainId, Consistency, Error, ImageId, ImageKind, Result, SetId, discovery::discover_source,
+};
 use lr_crypto::mac::{mac32, unkeyed_mac32, verify_mac32};
 use lr_format::{ImageReader, Superblock};
 use serde::{Deserialize, Serialize};
@@ -126,6 +128,13 @@ pub struct RestoreToken {
     /// Set-relative names of every member to apply, oldest first.
     #[serde(default)]
     pub chain: Vec<String>,
+    /// Ordered member descriptors captured by `prepare` and covered by the
+    /// token MAC. The superblock digest pins metadata bytes, not payload bytes;
+    /// the destination can still change after verification.
+    /// Tokens without these descriptors, including older tokens, must be
+    /// prepared again before they can be applied.
+    #[serde(default)]
+    pub chain_members: Vec<RestoreMemberIdentity>,
     /// SFTP identity file the destination was opened with (a path, never a key).
     #[serde(default)]
     pub identity: Option<PathBuf>,
@@ -159,6 +168,64 @@ pub struct RestoreToken {
     pub nonce: String,
     /// MAC over the payload, hex.
     pub mac: String,
+}
+
+/// The ordered chain-member metadata approved by `prepare`.
+///
+/// This prevents `apply` from verifying a different chain resolution than the
+/// one named by the token. It is not a content digest: a mutable destination
+/// may still replace payload bytes after verification and before they are
+/// read for restore.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreMemberIdentity {
+    /// Set-relative member name.
+    pub file_name: String,
+    /// Chain identifier from the member superblock.
+    pub chain_id: ChainId,
+    /// Set identifier from the member superblock.
+    pub set_id: SetId,
+    /// Member position in the chain.
+    pub seq_in_chain: u32,
+    /// Image identifier from the member superblock.
+    pub image_uuid: ImageId,
+    /// Parent image identifier from the member superblock.
+    pub parent_uuid: ImageId,
+    /// Kind recorded in the member superblock.
+    pub image_kind: ImageKind,
+    /// BLAKE3 of the complete on-disk superblock, including its MAC.
+    pub superblock_hash: [u8; 32],
+}
+
+/// The token-bound member selection and verification policy for one restore.
+pub(crate) struct SelectedPayloadRequest<'a> {
+    pub(crate) image_name: &'a str,
+    pub(crate) selected_names: &'a [String],
+    pub(crate) expected_members: Option<&'a [RestoreMemberIdentity]>,
+    pub(crate) whole_disk: bool,
+    pub(crate) verification: crate::verify::VerifyRequest,
+}
+
+impl RestoreMemberIdentity {
+    pub(crate) fn read(
+        destination: &dyn lr_store::Destination,
+        set: &lr_store::SetHandle,
+        file_name: &str,
+    ) -> Result<Self> {
+        let mut reader = destination.open_ro(set, file_name)?;
+        let mut bytes = [0u8; lr_format::SB_SIZE];
+        reader.read_exact(&mut bytes).map_err(Error::Io)?;
+        let superblock = Superblock::decode(&bytes)?;
+        Ok(Self {
+            file_name: file_name.to_owned(),
+            chain_id: superblock.chain_id,
+            set_id: superblock.set_id,
+            seq_in_chain: superblock.seq_in_chain,
+            image_uuid: superblock.image_uuid,
+            parent_uuid: superblock.parent_uuid,
+            image_kind: superblock.image_kind,
+            superblock_hash: unkeyed_mac32(&bytes),
+        })
+    }
 }
 
 /// Where a chain's images live, as the token records it.
@@ -203,6 +270,7 @@ impl RestoreToken {
             set: image.set,
             image: image.image,
             chain: image.chain,
+            chain_members: Vec::new(),
             identity: image.identity,
             known_hosts: image.known_hosts,
             insecure_ignore_host_key: image.insecure_ignore_host_key,
@@ -228,6 +296,16 @@ impl RestoreToken {
     /// Propagates serialization failures.
     pub fn with_strict_metadata(mut self, strict: bool) -> Result<Self> {
         self.strict_metadata = strict;
+        self.mac = hex::encode(mac32(token_secret(), &self.payload()?));
+        Ok(self)
+    }
+
+    /// Bind this token to the ordered member metadata resolved by `prepare`.
+    ///
+    /// # Errors
+    /// Propagates serialization failures while recalculating the token MAC.
+    pub fn with_chain_members(mut self, members: Vec<RestoreMemberIdentity>) -> Result<Self> {
+        self.chain_members = members;
         self.mac = hex::encode(mac32(token_secret(), &self.payload()?));
         Ok(self)
     }
@@ -295,8 +373,9 @@ impl RestoreToken {
 
     /// Check that `uid` prepared this token, then record it as used. Called
     /// after the target is re-checked and before the first write, so a
-    /// refused apply leaves the token usable and two applies of one token
-    /// cannot both write (A11).
+    /// failure before admission leaves the token usable, but payload verification
+    /// after admission consumes it even if verification fails. Two applies of
+    /// one token cannot both write (A11).
     ///
     /// # Errors
     /// [`Error::Denied`] for another user, [`Error::Corrupt`] for a token that
@@ -579,6 +658,169 @@ fn open_image(
     Ok((reader, keys, superblock))
 }
 
+/// Verify that an explicitly selected, ordered recovery chain still matches
+/// its prepared member descriptors, then check the payloads the selected
+/// recovery point needs.
+///
+/// The exact member list is passed to the verifier, so it cannot independently
+/// resolve another chain. Before/after descriptor checks detect persistent
+/// metadata changes; a mutable destination can still replace payload bytes
+/// after this call returns.
+pub(crate) fn verify_selected_payloads(
+    destination: &dyn lr_store::Destination,
+    set: &lr_store::SetHandle,
+    selection: &SelectedPayloadRequest<'_>,
+) -> Result<Vec<RestoreMemberIdentity>> {
+    let image_name = selection.image_name;
+    let selected_names = selection.selected_names;
+    let expected_members = selection.expected_members;
+    let whole_disk = selection.whole_disk;
+    let verification = &selection.verification;
+    if selected_names.last().map(String::as_str) != Some(image_name) {
+        return Err(Error::corrupt(
+            "restore member order does not end at the selected image",
+        ));
+    }
+    if let Some(expected) = expected_members
+        && (expected.is_empty()
+            || expected
+                .iter()
+                .map(|member| member.file_name.as_str())
+                .ne(selected_names.iter().map(String::as_str)))
+    {
+        return Err(Error::corrupt(
+            "restore token does not bind the selected member order; prepare again",
+        ));
+    }
+
+    let before =
+        selected_member_identities(destination, set, image_name, selected_names, whole_disk)?;
+    if expected_members.is_some_and(|expected| expected != before.as_slice()) {
+        return Err(Error::corrupt(
+            "restore chain metadata changed since prepare; prepare the restore again",
+        ));
+    }
+
+    let verify_members = chain_files_from_identities(&before);
+    verification.context.check_cancel()?;
+    let report = crate::verify::verify_members_in_set(
+        destination,
+        set,
+        image_name,
+        &verify_members,
+        verification,
+    )?;
+    report.ensure_complete_recovery()?;
+
+    let after =
+        selected_member_identities(destination, set, image_name, selected_names, whole_disk)?;
+    if after != before || expected_members.is_some_and(|expected| expected != after.as_slice()) {
+        return Err(Error::corrupt(
+            "restore chain metadata changed during verification; prepare the restore again",
+        ));
+    }
+    Ok(after)
+}
+
+pub(crate) fn chain_files_from_identities(
+    members: &[RestoreMemberIdentity],
+) -> Vec<crate::chain::ChainMemberFile> {
+    members
+        .iter()
+        .map(|member| crate::chain::ChainMemberFile {
+            file_name: member.file_name.clone(),
+            seq_in_chain: member.seq_in_chain,
+            image_uuid: member.image_uuid,
+        })
+        .collect()
+}
+
+pub(crate) fn validate_selected_members_current(
+    destination: &dyn lr_store::Destination,
+    set: &lr_store::SetHandle,
+    image_name: &str,
+    selected_names: &[String],
+    expected: &[RestoreMemberIdentity],
+    whole_disk: bool,
+) -> Result<()> {
+    let current =
+        selected_member_identities(destination, set, image_name, selected_names, whole_disk)?;
+    if current != expected {
+        return Err(Error::corrupt(
+            "restore chain metadata changed after verification; prepare the restore again",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_open_chain_members(
+    destination: &dyn lr_store::Destination,
+    set: &lr_store::SetHandle,
+    opened: &[crate::chain::OpenMember],
+    expected: &[RestoreMemberIdentity],
+) -> Result<()> {
+    if opened.len() != expected.len() {
+        return Err(Error::corrupt(
+            "the opened restore chain has a different number of members",
+        ));
+    }
+    for (member, expected) in opened.iter().zip(expected) {
+        let superblock = &member.superblock;
+        if member.file_name != expected.file_name
+            || member.seq_in_chain != expected.seq_in_chain
+            || member.image_uuid != expected.image_uuid
+            || superblock.chain_id != expected.chain_id
+            || superblock.set_id != expected.set_id
+            || superblock.parent_uuid != expected.parent_uuid
+            || superblock.image_kind != expected.image_kind
+            || RestoreMemberIdentity::read(destination, set, &member.file_name)? != *expected
+        {
+            return Err(Error::corrupt(format!(
+                "{} no longer matches the prepared restore member",
+                member.file_name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn selected_member_identities(
+    destination: &dyn lr_store::Destination,
+    set: &lr_store::SetHandle,
+    image_name: &str,
+    selected_names: &[String],
+    whole_disk: bool,
+) -> Result<Vec<RestoreMemberIdentity>> {
+    if whole_disk {
+        if selected_names.len() != 1 || selected_names[0] != image_name {
+            return Err(Error::corrupt(
+                "a whole-disk restore must select exactly its named image",
+            ));
+        }
+        return Ok(vec![RestoreMemberIdentity::read(
+            destination,
+            set,
+            image_name,
+        )?]);
+    }
+
+    let resolved = crate::chain::resolve_chain(destination, set, image_name)?;
+    let resolved_names: Vec<&str> = resolved
+        .iter()
+        .map(|member| member.file_name.as_str())
+        .collect();
+    let selected_names: Vec<&str> = selected_names.iter().map(String::as_str).collect();
+    if resolved_names != selected_names {
+        return Err(Error::corrupt(
+            "the resolved restore chain differs from the prepared member order; prepare again",
+        ));
+    }
+    resolved
+        .iter()
+        .map(|member| RestoreMemberIdentity::read(destination, set, &member.file_name))
+        .collect()
+}
+
 /// Build the restore plan and token for one image and target.
 ///
 /// The image may be one member of a chain: every ancestor is resolved from the
@@ -616,15 +858,28 @@ pub fn prepare_restore_as(request: &PrepareRequest, uid: u32) -> Result<RestoreP
 
     // A whole-disk image is always a full image; block and stream images may be
     // chain members, and applying one needs every ancestor.
-    let members: Vec<String> = if superblock.is_whole_disk() {
+    let (members, chain_members): (Vec<String>, Vec<RestoreMemberIdentity>) = if superblock
+        .is_whole_disk()
+    {
         // The whole manifest is read and validated before a token exists:
         // a malformed manifest or a recorded bad sector is refused here
         // (R24, R26).
         let summary = crate::plan::whole_disk(&mut reader, &keys.meta_key, &superblock)?;
         crate::plan::refuse_bad_sectors(&summary)?;
-        vec![location.name.clone()]
+        (
+            vec![location.name.clone()],
+            vec![RestoreMemberIdentity::read(
+                &*destination,
+                &set,
+                &location.name,
+            )?],
+        )
     } else {
         let files = crate::chain::resolve_chain(&*destination, &set, &location.name)?;
+        let chain_members = files
+            .iter()
+            .map(|file| RestoreMemberIdentity::read(&*destination, &set, &file.file_name))
+            .collect::<Result<Vec<_>>>()?;
         // Open and authenticate every member now: a missing or damaged
         // ancestor must fail before a token is issued.
         let validated = crate::chain::open_chain(&*destination, &set, &files, &request.encryption)?;
@@ -659,7 +914,10 @@ pub fn prepare_restore_as(request: &PrepareRequest, uid: u32) -> Result<RestoreP
                 }
             }
         }
-        files.into_iter().map(|file| file.file_name).collect()
+        (
+            files.into_iter().map(|file| file.file_name).collect(),
+            chain_members,
+        )
     };
 
     // File mode restores into an existing directory: the space check is about
@@ -767,6 +1025,7 @@ pub fn prepare_restore_as(request: &PrepareRequest, uid: u32) -> Result<RestoreP
         request.ttl,
         uid,
     )?
+    .with_chain_members(chain_members)?
     .with_strict_metadata(request.strict_metadata)?;
 
     Ok(RestorePlan {
@@ -886,9 +1145,10 @@ pub fn apply_restore(request: &ApplyRequest) -> Result<RestoreOutcome> {
     apply_restore_as(request, lr_unsafe::effective_uid())
 }
 
-/// [`apply_restore`] on behalf of `uid`, which must be the user who prepared
-/// the token; the token is used up by the first apply that passes its checks
-/// (A11).
+/// [`apply_restore`] on behalf of `uid`, who must have prepared the token.
+/// The token is validated and consumed after the target claim and identity
+/// checks admit an apply; later source verification and restore work may
+/// continue past its expiry (A11).
 ///
 /// # Errors
 /// As [`apply_restore`], plus [`Error::Denied`] for another user and
@@ -919,25 +1179,31 @@ pub fn apply_restore_as(request: &ApplyRequest, uid: u32) -> Result<RestoreOutco
         if !current.matches(expected) {
             return Err(Error::TargetChanged);
         }
+        request.context.check_cancel()?;
+        token.verify()?;
         token.redeem(uid)?;
         let chain = if token.chain.is_empty() {
             vec![token.image.clone()]
         } else {
             token.chain.clone()
         };
-        let report = crate::file::restore_file(&crate::file::FileRestoreRequest {
-            dest: token.dest.clone(),
-            set: token.set.clone(),
-            images: chain,
-            destination_options: token.destination_options(),
-            target: token.target_path.clone(),
-            encryption: request.encryption.clone(),
-            confirm: true,
-            accept_inconsistent: request.accept_inconsistent,
-            merge: token.merge,
-            strict_metadata: token.strict_metadata,
-            context: request.context.clone(),
-        })?;
+        let report = crate::file::restore_file_for_apply(
+            &crate::file::FileRestoreRequest {
+                dest: token.dest.clone(),
+                set: token.set.clone(),
+                images: chain,
+                destination_options: token.destination_options(),
+                target: token.target_path.clone(),
+                encryption: request.encryption.clone(),
+                confirm: true,
+                accept_inconsistent: request.accept_inconsistent,
+                merge: token.merge,
+                strict_metadata: token.strict_metadata,
+                context: request.context.clone(),
+            },
+            expected,
+            &token.chain_members,
+        )?;
         return Ok(RestoreOutcome::File(report));
     }
     if superblock.is_inconsistent() && !request.accept_inconsistent {
@@ -957,13 +1223,6 @@ pub fn apply_restore_as(request: &ApplyRequest, uid: u32) -> Result<RestoreOutco
         return Err(Error::TargetChanged);
     }
     crate::target::preflight_target(&token.target_path)?;
-    token.redeem(uid)?;
-
-    let mut reporter = request
-        .context
-        .clone()
-        .reporter(superblock.source_size_bytes)?;
-    reporter.phase("restore");
 
     let chain = if token.chain.is_empty() {
         vec![token.image.clone()]
@@ -971,9 +1230,60 @@ pub fn apply_restore_as(request: &ApplyRequest, uid: u32) -> Result<RestoreOutco
         token.chain.clone()
     };
 
+    let mut reporter = request
+        .context
+        .clone()
+        .reporter(superblock.source_size_bytes)?;
+    request.context.check_cancel()?;
+    token.verify()?;
+    token.redeem(uid)?;
+
+    if superblock.image_kind == ImageKind::Block {
+        // Verify every payload needed for the selected recovery point while
+        // the claimed target stays protected.
+        verify_selected_payloads(
+            &*destination,
+            &set,
+            &SelectedPayloadRequest {
+                image_name: &token.image,
+                selected_names: &chain,
+                expected_members: Some(&token.chain_members),
+                whole_disk: superblock.is_whole_disk(),
+                verification: crate::verify::VerifyRequest {
+                    image: token.image.clone(),
+                    encryption: request.encryption.clone(),
+                    chain: false,
+                    destination_options: token.destination_options(),
+                    context: request.context.clone(),
+                },
+            },
+        )?;
+
+        // Verification may take a long time. Recheck cancellation and target
+        // identity immediately before the first possible mutation. Expiry is
+        // an admission bound and is not re-applied to an admitted operation.
+        request.context.check_cancel()?;
+        let current = TargetFacts::read(&token.target_path)?;
+        if !current.matches(&token.target) || target.device_id()? != current.dev_id {
+            return Err(Error::TargetChanged);
+        }
+        crate::target::preflight_target(&token.target_path)?;
+        request.context.check_cancel()?;
+        reporter.phase("restore");
+    }
+
     if superblock.is_whole_disk() {
         // A whole-disk restore reads manifests and chunks at the same time, so
         // it needs its own second handle.
+        validate_selected_members_current(
+            &*destination,
+            &set,
+            &token.image,
+            &chain,
+            &token.chain_members,
+            true,
+        )?;
+        request.context.check_cancel()?;
         let mut chunks = reader.chunk_reader_with(destination.open_ro(&set, &token.image)?);
         return write_image(
             &mut reader,
@@ -992,18 +1302,22 @@ pub fn apply_restore_as(request: &ApplyRequest, uid: u32) -> Result<RestoreOutco
         // its own exclusive claim, so ours is released just before; the
         // stream restore claims the device again before formatting.
         drop(target);
-        let report = crate::stream::restore_stream(&crate::stream::StreamRestoreRequest {
-            dest: token.dest.clone(),
-            set: token.set.clone(),
-            images: chain,
-            destination_options: token.destination_options(),
-            target: token.target_path.clone(),
-            encryption: request.encryption.clone(),
-            mount_root: PathBuf::from("/run/linuxreflect"),
-            confirm: true,
-            accept_inconsistent: request.accept_inconsistent,
-            context: request.context.clone(),
-        })?;
+        let report = crate::stream::restore_stream_for_apply(
+            &crate::stream::StreamRestoreRequest {
+                dest: token.dest.clone(),
+                set: token.set.clone(),
+                images: chain,
+                destination_options: token.destination_options(),
+                target: token.target_path.clone(),
+                encryption: request.encryption.clone(),
+                mount_root: PathBuf::from("/run/linuxreflect"),
+                confirm: true,
+                accept_inconsistent: request.accept_inconsistent,
+                context: request.context.clone(),
+            },
+            &token.target,
+            &token.chain_members,
+        )?;
         return Ok(RestoreOutcome::Stream(report));
     }
 
@@ -1023,6 +1337,8 @@ pub fn apply_restore_as(request: &ApplyRequest, uid: u32) -> Result<RestoreOutco
     let checked = crate::chain::open_chain(&*destination, &set, &files, &request.encryption)?;
     crate::plan::refuse_bad_sectors(&crate::plan::block_chain(checked, &superblock)?)?;
     let members = crate::chain::open_chain(&*destination, &set, &files, &request.encryption)?;
+    validate_open_chain_members(&*destination, &set, &members, &token.chain_members)?;
+    request.context.check_cancel()?;
     write_block_chain(members, &superblock, &token, target, &mut reporter)
         .map(RestoreOutcome::Block)
 }

@@ -179,6 +179,74 @@ fn request(source: &Path, dest: &Path) -> BackupRequest {
 }
 
 #[test]
+fn late_whole_disk_corruption_does_not_overwrite_the_target() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = dir.path().join("source.img");
+    if !build_disk(&source) {
+        return;
+    }
+    let ImageReport::WholeDisk(backup) =
+        backup_image(&request(&source, &dir.path().join("out"))).expect("backup")
+    else {
+        panic!("expected a whole-disk backup");
+    };
+
+    let target = dir.path().join("target.img");
+    let sentinel = vec![0xa5; 64 * 1024];
+    let mut output = std::fs::File::create(&target).expect("target");
+    for _ in 0..SRC_SIZE / sentinel.len() as u64 {
+        output.write_all(&sentinel).expect("fill target");
+    }
+    output.sync_all().expect("sync target");
+    drop(output);
+    let plan = prepare_restore(&PrepareRequest::from_path(
+        &backup.image_path,
+        &target,
+        Encryption::NoEncrypt,
+    ))
+    .expect("prepare intact image");
+
+    // Leave all framing and metadata intact; corrupt the last stored payload.
+    // Without preverification, the earlier disk regions have already been
+    // written when restore reaches this record.
+    let mut reader =
+        lr_format::ImageReader::open(std::fs::File::open(&backup.image_path).expect("image"))
+            .expect("reader");
+    let end = reader.footer().data_end_offset;
+    let mut offset = lr_format::SB_SIZE as u64;
+    let mut last = None;
+    let mut count = 0;
+    while offset < end {
+        let record = reader.read_chunk_record(offset).expect("record");
+        last = Some(offset);
+        count += 1;
+        offset += record.len() as u64;
+    }
+    assert!(count > 1, "the fixture must have earlier valid payloads");
+    assert_eq!(offset, end);
+    let payload = last.expect("last chunk") + lr_format::chunk::CHUNK_HEADER_LEN as u64;
+    let original = read_at(&backup.image_path, payload, 1)[0];
+    write_at(&backup.image_path, payload, &[original ^ 1]);
+
+    let error = apply_restore(&ApplyRequest {
+        token: plan.token,
+        confirm: true,
+        accept_inconsistent: false,
+        encryption: Encryption::NoEncrypt,
+        context: lr_engine::progress::EngineContext::silent(),
+    })
+    .expect_err("corrupt payload must fail before writing");
+    assert!(matches!(error, lr_core::Error::Corrupt { .. }), "{error}");
+    let mut output = std::fs::File::open(&target).expect("target");
+    let mut block = vec![0; sentinel.len()];
+    for _ in 0..SRC_SIZE / block.len() as u64 {
+        output.read_exact(&mut block).expect("read target");
+        assert_eq!(block, sentinel, "restore changed the target");
+    }
+    assert_eq!(output.metadata().expect("stat target").len(), SRC_SIZE);
+}
+
+#[test]
 fn a_whole_disk_image_round_trips_to_a_larger_disk() {
     let dir = tempfile::tempdir().expect("tempdir");
     let source = dir.path().join("source.img");

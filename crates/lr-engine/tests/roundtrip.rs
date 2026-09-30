@@ -522,3 +522,183 @@ fn a_cancelled_backup_leaves_no_spool_or_temporary_file() {
     let leftovers = files_ending(&dest, &[".spool", ".tmp"]);
     assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
 }
+
+/// Corruption and cancellation during preverification leave the target
+/// untouched and consume the already-admitted one-use token.
+#[test]
+fn a_corrupt_payload_is_rejected_before_the_target_changes() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = dir.path().join("source.img");
+    if !make_ext4(&source, &backups()) {
+        return;
+    }
+    let backup =
+        backup_block_full(&request(&source, dir.path(), Encryption::NoEncrypt)).expect("backup");
+    let target = dir.path().join("target.img");
+    {
+        let mut file = std::fs::File::create(&target).expect("create target");
+        let block = vec![0xa5; 64 * 1024];
+        for _ in 0..(DEVICE_SIZE as usize / block.len()) {
+            file.write_all(&block).expect("fill target");
+        }
+        file.sync_all().expect("sync target");
+    }
+
+    let plan = prepare_restore(&PrepareRequest::from_path(
+        &backup.image_path,
+        &target,
+        Encryption::NoEncrypt,
+    ))
+    .expect("prepare before corruption");
+
+    // Corrupt the payload of the last physical chunk record so an unverified
+    // restore would first write earlier valid chunks to this target.
+    let payload_offset = last_chunk_payload_offset(&backup.image_path);
+    assert!(payload_offset > lr_format::SB_SIZE as u64 + lr_format::CHUNK_HEADER_LEN as u64);
+    let mut image = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&backup.image_path)
+        .expect("open image");
+    image
+        .seek(SeekFrom::Start(payload_offset))
+        .expect("seek payload");
+    let mut original = [0u8; 1];
+    image.read_exact(&mut original).expect("read payload byte");
+    image.seek(SeekFrom::Start(payload_offset)).expect("rewind");
+    image
+        .write_all(&[original[0] ^ 1])
+        .expect("corrupt payload");
+    image.sync_all().expect("sync corrupt image");
+
+    let error = apply_restore(&ApplyRequest {
+        token: plan.token.clone(),
+        confirm: true,
+        accept_inconsistent: false,
+        encryption: Encryption::NoEncrypt,
+        context: lr_engine::progress::EngineContext::silent(),
+    })
+    .expect_err("corrupt payload must be rejected");
+    assert!(matches!(error, lr_core::Error::Corrupt { .. }), "{error}");
+
+    assert_file_is_filled(&target, 0xa5);
+
+    image.seek(SeekFrom::Start(payload_offset)).expect("rewind");
+    image.write_all(&original).expect("restore payload byte");
+    image.sync_all().expect("sync restored image");
+    let replay = apply_restore(&ApplyRequest {
+        token: plan.token,
+        confirm: true,
+        accept_inconsistent: false,
+        encryption: Encryption::NoEncrypt,
+        context: lr_engine::progress::EngineContext::silent(),
+    })
+    .expect_err("failed source verification still consumes the admitted token");
+    assert!(matches!(replay, lr_core::Error::Corrupt { .. }), "{replay}");
+
+    let cancelled_plan = prepare_restore(&PrepareRequest::from_path(
+        &backup.image_path,
+        &target,
+        Encryption::NoEncrypt,
+    ))
+    .expect("prepare for cancellation");
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let context = lr_engine::progress::EngineContext {
+        progress: Some(std::sync::Arc::new(CancelOnRestoreVerify(cancel.clone()))),
+        cancel: Some(cancel),
+    };
+    let cancelled = apply_restore(&ApplyRequest {
+        token: cancelled_plan.token.clone(),
+        confirm: true,
+        accept_inconsistent: false,
+        encryption: Encryption::NoEncrypt,
+        context,
+    })
+    .expect_err("cancellation during payload verification must stop apply");
+    assert!(
+        matches!(cancelled, lr_core::Error::Cancelled),
+        "{cancelled}"
+    );
+    assert_file_is_filled(&target, 0xa5);
+
+    let replay = apply_restore(&ApplyRequest {
+        token: cancelled_plan.token,
+        confirm: true,
+        accept_inconsistent: false,
+        encryption: Encryption::NoEncrypt,
+        context: lr_engine::progress::EngineContext::silent(),
+    })
+    .expect_err("a cancelled admitted apply must not be replayed");
+    assert!(matches!(replay, lr_core::Error::Corrupt { .. }), "{replay}");
+
+    let fresh_plan = prepare_restore(&PrepareRequest::from_path(
+        &backup.image_path,
+        &target,
+        Encryption::NoEncrypt,
+    ))
+    .expect("prepare after the failed attempts");
+    apply_restore(&ApplyRequest {
+        token: fresh_plan.token,
+        confirm: true,
+        accept_inconsistent: false,
+        encryption: Encryption::NoEncrypt,
+        context: lr_engine::progress::EngineContext::silent(),
+    })
+    .expect("a fresh token can apply the verified image");
+}
+
+fn assert_file_is_filled(path: &Path, expected: u8) {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path).expect("open target");
+    let mut block = vec![0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut block).expect("read target");
+        if read == 0 {
+            break;
+        }
+        assert!(
+            block[..read].iter().all(|byte| *byte == expected),
+            "preverification failure must leave every target byte untouched"
+        );
+    }
+}
+
+fn last_chunk_payload_offset(path: &Path) -> u64 {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let image = lr_format::ImageReader::open(std::fs::File::open(path).expect("open image"))
+        .expect("read image footer");
+    let data_end = image.footer().data_end_offset;
+    let mut file = std::fs::File::open(path).expect("open chunk region");
+    let mut offset = lr_format::SB_SIZE as u64;
+    let mut last_payload = None;
+    let mut records = 0u64;
+    while offset < data_end {
+        file.seek(SeekFrom::Start(offset))
+            .expect("seek chunk header");
+        let mut bytes = [0u8; lr_format::CHUNK_HEADER_LEN];
+        file.read_exact(&mut bytes).expect("read chunk header");
+        let header = lr_format::decode_header(&bytes).expect("decode chunk header");
+        last_payload = Some(offset + lr_format::CHUNK_HEADER_LEN as u64);
+        offset += header.total_len() as u64;
+        records += 1;
+    }
+    assert_eq!(offset, data_end, "chunk records cover the chunk region");
+    assert!(records > 1, "fixture contains earlier valid chunk records");
+    last_payload.expect("at least one chunk record")
+}
+
+struct CancelOnRestoreVerify(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl lr_engine::progress::ProgressSink for CancelOnRestoreVerify {
+    fn phase(&self, name: &str) {
+        if name == "content" {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn bytes(&self, _done: u64, _total: u64) {}
+}

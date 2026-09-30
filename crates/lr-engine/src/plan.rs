@@ -736,4 +736,107 @@ mod tests {
             }
         }
     }
+
+    /// Payload corruption and cancellation both stop a public Stream restore
+    /// before it reaches `mkfs.btrfs` or creates a mountpoint.
+    #[test]
+    fn stream_restore_preverifies_payload_before_formatting() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let work = tempfile::tempdir().expect("work directory");
+        let set = work.path().join("set");
+        std::fs::create_dir_all(set.join("chain")).expect("chain directory");
+        let image = set.join("chain/000-full.lrimg");
+        write_stream_image(&image, true);
+
+        let payload_offset = lr_format::SB_SIZE as u64 + lr_format::CHUNK_HEADER_LEN as u64;
+        let mut image_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&image)
+            .expect("open stream image");
+        image_file
+            .seek(SeekFrom::Start(payload_offset))
+            .expect("seek payload");
+        let mut original = [0u8; 1];
+        image_file
+            .read_exact(&mut original)
+            .expect("read payload byte");
+        image_file
+            .seek(SeekFrom::Start(payload_offset))
+            .expect("rewind payload");
+        image_file
+            .write_all(&[original[0] ^ 0xFF])
+            .expect("corrupt payload");
+        image_file.sync_all().expect("sync corruption");
+
+        let target = work.path().join("target.img");
+        let target_bytes = vec![0xA5; 4 * 1024 * 1024];
+        std::fs::write(&target, &target_bytes).expect("create sentinel target");
+        let mount_root = work.path().join("mount-root");
+        let request = |context| crate::stream::StreamRestoreRequest {
+            dest: work.path().to_string_lossy().into_owned(),
+            set: "set".to_owned(),
+            images: vec!["chain/000-full.lrimg".to_owned()],
+            destination_options: lr_store::DestinationOptions::new("set"),
+            target: target.clone(),
+            encryption: Encryption::NoEncrypt,
+            mount_root: mount_root.clone(),
+            confirm: true,
+            accept_inconsistent: false,
+            context,
+        };
+
+        let error =
+            crate::stream::restore_stream(&request(crate::progress::EngineContext::silent()))
+                .expect_err("corrupt Stream payload must fail before formatting");
+        let message = format!("{error}");
+        assert!(
+            matches!(&error, lr_core::Error::Corrupt { .. }),
+            "expected payload corruption, got {message}"
+        );
+        assert!(
+            message.contains("chunk") || message.contains("payload"),
+            "expected a payload-specific error, got {message}"
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("sentinel remains"),
+            target_bytes
+        );
+        assert!(
+            !mount_root.exists(),
+            "verification did not create a mountpoint"
+        );
+
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let context = crate::progress::EngineContext {
+            progress: Some(std::sync::Arc::new(CancelOnStreamContent(
+                cancelled.clone(),
+            ))),
+            cancel: Some(cancelled),
+        };
+        let error = crate::stream::restore_stream(&request(context))
+            .expect_err("cancellation during payload verification stops formatting");
+        assert!(matches!(error, lr_core::Error::Cancelled), "{error}");
+        assert_eq!(
+            std::fs::read(&target).expect("sentinel remains after cancellation"),
+            target_bytes
+        );
+        assert!(
+            !mount_root.exists(),
+            "cancellation did not create a mountpoint"
+        );
+    }
+
+    struct CancelOnStreamContent(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl crate::progress::ProgressSink for CancelOnStreamContent {
+        fn phase(&self, name: &str) {
+            if name == "content" {
+                self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        fn bytes(&self, _done: u64, _total: u64) {}
+    }
 }

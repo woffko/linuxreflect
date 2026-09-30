@@ -1703,3 +1703,23 @@ rule; CLI and daemon adapters call it. Clearing requires removing and recreating
 the named entry. Nested or ambiguously stacked mounts and non-root mount
 projections are refused. Matching source/type is not a persistent mount ID, and
 the check/use interval remains a limitation of this first implementation.
+
+## D-127 — Restore checks required payloads before destructive work
+
+Restore apply must verify the selected recovery point's required payloads before
+target writes, file-tree mutation or formatting, not only authenticate manifests
+at prepare time. The selected members must agree with the approved restore.
+Confirmation, caller binding, token expiry and single use, target revalidation,
+and integrity checking while writing remain in force. This adds a read pass;
+it must not buffer the whole image or duplicate a large file tree.
+
+Token expiry bounds admission to the operation, not the duration of its I/O.
+After initial target validation, apply redeems the valid token before the long
+read pass. A failed or cancelled preverification therefore consumes the token;
+retry requires a new prepare. An admitted operation still checks cancellation
+and live target facts before mutation, but a verification longer than ten
+minutes does not require extending the token lifetime.
+
+The check detects corruption already present before destructive work. It does
+not make mutable storage immutable, eliminate later I/O failures, or make a
+restore transactional. An interrupted restore can leave a partial target.

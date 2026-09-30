@@ -198,24 +198,31 @@ pub(crate) fn verify_in_set(
     name: &str,
     request: &VerifyRequest,
 ) -> Result<VerifyReport> {
-    let location = uri::ImageLocation {
-        dest: String::new(),
-        set: String::new(),
-        name: name.to_owned(),
-    };
-    let target = crate::chain::read_superblock(destination, set, &location.name)?;
-
     // The image's whole ancestry is always opened: a non-full member's
     // recovery point needs the payloads it inherits (R23). `--chain`
     // additionally reads every payload every member stores, including
     // superseded ones, which are recovery points of older members (R22).
-    let members = crate::chain::resolve_chain(destination, set, &location.name)?;
-    if members.last().map(|member| member.file_name.as_str()) != Some(location.name.as_str()) {
+    let members = crate::chain::resolve_chain(destination, set, name)?;
+    verify_members_in_set(destination, set, name, &members, request)
+}
+
+/// Verify an already selected member order without resolving another chain.
+/// The caller owns selection/identity validation; ordinary verification resolves
+/// above, while restore compares these names and superblocks to its token.
+/// Files remain mutable: this is not a lease or a snapshot of their contents.
+pub(crate) fn verify_members_in_set(
+    destination: &dyn Destination,
+    set: &SetHandle,
+    name: &str,
+    members: &[crate::chain::ChainMemberFile],
+    request: &VerifyRequest,
+) -> Result<VerifyReport> {
+    if members.last().map(|member| member.file_name.as_str()) != Some(name) {
         return Err(Error::corrupt(format!(
-            "{} is not part of its own chain",
-            location.name
+            "{name} is not the last member of the selected chain"
         )));
     }
+    let target = crate::chain::read_superblock(destination, set, name)?;
     let every_member = request.chain;
 
     let mut reporter = request.context.clone().reporter(0)?;
@@ -233,7 +240,8 @@ pub(crate) fn verify_in_set(
     };
 
     // 1. Structure, MACs and page tags, member by member.
-    for member in &members {
+    for member in members {
+        request.context.check_cancel()?;
         let superblock = crate::chain::read_superblock(destination, set, &member.file_name)?;
         let keys = keys::unlock_image(&request.encryption, &superblock)?;
         let encrypted = superblock.is_encrypted();
@@ -259,13 +267,15 @@ pub(crate) fn verify_in_set(
 
     // 2. Content: every stored chunk's plaintext must hash to the manifest.
     reporter.phase("content");
+    request.context.check_cancel()?;
     match target.image_kind {
         ImageKind::Block if target.is_whole_disk() => {
             verify_whole_disk(
                 destination,
                 set,
-                &location.name,
+                name,
                 &request.encryption,
+                &mut reporter,
                 &mut report,
             )?;
         }
@@ -273,7 +283,7 @@ pub(crate) fn verify_in_set(
             verify_block_chain(
                 destination,
                 set,
-                &members,
+                members,
                 &request.encryption,
                 every_member,
                 &mut reporter,
@@ -284,7 +294,7 @@ pub(crate) fn verify_in_set(
             // Stream members carry their own payloads; one recovery point is
             // its own member's streams.
             let own = if every_member {
-                &members[..]
+                members
             } else {
                 &members[members.len() - 1..]
             };
@@ -301,7 +311,7 @@ pub(crate) fn verify_in_set(
             verify_file(
                 destination,
                 set,
-                &members,
+                members,
                 &request.encryption,
                 every_member,
                 &mut reporter,
@@ -310,6 +320,7 @@ pub(crate) fn verify_in_set(
         }
     }
 
+    request.context.check_cancel()?;
     reporter.finish(report.chunks);
     Ok(report)
 }
@@ -580,6 +591,7 @@ fn verify_whole_disk(
     set: &SetHandle,
     name: &str,
     encryption: &Encryption,
+    reporter: &mut crate::progress::Reporter,
     report: &mut VerifyReport,
 ) -> Result<()> {
     let mut reader = ImageReader::open(destination.open_ro(set, name)?)?;
@@ -599,21 +611,9 @@ fn verify_whole_disk(
     let chunk_size = u64::from(superblock.chunk_size);
     let mut chunks = reader.chunk_reader_with(destination.open_ro(set, name)?);
 
-    let mut manifest = Vec::new();
-    {
-        let mut page = reader.stream_reader(StreamId::Manifest, *keys.meta_key, kind)?;
-        let mut buffer = vec![0u8; 64 * 1024];
-        loop {
-            let read = page.read_bytes_partial(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            manifest.extend_from_slice(&buffer[..read]);
-        }
-    }
-    let mut cursor = std::io::Cursor::new(manifest.as_slice());
+    let manifest = reader.stream_reader(StreamId::Manifest, *keys.meta_key, kind)?;
+    let mut wire = wire::Reader::new(manifest);
     let disk_header = {
-        let mut wire = wire::Reader::new(&mut cursor);
         let header = DiskHeader::read(&mut wire)?;
         header.validate()?;
         header
@@ -622,9 +622,9 @@ fn verify_whole_disk(
         if !region.has_manifest() {
             continue;
         }
-        let mut wire = wire::Reader::new(&mut cursor);
         let (header, _delta) = BlockManifestHeader::read(&mut wire)?;
         for index in 0..header.entry_count {
+            reporter.report(report.bytes_checked)?;
             let entry = BlockEntry::read(&mut wire)?;
             if !entry.is_stored() {
                 continue;
