@@ -1287,6 +1287,9 @@ fn destination(
             uri,
             identity,
             known_hosts,
+            required_mount,
+            required_source,
+            required_fs_type,
         } => DestinationChange::Set(lr_proto::v1::NamedDestination {
             name: name.clone(),
             uri: uri.clone(),
@@ -1298,6 +1301,17 @@ fn destination(
                 .as_ref()
                 .map(|path| path.display().to_string())
                 .unwrap_or_default(),
+            required_mount: match (required_mount, required_source, required_fs_type) {
+                (Some(path), Some(source), Some(fs_type)) => Some(lr_proto::v1::RequiredMount {
+                    path: path.display().to_string(),
+                    source: source.clone(),
+                    fs_type: fs_type.clone(),
+                }),
+                (None, None, None) => None,
+                _ => bail!(
+                    "--required-mount, --required-source, and --required-fs-type must be supplied together"
+                ),
+            },
         }),
         DestinationCommand::Remove { name } => DestinationChange::Remove(name.clone()),
     };
@@ -1314,6 +1328,13 @@ fn destination(
                 identity: (!entry.identity.is_empty()).then(|| PathBuf::from(entry.identity)),
                 known_hosts: (!entry.known_hosts.is_empty())
                     .then(|| PathBuf::from(entry.known_hosts)),
+                required_mount: entry
+                    .required_mount
+                    .map(|required| lr_store::RequiredMount {
+                        path: PathBuf::from(required.path),
+                        source: required.source,
+                        fs_type: required.fs_type,
+                    }),
             })
             .collect()
     } else {
@@ -1328,11 +1349,15 @@ fn destination(
                     identity: (!entry.identity.is_empty()).then(|| PathBuf::from(entry.identity)),
                     known_hosts: (!entry.known_hosts.is_empty())
                         .then(|| PathBuf::from(entry.known_hosts)),
+                    required_mount: entry
+                        .required_mount
+                        .map(|required| lr_store::RequiredMount {
+                            path: PathBuf::from(required.path),
+                            source: required.source,
+                            fs_type: required.fs_type,
+                        }),
                 };
-                lr_store::named::validate(&entry)?;
-                entries.retain(|existing| existing.name != entry.name);
-                entries.push(entry);
-                entries.sort_by(|left, right| left.name.cmp(&right.name));
+                lr_store::named::upsert(&mut entries, entry)?;
                 lr_store::named::save(&path, &entries)?;
             }
             DestinationChange::Remove(name) => {
@@ -1354,7 +1379,18 @@ fn destination(
         println!("no destinations are configured");
     }
     for entry in &entries {
-        println!("@{:<16} {}", entry.name, entry.uri);
+        if let Some(required_mount) = &entry.required_mount {
+            println!(
+                "@{:<16} {} (requires {} source {} on {})",
+                entry.name,
+                entry.uri,
+                required_mount.fs_type,
+                required_mount.source,
+                required_mount.path.display()
+            );
+        } else {
+            println!("@{:<16} {}", entry.name, entry.uri);
+        }
     }
     Ok(())
 }

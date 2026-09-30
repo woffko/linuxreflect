@@ -883,6 +883,68 @@ async fn a_named_destination_is_used_by_name() {
         .into_inner();
     assert_eq!(sets.sets, ["named"]);
 
+    let required_mount = lr_proto::v1::RequiredMount {
+        path: "/mnt/linuxreflect-test".to_owned(),
+        source: "test-nas:/exports/backups".to_owned(),
+        fs_type: "nfs4".to_owned(),
+    };
+    let list = client
+        .set_destination(lr_proto::v1::NamedDestination {
+            name: "mounted-shelf".to_owned(),
+            uri: work.path().join("mounted-backups").display().to_string(),
+            required_mount: Some(required_mount.clone()),
+            ..lr_proto::v1::NamedDestination::default()
+        })
+        .await
+        .expect("configure mount policy")
+        .into_inner();
+    assert_eq!(
+        list.destinations
+            .iter()
+            .find(|entry| entry.name == "mounted-shelf")
+            .and_then(|entry| entry.required_mount.as_ref()),
+        Some(&required_mount)
+    );
+    let mut edited = client
+        .list_destinations(lr_proto::v1::Request::default())
+        .await
+        .expect("list configured destinations")
+        .into_inner()
+        .destinations
+        .into_iter()
+        .find(|entry| entry.name == "mounted-shelf")
+        .expect("mounted destination");
+    edited.uri = work
+        .path()
+        .join("mounted-backups-updated")
+        .display()
+        .to_string();
+    // An older client omits the optional field when it edits unrelated
+    // destination data; that must not clear the configured guard.
+    edited.required_mount = None;
+    let list = client
+        .set_destination(edited)
+        .await
+        .expect("edit destination without mount field")
+        .into_inner();
+    assert_eq!(
+        list.destinations
+            .iter()
+            .find(|entry| entry.name == "mounted-shelf")
+            .and_then(|entry| entry.required_mount.as_ref()),
+        Some(&required_mount),
+        "editing the URI preserves the required mount policy"
+    );
+
+    let list = client
+        .remove_destination(lr_proto::v1::DestinationRef {
+            name: "mounted-shelf".to_owned(),
+        })
+        .await
+        .expect("remove mounted destination")
+        .into_inner();
+    assert_eq!(list.destinations.len(), 1);
+
     let list = client
         .remove_destination(lr_proto::v1::DestinationRef {
             name: "shelf".to_owned(),

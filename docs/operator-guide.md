@@ -72,6 +72,30 @@ names, and an image appears under its final name only after it was flushed
 a vanished server blocks the job in the kernel, and nothing in user space can
 interrupt it (D-113).
 
+**Require a particular mounted share.** An administrator can register a guarded
+local destination (replace these example values with the actual mount):
+
+```sh
+linuxreflect destination add --name archive --uri /mnt/nas/backups \
+    --required-mount /mnt/nas --required-source nas:/exports/backups \
+    --required-fs-type nfs4
+```
+
+Use `--dest @archive` for backups, retention and scheduled jobs. The three
+required fields must match `/proc/self/mountinfo` in the executing process's
+mount namespace. Missing or wrong mounts are refused before directory creation;
+subdirectories of the required mount are supported. Nested/stacked mounts,
+non-root bind projections and paths containing `..` are refused. A raw path
+such as `--dest /mnt/nas/backups` does not inherit a named destination's guard.
+
+The registry stores this under `[destination.required_mount]` with `path`,
+`source` and `fs_type`. Listing destinations shows the guard. Updating a named
+destination without those fields preserves its existing guard; remove and
+recreate the entry to clear it. Checks run before storage operations but do not
+atomically pin the mount, prove server durability, or distinguish every mount
+with identical source/type. Test your actual NFS deployment before relying on
+it (D-126).
+
 **SFTP.** Configure SFTP destinations on the daemon, not per request:
 
 ```sh

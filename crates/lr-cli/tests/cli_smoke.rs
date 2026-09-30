@@ -116,3 +116,80 @@ fn schedule_list_reads_a_config_and_reports_missing_ones() {
     assert_eq!(jobs[0]["job"], "smoke", "{jobs}");
     assert_eq!(jobs[0]["timer_name"], "linuxreflect-job@smoke.timer");
 }
+
+#[test]
+fn destination_add_roundtrips_and_preserves_required_mount() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let registry = dir.path().join("destinations.toml");
+    let mount = dir.path().join("nas");
+    let destination = mount.join("backups");
+    let uri = destination.display().to_string();
+    let mount_arg = mount.display().to_string();
+    let source = "nas:/exports/backups";
+
+    let added = binary()
+        .env("LR_DESTINATIONS_FILE", &registry)
+        .args(["--json", "destination", "add", "--name", "archive", "--uri"])
+        .arg(&uri)
+        .args(["--required-mount", &mount_arg, "--required-source", source])
+        .args(["--required-fs-type", "nfs4"])
+        .output()
+        .expect("add named destination");
+    assert!(
+        added.status.success(),
+        "add failed: {}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&added.stdout).expect("destination add JSON");
+    assert_eq!(value[0]["required_mount"]["path"], mount_arg);
+    assert_eq!(value[0]["required_mount"]["source"], source);
+    assert_eq!(value[0]["required_mount"]["fs_type"], "nfs4");
+
+    let updated = binary()
+        .env("LR_DESTINATIONS_FILE", &registry)
+        .args([
+            "--json",
+            "destination",
+            "add",
+            "--name",
+            "archive",
+            "--uri",
+            "/srv/updated-backups",
+        ])
+        .output()
+        .expect("update named destination without policy field");
+    assert!(
+        updated.status.success(),
+        "update failed: {}",
+        String::from_utf8_lossy(&updated.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&updated.stdout).expect("updated destination JSON");
+    assert_eq!(value[0]["required_mount"]["path"], mount_arg);
+    assert_eq!(value[0]["required_mount"]["source"], source);
+
+    let removed = binary()
+        .env("LR_DESTINATIONS_FILE", &registry)
+        .args(["destination", "remove", "--name", "archive"])
+        .output()
+        .expect("remove named destination");
+    assert!(removed.status.success());
+    let recreated = binary()
+        .env("LR_DESTINATIONS_FILE", &registry)
+        .args([
+            "--json",
+            "destination",
+            "add",
+            "--name",
+            "archive",
+            "--uri",
+            "/srv/unguarded-backups",
+        ])
+        .output()
+        .expect("recreate named destination without policy");
+    assert!(recreated.status.success());
+    let value: serde_json::Value =
+        serde_json::from_slice(&recreated.stdout).expect("recreated destination JSON");
+    assert!(value[0].get("required_mount").is_none());
+}

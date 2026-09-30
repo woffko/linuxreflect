@@ -25,8 +25,8 @@ use std::time::Duration;
 use lr_core::{Error, Result, SetId};
 
 use crate::{
-    Destination, Durability, LockOwner, LockRecord, ReadSeek, SetHandle, SetLock, TempFile,
-    now_unix,
+    Destination, Durability, LockOwner, LockRecord, ReadSeek, RequiredMount, SetHandle, SetLock,
+    TempFile, now_unix,
 };
 
 /// `O_NOFOLLOW`: fail instead of opening a symlink.
@@ -42,6 +42,7 @@ pub const LOCK_FILE: &str = "set.lock";
 pub struct LocalDestination {
     root: PathBuf,
     set_name: String,
+    required_mount: Option<RequiredMount>,
 }
 
 impl LocalDestination {
@@ -51,6 +52,21 @@ impl LocalDestination {
         Self {
             root: root.into(),
             set_name: set_name.into(),
+            required_mount: None,
+        }
+    }
+
+    /// Create a destination that requires `required_mount` before access.
+    #[must_use]
+    pub fn new_with_required_mount(
+        root: impl Into<PathBuf>,
+        set_name: impl Into<String>,
+        required_mount: RequiredMount,
+    ) -> Self {
+        Self {
+            root: root.into(),
+            set_name: set_name.into(),
+            required_mount: Some(required_mount),
         }
     }
 
@@ -64,6 +80,7 @@ impl LocalDestination {
     /// symlink. `create` makes it when it is missing.
     fn set_fd(&self, create: bool) -> Result<OwnedFd> {
         lr_core::validate_set_name(&self.set_name)?;
+        self.check_required_mount_at(&self.set_dir())?;
         if create {
             std::fs::create_dir_all(&self.root).map_err(Error::Io)?;
         }
@@ -74,6 +91,13 @@ impl LocalDestination {
         }
         lr_unsafe::beneath::open_dir_beneath(&root, Path::new(name))
             .map_err(|error| refused(&self.set_dir(), &error))
+    }
+
+    fn check_required_mount_at(&self, path: &Path) -> Result<()> {
+        if let Some(required_mount) = &self.required_mount {
+            required_mount.check_path(path)?;
+        }
+        Ok(())
     }
 
     /// The pinned directory holding `name` and the entry path of `name` in
@@ -87,6 +111,7 @@ impl LocalDestination {
         let Some((file, directories)) = components.split_last() else {
             return Err(Error::unsupported("empty destination name"));
         };
+        self.check_required_mount_at(&self.set_dir().join(name))?;
         let mut dir = self.set_fd(create)?;
         for component in directories {
             if create {
@@ -139,6 +164,7 @@ impl LocalDestination {
     /// # Errors
     /// Propagates I/O errors other than "does not exist".
     pub fn lock_is_stale(&self) -> Result<bool> {
+        self.check_required_mount_at(&self.set_dir())?;
         match read_lock(&self.lock_path())? {
             Some(record) => Ok(record.is_stale(now_unix())),
             None => Ok(false),
@@ -521,7 +547,13 @@ impl Destination for LocalDestination {
             Err(error) => return Err(error),
         };
         let mut found = Vec::new();
-        collect_beneath(&dir, "", &mut found)?;
+        collect_beneath(
+            &dir,
+            &self.set_dir(),
+            "",
+            self.required_mount.as_ref(),
+            &mut found,
+        )?;
         found.sort();
         Ok(found)
     }
@@ -534,6 +566,7 @@ impl Destination for LocalDestination {
     }
 
     fn list_set_names(&self) -> Result<Vec<String>> {
+        self.check_required_mount_at(&self.root)?;
         let entries = match std::fs::read_dir(&self.root) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -551,7 +584,7 @@ impl Destination for LocalDestination {
             };
             let mut files = Vec::new();
             let dir = entry.path();
-            collect_files(&dir, &dir, &mut files)?;
+            collect_files(&dir, &dir, &mut files, self.required_mount.as_ref())?;
             if files.iter().any(|file| file.ends_with(".lrimg")) {
                 names.push(name);
             }
@@ -564,7 +597,17 @@ impl Destination for LocalDestination {
 /// Every regular file below the pinned `dir`, entering subdirectories only
 /// through their own pinned descriptors, so a directory swapped for a symlink
 /// while the listing runs is refused rather than listed.
-fn collect_beneath(dir: &OwnedFd, prefix: &str, found: &mut Vec<String>) -> Result<()> {
+fn collect_beneath(
+    dir: &OwnedFd,
+    set_dir: &Path,
+    prefix: &str,
+    required_mount: Option<&RequiredMount>,
+    found: &mut Vec<String>,
+) -> Result<()> {
+    let at = set_dir.join(prefix);
+    if let Some(required_mount) = required_mount {
+        required_mount.check_path(&at)?;
+    }
     let entries = std::fs::read_dir(lr_unsafe::beneath::self_path(dir)).map_err(Error::Io)?;
     for entry in entries {
         let entry = entry.map_err(Error::Io)?;
@@ -573,9 +616,19 @@ fn collect_beneath(dir: &OwnedFd, prefix: &str, found: &mut Vec<String>) -> Resu
         };
         let file_type = entry.file_type().map_err(Error::Io)?;
         if file_type.is_dir() {
+            let child_path = at.join(&name);
+            if let Some(required_mount) = required_mount {
+                required_mount.check_path(&child_path)?;
+            }
             let sub = lr_unsafe::beneath::open_dir_beneath(dir, Path::new(&name))
                 .map_err(|error| refused(Path::new(&format!("{prefix}{name}")), &error))?;
-            collect_beneath(&sub, &format!("{prefix}{name}/"), found)?;
+            collect_beneath(
+                &sub,
+                set_dir,
+                &format!("{prefix}{name}/"),
+                required_mount,
+                found,
+            )?;
         } else if file_type.is_file() {
             found.push(format!("{prefix}{name}"));
         }
@@ -617,7 +670,15 @@ fn refused(path: &Path, error: &std::io::Error) -> Error {
     ))
 }
 
-fn collect_files(root: &Path, at: &Path, found: &mut Vec<String>) -> Result<()> {
+fn collect_files(
+    root: &Path,
+    at: &Path,
+    found: &mut Vec<String>,
+    required_mount: Option<&RequiredMount>,
+) -> Result<()> {
+    if let Some(required_mount) = required_mount {
+        required_mount.check_path(at)?;
+    }
     let entries = match std::fs::read_dir(at) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -628,7 +689,7 @@ fn collect_files(root: &Path, at: &Path, found: &mut Vec<String>) -> Result<()> 
         let path = entry.path();
         let file_type = entry.file_type().map_err(Error::Io)?;
         if file_type.is_dir() {
-            collect_files(root, &path, found)?;
+            collect_files(root, &path, found, required_mount)?;
         } else if file_type.is_file()
             && let Ok(relative) = path.strip_prefix(root)
         {
@@ -641,7 +702,7 @@ fn collect_files(root: &Path, at: &Path, found: &mut Vec<String>) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::{LocalDestination, TMP_SUFFIX};
-    use crate::{Destination, LockOwner, LockRecord, local_root, read_to_vec};
+    use crate::{Destination, LockOwner, LockRecord, RequiredMount, local_root, read_to_vec};
     use lr_core::{Id, SetId};
     use std::io::Write;
     use std::time::Duration;
@@ -684,6 +745,29 @@ mod tests {
         assert!(std::path::Path::new(&handle.path).is_dir());
         assert!(handle.path.ends_with("laptop-root"));
         assert_eq!(local_root(&handle).expect("local"), destination.set_dir());
+    }
+
+    #[test]
+    fn required_mount_refusal_precedes_destination_creation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let required_path = dir.path().join("not-mounted");
+        let root = required_path.join("backups");
+        let destination = LocalDestination::new_with_required_mount(
+            &root,
+            "laptop-root",
+            RequiredMount {
+                path: required_path.clone(),
+                source: "nas.local:/exports/backups".to_owned(),
+                fs_type: "nfs4".to_owned(),
+            },
+        );
+
+        let error = destination
+            .open_set(&SetId::new(Id::from_bytes([0x22; 16])))
+            .expect_err("unmounted destination must be refused");
+        assert!(error.to_string().contains("required mount"), "{error}");
+        assert!(!required_path.exists());
+        assert!(!root.exists());
     }
 
     #[test]

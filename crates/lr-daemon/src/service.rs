@@ -438,6 +438,13 @@ fn destination_list() -> std::result::Result<lr_proto::v1::DestinationList, Stat
                     .known_hosts
                     .map(|path| path.display().to_string())
                     .unwrap_or_default(),
+                required_mount: entry
+                    .required_mount
+                    .map(|required| lr_proto::v1::RequiredMount {
+                        path: required.path.display().to_string(),
+                        source: required.source,
+                        fs_type: required.fs_type,
+                    }),
             })
             .collect(),
     })
@@ -542,13 +549,17 @@ impl LinuxReflect for DaemonService {
             identity: (!wanted.identity.is_empty()).then(|| PathBuf::from(&wanted.identity)),
             known_hosts: (!wanted.known_hosts.is_empty())
                 .then(|| PathBuf::from(&wanted.known_hosts)),
+            required_mount: wanted.required_mount.as_ref().map(|required| {
+                lr_store::RequiredMount {
+                    path: PathBuf::from(&required.path),
+                    source: required.source.clone(),
+                    fs_type: required.fs_type.clone(),
+                }
+            }),
         };
-        lr_store::named::validate(&entry).map_err(status::status_of)?;
         let path = lr_store::named::registry_path();
         let mut entries = lr_store::named::load(&path).map_err(status::status_of)?;
-        entries.retain(|existing| existing.name != entry.name);
-        entries.push(entry);
-        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        lr_store::named::upsert(&mut entries, entry).map_err(status::status_of)?;
         lr_store::named::save(&path, &entries).map_err(status::status_of)?;
         Ok(Response::new(destination_list()?))
     }

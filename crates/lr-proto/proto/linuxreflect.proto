@@ -155,12 +155,21 @@ message SetRef {
 // ── Named destinations (A6) ─────────────────────────────────────────────────
 
 // A destination an administrator configured on the daemon's machine;
-// clients use it as `@name` and never send key paths.
+// clients use it as `@name` and never send key paths. Omitting required_mount
+// while updating an existing destination preserves its current policy; remove
+// and recreate the destination to clear the policy.
 message NamedDestination {
   string name = 1;
   string uri = 2;
   string identity = 3;
   string known_hosts = 4;
+  RequiredMount required_mount = 5;
+}
+
+message RequiredMount {
+  string path = 1;
+  string source = 2;
+  string fs_type = 3;
 }
 
 message DestinationList {

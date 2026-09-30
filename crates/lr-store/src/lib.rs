@@ -11,12 +11,14 @@
 pub mod fault;
 pub mod known_hosts;
 pub mod local;
+pub mod mount_policy;
 pub mod named;
 mod publish;
 pub mod sftp;
 pub mod uri;
 
 pub use local::LocalDestination;
+pub use mount_policy::RequiredMount;
 pub use uri::{DestinationUri, ImageLocation};
 
 use std::io::Read;
@@ -278,7 +280,7 @@ pub fn open(uri: &str, options: &DestinationOptions) -> Result<std::sync::Arc<dy
         )));
     }
     // `@name` is a destination configured on this machine (A6).
-    let (uri, options) = named::resolve(uri, options)?;
+    let (uri, options, required_mount) = named::resolve_with_policy(uri, options)?;
     let (uri, options) = (uri.as_str(), &options);
     // The set name becomes a directory; an empty one is allowed only for
     // listing the sets (D-106), and anything else must match D-115.
@@ -288,7 +290,15 @@ pub fn open(uri: &str, options: &DestinationOptions) -> Result<std::sync::Arc<dy
     let parsed = uri::parse(uri)?;
     let destination: std::sync::Arc<dyn Destination> = match parsed {
         DestinationUri::Local { path } => {
-            std::sync::Arc::new(LocalDestination::new(path, options.set_name.clone()))
+            if let Some(required_mount) = required_mount {
+                std::sync::Arc::new(LocalDestination::new_with_required_mount(
+                    path,
+                    options.set_name.clone(),
+                    required_mount,
+                ))
+            } else {
+                std::sync::Arc::new(LocalDestination::new(path, options.set_name.clone()))
+            }
         }
         DestinationUri::Sftp { .. } => sftp::open(&parsed, options)?,
     };

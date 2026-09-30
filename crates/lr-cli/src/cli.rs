@@ -385,6 +385,7 @@ pub(crate) enum DestinationCommand {
     List,
 
     /// Add or replace a destination; clients then use it as `@<name>`.
+    /// An existing required mount is retained when omitted; remove and recreate to clear it.
     Add {
         /// Name, used as `@<name>` (letters, digits, '.', '_', '-').
         #[arg(long)]
@@ -401,6 +402,18 @@ pub(crate) enum DestinationCommand {
         /// `known_hosts` file for an SFTP destination.
         #[arg(long, value_name = "PATH")]
         known_hosts: Option<PathBuf>,
+
+        /// Require this local mount point to have the configured source and filesystem type.
+        #[arg(long, value_name = "PATH", requires_all = ["required_source", "required_fs_type"])]
+        required_mount: Option<PathBuf>,
+
+        /// Exact mount source required by `--required-mount` (for example `nas:/exports/backups`).
+        #[arg(long, value_name = "SOURCE", requires = "required_mount")]
+        required_source: Option<String>,
+
+        /// Exact mount filesystem type required by `--required-mount` (for example `nfs4`).
+        #[arg(long, value_name = "TYPE", requires = "required_mount")]
+        required_fs_type: Option<String>,
     },
 
     /// Remove a destination.

@@ -1686,3 +1686,20 @@ named directory can have distinct set IDs, but an incremental copied the
 catalog's first-scanned set ID. It now inherits the selected parent's set ID.
 Existing images are not rewritten; incompatible historical chains remain
 refused by verification.
+
+## D-126 — Configured mounted destinations can require mount identity
+
+A plain path remains a valid local destination. A named local destination may
+add an explicit required mount path, source and filesystem type. The common
+storage layer must reject a missing or mismatched mount before creating files,
+including when the destination is below the mount root. Configuration adapters
+must preserve the requirement. A pre-operation mount check does not establish
+server durability or distributed fencing, and real server interruption tests
+remain necessary before deployment.
+
+Registry updates retain an existing mount requirement when the incoming field
+is absent, including older protocol clients. The storage module owns that merge
+rule; CLI and daemon adapters call it. Clearing requires removing and recreating
+the named entry. Nested or ambiguously stacked mounts and non-root mount
+projections are refused. Matching source/type is not a persistent mount ID, and
+the check/use interval remains a limitation of this first implementation.
