@@ -1003,6 +1003,73 @@ fn a_file_that_keeps_changing_is_not_claimed_consistent() {
         "{:?}",
         report.warnings
     );
+
+    let image =
+        lr_format::ImageReader::open(std::fs::File::open(&report.image_path).expect("open image"))
+            .expect("the rewritten header and footer agree");
+    assert_eq!(image.superblock().consistency, lr_core::Consistency::None);
+    assert!(image.superblock().is_inconsistent());
+    assert_ne!(image.superblock().flags & lr_format::flags::INCONSISTENT, 0);
+
+    let destination = lr_store::open(
+        &dest.display().to_string(),
+        &lr_store::DestinationOptions::new("laptop-tree"),
+    )
+    .expect("open destination");
+    let set = destination
+        .open_existing_set(&lr_core::SetId::ZERO)
+        .expect("open set");
+    let image_name = report
+        .image_path
+        .strip_prefix(dest.join("laptop-tree"))
+        .expect("image is under its set")
+        .to_string_lossy()
+        .into_owned();
+    let files =
+        lr_engine::chain::resolve_chain(&*destination, &set, &image_name).expect("resolve image");
+    let mut members =
+        lr_engine::chain::open_chain(&*destination, &set, &files, &Encryption::NoEncrypt)
+            .expect("open image members");
+    let metadata = lr_engine::file::read_file_metadata(members.last_mut().expect("member"))
+        .expect("read image metadata");
+    assert_eq!(
+        metadata.get("consistency").map(String::as_str),
+        Some("none (inconsistent)")
+    );
+
+    let target = dir.path().join("restore-target");
+    std::fs::create_dir_all(&target).expect("target");
+    let sentinel = b"keep this merge target unchanged";
+    std::fs::write(target.join("busy.log"), sentinel).expect("sentinel");
+    let plan = prepare_restore(
+        &PrepareRequest::from_path(&report.image_path, &target, Encryption::NoEncrypt)
+            .with_merge(true),
+    )
+    .expect("prepare reports the achieved consistency and issues a plan");
+    assert_eq!(plan.consistency, lr_core::Consistency::None);
+    assert!(
+        plan.warnings
+            .iter()
+            .any(|warning| warning.contains("consistency is 'none'")),
+        "{:?}",
+        plan.warnings
+    );
+    let error = apply_restore(&ApplyRequest {
+        token: plan.token,
+        confirm: true,
+        accept_inconsistent: false,
+        encryption: Encryption::NoEncrypt,
+        context: lr_engine::progress::EngineContext::silent(),
+    })
+    .expect_err("the classified inconsistent image must be refused");
+    assert!(
+        format!("{error}").contains("--accept-inconsistent"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read(target.join("busy.log")).expect("target sentinel remains"),
+        sentinel
+    );
 }
 
 /// A file incremental verifies on its own and as a chain: its unchanged

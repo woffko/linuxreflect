@@ -237,7 +237,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
         .as_ref()
         .map(|snapshot| snapshot.excluded.clone())
         .unwrap_or_default();
-    let mut consistency = snapshot
+    let consistency = snapshot
         .as_ref()
         .map_or(options.consistency, |snapshot| snapshot.consistency);
 
@@ -314,9 +314,6 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
     if matches!(request.compression, Compression::Zstd { .. }) {
         sb_flags |= flags::COMPRESSED;
     }
-    if consistency == Consistency::None {
-        sb_flags |= flags::INCONSISTENT;
-    }
     let mut walk = tree::walk(
         &walk_root,
         &WalkOptions {
@@ -351,6 +348,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
         wrap_nonce: new_keys.wrap_nonce,
         wrapped_chain_key: new_keys.wrapped_chain_key,
     };
+    superblock.set_consistency(consistency);
 
     let (set_root, _) = crate::backup::spool_location(&*destination, &set)?;
     let chain_dir = chain_id.to_string();
@@ -505,10 +503,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
     // A file that kept changing while it was read may be torn, so the image
     // cannot claim per-file consistency (R16).
     if !unstable.is_empty() {
-        consistency = Consistency::None;
-        superblock.consistency = Consistency::None;
-        superblock.flags |= flags::INCONSISTENT;
-        image_writer.rewrite_superblock(&superblock, mac_key)?;
+        image_writer.update_consistency(&mut superblock, Consistency::None, mac_key)?;
         for name in &unstable {
             read_warnings.push(format!(
                 "{name} changed while it was read ({STABLE_ATTEMPTS} attempts); its content in \
@@ -564,7 +559,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
         let mut metadata = format!(
             "source={}\nconsistency={}\nmode=file\nroot={}\none_file_system={}\nxattrs={}\n",
             request.source.display(),
-            consistency,
+            superblock.consistency,
             walk_root.display(),
             options.one_file_system,
             options.xattrs
@@ -600,7 +595,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
     warnings.append(&mut read_warnings);
     warnings.extend(crate::stream::excluded_warning(&excluded_subvolumes));
     warnings.extend(durability.warning("the image"));
-    if consistency == Consistency::PerFile {
+    if superblock.consistency == Consistency::PerFile {
         warnings.push(
             "file mode without a tree snapshot is consistently per file, not point-in-time \
              (spec §D.2)"
@@ -612,7 +607,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
         image_path: crate::backup::local_image_path(&set_root, &image_name),
         image_uuid: request.image_uuid,
         chain_id,
-        consistency,
+        consistency: superblock.consistency,
         root: walk_root.display().to_string(),
         files: counts[0],
         directories: counts[1],

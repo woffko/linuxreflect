@@ -325,14 +325,11 @@ pub fn backup_stream(request: &BackupRequest) -> Result<StreamReport> {
     if matches!(request.compression, crate::backup::Compression::Zstd { .. }) {
         sb_flags |= flags::COMPRESSED;
     }
-    if snapshot.consistency == Consistency::None {
-        sb_flags |= flags::INCONSISTENT;
-    }
     let all_full = snapshot
         .subvolumes
         .iter()
         .all(|subvol| subvol.parent_snapshot.is_none());
-    let superblock = Superblock {
+    let mut superblock = Superblock {
         format_major: FORMAT_MAJOR,
         min_reader: MIN_READER,
         flags: sb_flags,
@@ -360,6 +357,7 @@ pub fn backup_stream(request: &BackupRequest) -> Result<StreamReport> {
         wrap_nonce: new_keys.wrap_nonce,
         wrapped_chain_key: new_keys.wrapped_chain_key,
     };
+    superblock.set_consistency(snapshot.consistency);
 
     let (set_root, _) = crate::backup::spool_location(&*destination, &set)?;
     let chain_dir = chain_id.to_string();
@@ -477,7 +475,7 @@ pub fn backup_stream(request: &BackupRequest) -> Result<StreamReport> {
         let metadata = format!(
             "source={}\nconsistency={}\nfs_type=btrfs\nmode={mode}\n",
             request.source.display(),
-            snapshot.consistency
+            superblock.consistency
         );
         write_extras_record(&mut extras, EXTRAS_IMAGE_METADATA, metadata.as_bytes())?;
         write_extras_record(
@@ -522,7 +520,7 @@ pub fn backup_stream(request: &BackupRequest) -> Result<StreamReport> {
         image_path: crate::backup::local_image_path(&set_root, &image_name),
         image_uuid: request.image_uuid,
         chain_id: request.chain_id,
-        consistency: snapshot.consistency,
+        consistency: superblock.consistency,
         fs_uuid: snapshot.fs_uuid.clone(),
         label: snapshot.label.clone(),
         default_subvolid: snapshot.default_subvolid,

@@ -443,13 +443,10 @@ pub fn backup_block_with(
     if matches!(request.compression, Compression::Zstd { .. }) {
         sb_flags |= flags::COMPRESSED;
     }
-    if snapshot.consistency == lr_core::Consistency::None {
-        sb_flags |= flags::INCONSISTENT;
-    }
     if member_kind == MemberKind::Incremental {
         sb_flags |= flags::DELTA_MANIFEST;
     }
-    let superblock = Superblock {
+    let mut superblock = Superblock {
         format_major: FORMAT_MAJOR,
         min_reader: MIN_READER,
         flags: sb_flags,
@@ -473,6 +470,7 @@ pub fn backup_block_with(
         wrap_nonce: new_keys.wrap_nonce,
         wrapped_chain_key: new_keys.wrapped_chain_key,
     };
+    superblock.set_consistency(snapshot.consistency);
 
     // 6. Destination layout (spec §D.3): `<chain_id>/<seq>-<kind>-<uuid>.lrimg`.
     //    The manifest spool needs local scratch space; next to the image for a
@@ -642,7 +640,6 @@ pub fn backup_block_with(
     // read may have run past its deadline (R29); then it is released at
     // once instead of being held through the manifest and publication.
     snapshot.check_final_health()?;
-    let consistency = snapshot.consistency;
     drop(source);
     drop(snapshot);
 
@@ -688,7 +685,7 @@ pub fn backup_block_with(
         let metadata = format!(
             "source={}\nconsistency={}\nfs_type={fs_type}\nkind={}\nseq={seq_in_chain}\n",
             request.source.display(),
-            consistency,
+            superblock.consistency,
             request.member_type.file_tag()
         );
         write_extras_record(&mut extras, EXTRAS_IMAGE_METADATA, metadata.as_bytes())?;
@@ -729,7 +726,7 @@ pub fn backup_block_with(
         image_uri: request.image_uri(&image_name),
         image_uuid: request.image_uuid,
         chain_id,
-        consistency,
+        consistency: superblock.consistency,
         source_size_bytes: device_size,
         chunk_size: request.chunk_size,
         total_chunks: chunk_count,

@@ -267,7 +267,7 @@ pub fn backup_whole_disk(request: &crate::backup::BackupRequest) -> Result<Whole
     if matches!(request.compression, Compression::Zstd { .. }) {
         sb_flags |= flags::COMPRESSED;
     }
-    let superblock = Superblock {
+    let mut superblock = Superblock {
         format_major: FORMAT_MAJOR,
         min_reader: MIN_READER,
         flags: sb_flags,
@@ -291,6 +291,7 @@ pub fn backup_whole_disk(request: &crate::backup::BackupRequest) -> Result<Whole
         wrap_nonce: new_keys.wrap_nonce,
         wrapped_chain_key: new_keys.wrapped_chain_key,
     };
+    superblock.set_consistency(Consistency::Offline);
 
     let destination = request.open_destination()?;
     let set = destination.open_set(&request.set_id)?;

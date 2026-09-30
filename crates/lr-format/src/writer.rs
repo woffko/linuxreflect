@@ -8,7 +8,7 @@
 
 use std::io::{Seek, SeekFrom, Write};
 
-use lr_core::{ImageKind, Result};
+use lr_core::{Consistency, ImageKind, Result};
 use lr_crypto::aead::AeadKind;
 use lr_crypto::nonce::NonceSeq;
 use lr_crypto::page::{PAGE_OVERHEAD, StreamId};
@@ -110,6 +110,33 @@ impl<W: Write + Seek> ImageWriter<W> {
         self.writer.write_all(&bytes)?;
         self.writer.seek(SeekFrom::Start(self.position))?;
         self.superblock_bytes = bytes;
+        Ok(())
+    }
+
+    /// Finalize a changed consistency level in the model and rewrite the
+    /// writer's superblock copy together.
+    ///
+    /// This is for a writer that learns during execution that the achieved
+    /// level is weaker than its initial value. The flag is derived by
+    /// [`Superblock::set_consistency`], and [`Self::finish`] will copy the
+    /// rewritten header into the footer. The caller's model changes only
+    /// after the rewrite succeeds. An I/O error may nevertheless have
+    /// partially changed the output; discard this writer and do not finish it
+    /// after such an error.
+    ///
+    /// # Errors
+    /// Returns [`Error::Corrupt`] when the rewritten header is invalid or its
+    /// image identity changed, and propagates I/O errors.
+    pub fn update_consistency(
+        &mut self,
+        superblock: &mut Superblock,
+        consistency: Consistency,
+        meta_key: Option<&[u8; 32]>,
+    ) -> Result<()> {
+        let mut candidate = superblock.clone();
+        candidate.set_consistency(consistency);
+        self.rewrite_superblock(&candidate, meta_key)?;
+        *superblock = candidate;
         Ok(())
     }
 

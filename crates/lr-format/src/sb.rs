@@ -44,7 +44,7 @@ pub mod flags {
     pub const DELTA_MANIFEST: u64 = 1 << 2;
     /// The image is a whole-disk image with a partition manifest.
     pub const WHOLE_DISK: u64 = 1 << 3;
-    /// The image was taken from a live, mounted device (`--allow-inconsistent`).
+    /// The achieved consistency is `none`; the image may contain torn data.
     pub const INCONSISTENT: u64 = 1 << 4;
 }
 
@@ -137,7 +137,16 @@ impl Superblock {
     /// `true` when the image was taken inconsistently.
     #[must_use]
     pub const fn is_inconsistent(&self) -> bool {
-        self.flags & flags::INCONSISTENT != 0
+        matches!(self.consistency, Consistency::None)
+    }
+
+    /// Set achieved consistency and derive its redundant wire flag.
+    pub fn set_consistency(&mut self, consistency: Consistency) {
+        self.consistency = consistency;
+        self.flags &= !flags::INCONSISTENT;
+        if self.is_inconsistent() {
+            self.flags |= flags::INCONSISTENT;
+        }
     }
 
     /// The key that authenticates this superblock: the image's `meta_key`, or
@@ -161,6 +170,11 @@ impl Superblock {
                 "min_reader {} means a newer reader is required",
                 self.min_reader
             )));
+        }
+        if (self.flags & flags::INCONSISTENT != 0) != self.is_inconsistent() {
+            return Err(Error::corrupt(
+                "consistency level and INCONSISTENT flag disagree",
+            ));
         }
         if !is_power_of_two_in_range(self.chunk_size, MIN_CHUNK_SIZE, MAX_CHUNK_SIZE) {
             return Err(Error::corrupt(format!(
@@ -439,6 +453,80 @@ mod tests {
         let mut superblock = sample();
         superblock.aead_id = AeadKind::ChaCha20Poly1305.id();
         assert!(superblock.encode(None).is_ok());
+    }
+
+    #[test]
+    fn consistency_update_derives_the_wire_flag() {
+        let mut superblock = sample();
+        for consistency in lr_core::Consistency::ALL {
+            superblock.set_consistency(consistency);
+            assert_eq!(superblock.consistency, consistency);
+            assert_eq!(
+                superblock.flags & flags::INCONSISTENT != 0,
+                matches!(consistency, Consistency::None)
+            );
+            assert_eq!(
+                superblock.is_inconsistent(),
+                matches!(consistency, Consistency::None)
+            );
+            let bytes = superblock.encode(Some(&[0x11; 32])).expect("encode");
+            assert_eq!(Superblock::decode(&bytes).expect("decode"), superblock);
+        }
+    }
+
+    #[test]
+    fn failed_consistency_rewrite_does_not_mutate_the_model_or_output() {
+        let superblock = sample();
+        let original_bytes = superblock.encode(None).expect("encode baseline");
+        let mut output = std::io::Cursor::new(Vec::new());
+        let mut writer = crate::writer::ImageWriter::create(&mut output, &superblock, None)
+            .expect("start writer");
+        let mut candidate = superblock.clone();
+        candidate.chunk_size = 0;
+        let before_update = candidate.clone();
+
+        assert!(
+            writer
+                .update_consistency(&mut candidate, Consistency::None, None)
+                .is_err()
+        );
+        assert_eq!(candidate, before_update);
+        drop(writer);
+        assert_eq!(output.get_ref(), &original_bytes);
+    }
+
+    #[test]
+    fn rejects_a_consistency_flag_that_disagrees_with_the_enum() {
+        for (consistency, inconsistent_flag) in
+            [(Consistency::Offline, true), (Consistency::None, false)]
+        {
+            let mut superblock = sample();
+            superblock.consistency = consistency;
+            superblock.flags &= !flags::INCONSISTENT;
+            if inconsistent_flag {
+                superblock.flags |= flags::INCONSISTENT;
+            }
+            // Craft a hash-valid header with a contradictory flag.
+            assert!(
+                superblock.encode(Some(&[0x11; 32])).is_err(),
+                "the encoder must reject contradictory fields"
+            );
+            let mut bytes = sample().encode(Some(&[0x11; 32])).expect("valid baseline");
+            bytes[25] = consistency.as_u8();
+            let flags_at = u64::from_le_bytes(bytes[16..24].try_into().expect("flags"));
+            let flags_at = if inconsistent_flag {
+                flags_at | flags::INCONSISTENT
+            } else {
+                flags_at & !flags::INCONSISTENT
+            };
+            bytes[16..24].copy_from_slice(&flags_at.to_le_bytes());
+            let hash = lr_crypto::mac::unkeyed_mac32(&bytes[..super::SB_HASH_OFFSET]);
+            bytes[super::SB_HASH_OFFSET..super::SB_HASH_OFFSET + 32].copy_from_slice(&hash);
+            assert!(
+                Superblock::decode(&bytes).is_err(),
+                "{consistency:?} with flag={inconsistent_flag} must be refused"
+            );
+        }
     }
 
     #[test]
