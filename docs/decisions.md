@@ -1659,3 +1659,30 @@ missing file data (A16).
 - **Operator documentation** says to back up the log and realtime devices
   separately, or to avoid those layouts for systems that must be restorable
   from one image.
+
+## D-125 — Retention requires a freshly checked recovery chain
+
+An image with recorded unreadable source sectors can pass integrity verification
+with a warning even though restore refuses it. A successful verification call
+alone therefore does not authorize replacing a healthy recovery chain. The
+catalog's verification timestamps are also historical, rebuildable-cache data;
+they neither survive every cache loss nor establish current payload integrity.
+
+Before deleting any chain, retention must have freshly verified a retained
+chain's payloads and established that its recovery point has no recorded bad
+sectors. `--verify-first` still checks candidate chains before selecting them;
+without it, retention checks its selected retained chains before deletion. If
+none qualifies, it refuses deletion, including when keys are unavailable. A
+dry run uses the same eligibility rule. Whole-chain deletion and ordering stay
+unchanged. Verification timestamps remain advisory; a durable evidence-history
+store is a separate change. This adds read I/O to retention and deliberately
+prefers keeping extra backups to deleting without a checked replacement.
+Generated scheduled-retention commands therefore receive the same configured
+passphrase-file path as the backup command. Existing installed units must be
+regenerated; no key contents are stored in a unit.
+
+Fresh verification exposed a parent-resolution defect: full chains in one
+named directory can have distinct set IDs, but an incremental copied the
+catalog's first-scanned set ID. It now inherits the selected parent's set ID.
+Existing images are not rewritten; incompatible historical chains remain
+refused by verification.

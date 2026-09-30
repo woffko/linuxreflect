@@ -26,10 +26,11 @@ pub struct RetentionOptions {
     pub break_stale_lock: bool,
     /// Set-lock lease in seconds; the spec default is 300.
     pub set_lock_ttl_secs: Option<u64>,
-    /// Verify every payload of the chains to keep before deleting anything;
-    /// a chain that fails does not count as a backup (R20).
+    /// Verify candidate chains before selecting which to keep. Regardless of
+    /// this option, deletion requires a freshly verified retained recovery chain.
     pub verify_first: bool,
-    /// How to unlock encrypted chains for `verify_first`.
+    /// How to unlock encrypted chains for verification, including the mandatory
+    /// pre-deletion check when `verify_first` is false.
     pub encryption: crate::keys::Encryption,
 }
 
@@ -150,7 +151,7 @@ pub fn apply(
     }
 
     let keep_count = options.keep_chains.max(1);
-    if options.verify_first {
+    let freshly_verified = if options.verify_first {
         verify_newest(
             destination,
             set,
@@ -159,8 +160,10 @@ pub fn apply(
             options,
             &mut loaded.catalog,
             &mut warnings,
-        );
-    }
+        )
+    } else {
+        0
+    };
     let mut kept_chains: Vec<ChainRecord> = usable.iter().take(keep_count).cloned().collect();
     // The newest chain known to be restorable is never given up for newer
     // chains that were not verified (R20).
@@ -208,6 +211,33 @@ pub fn apply(
     }
     // Oldest first, so a partial run removes the least valuable data first.
     doomed.sort_by_key(|(chain, _)| chain.created_unix);
+
+    // Cached timestamps are historical evidence, not proof that the kept bytes
+    // can still be read. Keep the same gate for dry runs so their deletion plan
+    // does not promise work that apply would refuse (D-125).
+    if !doomed.is_empty() && freshly_verified == 0 {
+        let mut checked = false;
+        for chain in &kept_chains {
+            match verify_replacement(destination, set, chain, &options.encryption) {
+                Ok(()) => {
+                    checked = true;
+                    break;
+                }
+                Err(error) => warnings.push(format!(
+                    "chain {} cannot authorize retention: {error}",
+                    chain.chain_id
+                )),
+            }
+        }
+        if !checked {
+            return Err(Error::unsupported(format!(
+                "retention refused: no retained recovery chain passed fresh verification; \
+                 no images were deleted. Supply the correct keys or create and verify a \
+                 healthy backup. {}",
+                warnings.join("; ")
+            )));
+        }
+    }
 
     let mut deleted = Vec::new();
     for (chain, reason) in doomed {
@@ -288,24 +318,13 @@ fn verify_newest(
     options: &RetentionOptions,
     catalog: &mut lr_core::catalog::Catalog,
     warnings: &mut Vec<String>,
-) {
+) -> usize {
     let mut passed = 0usize;
     let mut index = 0usize;
     while index < usable.len() && passed < keep_count {
         let chain = &usable[index];
-        let Some(newest) = chain.latest_member() else {
-            index += 1;
-            continue;
-        };
-        let request = crate::verify::VerifyRequest {
-            image: newest.file_name.clone(),
-            encryption: options.encryption.clone(),
-            chain: true,
-            destination_options: lr_store::DestinationOptions::default(),
-            context: crate::progress::EngineContext::silent(),
-        };
-        match crate::verify::verify_in_set(destination, set, &newest.file_name, &request) {
-            Ok(_) => {
+        match verify_replacement(destination, set, chain, &options.encryption) {
+            Ok(()) => {
                 let files = chain
                     .members
                     .iter()
@@ -329,6 +348,29 @@ fn verify_newest(
             }
         }
     }
+    passed
+}
+
+/// A retained chain must provide a complete checked recovery point, not merely
+/// a valid footer or a historical verification timestamp.
+fn verify_replacement(
+    destination: &dyn Destination,
+    set: &SetHandle,
+    chain: &ChainRecord,
+    encryption: &crate::keys::Encryption,
+) -> Result<()> {
+    let newest = chain
+        .latest_member()
+        .ok_or_else(|| Error::corrupt("the recovery chain has no members"))?;
+    let request = crate::verify::VerifyRequest {
+        image: newest.file_name.clone(),
+        encryption: encryption.clone(),
+        chain: true,
+        destination_options: lr_store::DestinationOptions::default(),
+        context: crate::progress::EngineContext::silent(),
+    };
+    crate::verify::verify_in_set(destination, set, &newest.file_name, &request)?
+        .ensure_complete_recovery()
 }
 
 /// `true` when another member may be appended to the newest chain.

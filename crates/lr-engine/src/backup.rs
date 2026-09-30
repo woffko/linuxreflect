@@ -939,7 +939,10 @@ pub(crate) fn resolve_parent_chain(
     Ok(Some(ParentChain {
         member: parent,
         chain_id: chain.chain_id,
-        set_id: loaded.catalog.set_id,
+        // Older full chains in one named set can carry different set IDs.
+        // The selected parent's image, not an unrelated catalog scan entry,
+        // owns the identity that every member of this chain must preserve.
+        set_id: superblock.set_id,
         prefix,
         files,
         superblock,

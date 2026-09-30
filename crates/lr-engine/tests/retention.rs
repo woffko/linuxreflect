@@ -451,3 +451,244 @@ fn retention_never_gives_up_the_last_verified_chain_for_an_unverified_one() {
     }
     assert!(damaged.exists(), "a failed chain is left in place");
 }
+
+/// A valid full image whose source had an unreadable sector, not a corrupt
+/// image. Integrity verification succeeds with a bad-sector warning.
+fn bad_sector_image(dest: &Path, set: &str, template: &Path) -> PathBuf {
+    use lr_core::{ChainId, Id, ImageId};
+    use lr_crypto::keys::{ChainKey, file_keys};
+    use lr_format::{BlockEntry, BlockManifestHeader, ImageReader, ImageWriter, StreamId};
+
+    let reader = ImageReader::open(std::fs::File::open(template).expect("template"))
+        .expect("template reader");
+    let mut sb = reader.superblock().clone();
+    sb.chain_id = ChainId::new(Id::from_bytes([0xB1; 16]));
+    sb.image_uuid = ImageId::new(Id::from_bytes([0xB2; 16]));
+    sb.parent_uuid = ImageId::ZERO;
+    sb.seq_in_chain = 0;
+    sb.created_unix += 1;
+    sb.flags = 0;
+    sb.source_size_bytes = u64::from(sb.chunk_size);
+    let chain = dest.join(set).join(sb.chain_id.to_string());
+    std::fs::create_dir(&chain).expect("chain directory");
+    let path = chain.join(format!("000-full-{}.lrimg", sb.image_uuid));
+    let keys = file_keys(
+        &ChainKey::from_bytes(lr_crypto::mac::fixed_public_mac_key()),
+        sb.image_uuid.inner(),
+    )
+    .expect("public image keys");
+    let kind = sb.aead_kind().expect("aead");
+    let mut writer = ImageWriter::create(std::fs::File::create(&path).expect("image"), &sb, None)
+        .expect("writer");
+    {
+        let mut manifest = writer.page_stream(StreamId::Manifest, kind, *keys.meta_key);
+        BlockManifestHeader {
+            chunk_size: sb.chunk_size,
+            chunk_count: 1,
+            entry_count: 1,
+            used_extent_count: 1,
+            used_bytes: sb.source_size_bytes,
+            fs_type: String::new(),
+            fs_uuid: String::new(),
+            label: String::new(),
+        }
+        .write(&mut manifest, false)
+        .expect("manifest header");
+        BlockEntry::bad_sector(0, sb.chunk_size)
+            .write(&mut manifest)
+            .expect("record unreadable source");
+        manifest.finish().expect("manifest");
+    }
+    {
+        let mut extras = writer.page_stream(StreamId::Extras, kind, *keys.meta_key);
+        lr_format::extras::write_chain_members(
+            &mut extras,
+            &[lr_format::ChainMember {
+                index: 0,
+                image_uuid: sb.image_uuid,
+            }],
+        )
+        .expect("chain members");
+        extras.finish().expect("extras");
+    }
+    writer.finish(&keys.meta_key, None, kind).expect("finish");
+    path
+}
+
+fn verify_request(image: &Path) -> lr_engine::verify::VerifyRequest {
+    lr_engine::verify::VerifyRequest {
+        image: image.display().to_string(),
+        encryption: Encryption::NoEncrypt,
+        chain: true,
+        destination_options: lr_store::DestinationOptions::default(),
+        context: lr_engine::progress::EngineContext::silent(),
+    }
+}
+
+#[test]
+fn retention_does_not_replace_a_healthy_chain_with_recorded_bad_sectors() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = source_file(dir.path(), "source.img", 1024 * 1024);
+    let dest = dir.path().join("backups");
+    let set = "recorded-bad";
+    build_chain(&source, &dest, set, 0, 1);
+    let healthy = newest_image(&dest, set);
+    let bad = bad_sector_image(&dest, set, &healthy);
+    let report = lr_engine::verify::verify_image(&verify_request(&bad)).expect("valid image");
+    assert_eq!(report.recorded_bad_chunks, 1);
+
+    let (destination, handle) = open_dest(&dest, set);
+    let retained = apply(
+        &*destination,
+        &handle,
+        set,
+        &RetentionOptions {
+            keep_chains: 1,
+            verify_first: true,
+            ..RetentionOptions::default()
+        },
+    )
+    .expect("retention");
+    assert!(retained.deleted.is_empty(), "{retained:?}");
+    assert!(healthy.exists(), "the healthy recovery chain was deleted");
+    assert!(bad.exists(), "a degraded backup is left for the operator");
+}
+
+#[test]
+fn recorded_bad_sectors_do_not_create_a_verified_catalog_record() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = source_file(dir.path(), "source.img", 1024 * 1024);
+    let dest = dir.path().join("backups");
+    let set = "bad-evidence";
+    build_chain(&source, &dest, set, 0, 1);
+    let bad = bad_sector_image(&dest, set, &newest_image(&dest, set));
+    let request = verify_request(&bad);
+    let report = lr_engine::verify::verify_image(&request).expect("valid image");
+    let note = lr_engine::verify::record_verification(&request, &report).expect("record");
+    assert!(
+        note.is_some(),
+        "incomplete recovery must not count as verified"
+    );
+    let (destination, handle) = open_dest(&dest, set);
+    let loaded = lr_engine::catalog::load(&*destination, &handle, set, 0).expect("catalog");
+    assert!(loaded.catalog.chains.iter().all(|chain| {
+        chain
+            .members
+            .iter()
+            .all(|member| member.verified_unix.is_none())
+    }));
+}
+
+#[test]
+fn retention_refuses_deletion_without_a_fresh_healthy_replacement() {
+    for cache in ["missing", "corrupt", "stale"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = data_source(dir.path());
+        let dest = dir.path().join("backups");
+        let set = "fresh-evidence";
+        build_chain(&source, &dest, set, 0, 1);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        build_chain(&source, &dest, set, 0, 2);
+        let newest = newest_image(&dest, set);
+        verify_and_record(&newest);
+        let mut bytes = std::fs::read(&newest).expect("image");
+        bytes[256 * 1024] ^= 0xFF;
+        std::fs::write(&newest, bytes).expect("same-size corruption");
+        let catalog = dest.join(set).join("catalog.json");
+        match cache {
+            "missing" => std::fs::remove_file(&catalog).expect("remove test catalog"),
+            "corrupt" => std::fs::write(&catalog, b"not json").expect("corrupt test catalog"),
+            _ => {}
+        }
+        let before = image_files(&dest, set);
+        let (destination, handle) = open_dest(&dest, set);
+        for dry_run in [true, false] {
+            let error = apply(
+                &*destination,
+                &handle,
+                set,
+                &RetentionOptions {
+                    keep_chains: 1,
+                    dry_run,
+                    ..RetentionOptions::default()
+                },
+            )
+            .expect_err("unchecked/corrupt replacement must refuse deletion");
+            assert!(error.to_string().contains("retention refused"), "{error}");
+            assert_eq!(image_files(&dest, set), before, "{cache}, dry={dry_run}");
+        }
+    }
+}
+
+#[test]
+fn retention_requires_the_key_for_an_encrypted_replacement() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = source_file(dir.path(), "source.img", 1024 * 1024);
+    let dest = dir.path().join("backups");
+    let set = "encrypted-replacement";
+    build_chain(&source, &dest, set, 0, 1);
+    let old = newest_image(&dest, set);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let encryption = Encryption::Passphrase(lr_engine::keystore::Passphrase::new(
+        b"test-only retention fixture".to_vec(),
+    ));
+    let encrypted = backup_block_full(&request(&source, &dest, set, encryption.clone()))
+        .expect("encrypted backup");
+    let (destination, handle) = open_dest(&dest, set);
+    let error = apply(
+        &*destination,
+        &handle,
+        set,
+        &RetentionOptions {
+            keep_chains: 1,
+            ..RetentionOptions::default()
+        },
+    )
+    .expect_err("missing keys must not authorize deletion");
+    assert!(error.to_string().contains("retention refused"), "{error}");
+    assert!(old.exists() && encrypted.image_path.exists());
+
+    let report = apply(
+        &*destination,
+        &handle,
+        set,
+        &RetentionOptions {
+            keep_chains: 1,
+            encryption,
+            ..RetentionOptions::default()
+        },
+    )
+    .expect("verified replacement authorizes retention");
+    assert_eq!(report.deleted.len(), 1);
+    assert!(!old.exists());
+    assert!(encrypted.image_path.exists());
+}
+
+#[test]
+fn an_incremental_uses_its_parents_set_identity_not_another_chains() {
+    use lr_core::{ChainId, Id, SetId};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = source_file(dir.path(), "source.img", 1024 * 1024);
+    let dest = dir.path().join("backups");
+    let set = "parent-identity";
+    let mut older = request(&source, &dest, set, Encryption::NoEncrypt);
+    older.chain_id = ChainId::new(Id::from_bytes([1; 16]));
+    older.set_id = SetId::new(Id::from_bytes([11; 16]));
+    backup_block_full(&older).expect("older chain");
+    let mut parent = request(&source, &dest, set, Encryption::NoEncrypt);
+    parent.chain_id = ChainId::new(Id::from_bytes([2; 16]));
+    parent.set_id = SetId::new(Id::from_bytes([22; 16]));
+    let full = backup_block_full(&parent).expect("parent chain");
+    let mut incremental = request(&source, &dest, set, Encryption::NoEncrypt);
+    incremental.member_type = MemberType::Incremental;
+    incremental.parent = Some(full.image_uuid.to_string());
+    let child = backup_block_full(&incremental).expect("incremental");
+    let reader = lr_format::ImageReader::open(
+        std::fs::File::open(&child.image_path).expect("incremental image"),
+    )
+    .expect("image reader");
+    assert_eq!(reader.superblock().set_id, parent.set_id);
+    lr_engine::verify::verify_image(&verify_request(&child.image_path))
+        .expect("the newly created recovery chain must verify");
+}

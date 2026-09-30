@@ -151,17 +151,27 @@ A chain is one full backup and the members that follow it.
 ## Retention
 
 `linuxreflect retention apply --keep-chains N` deletes whole chains only,
-oldest first. It never deletes the newest usable chain, nor the newest chain
-that passed a whole-chain verification, whatever N says (R20).
-`--verify-first` verifies the chains it keeps before deleting anything.
+oldest first. Before any deletion, it requires fresh payload verification of
+at least one retained chain whose recovery point has no recorded bad sectors.
+If no retained chain qualifies, retention fails without deleting images. This
+includes encrypted backups for which the required key is unavailable.
+
+`--verify-first` checks candidate chains before choosing which to keep, leaving
+failed chains in place. Without it, retention checks the selected retained
+chains before deletion. Dry runs use the same rule. Cached verification times
+are historical information, not authority to delete; a missing catalog or a
+same-size payload change cannot bypass the fresh check (D-125).
 
 ## Verification
 
 `linuxreflect verify --image <member>` checks that member and everything it
 needs from its ancestry; `--chain` checks every payload of the whole chain,
 older members included. A failure names the corrupted chunk or file. A
-successful `--chain` verification is recorded, and retention keeps that
-chain.
+successful `--chain` verification without recorded bad sectors is recorded in
+the catalog. Recorded bad sectors still appear as verification warnings, but
+do not qualify the image as a complete recovery point. This history can be
+lost when the catalog is rebuilt; retention checks current content before
+deleting regardless.
 
 ## Restoring
 
@@ -201,6 +211,11 @@ into systemd units with `sudo linuxreflect schedule set`:
   same sources as full backups on that calendar; the incremental timer's
   service is ordered after it, so when both are due the new chain comes
   first.
+
+Encrypted jobs pass their configured `passphrase_file` to retention as well as
+backup creation, because deletion requires fresh verification. Regenerate older
+installed units with `schedule set` after upgrading; without a usable key,
+retention preserves the backups and reports refusal.
 
 A named destination's `identity` and `known_hosts`, and `[daemon]
 lvm_cow_size`, are passed to the generated commands. Every argument is quoted

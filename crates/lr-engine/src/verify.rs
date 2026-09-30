@@ -68,6 +68,24 @@ pub struct VerifyReport {
 }
 
 impl VerifyReport {
+    /// Require a recovery point without recorded unreadable source regions.
+    ///
+    /// Integrity verification can succeed for a faithfully recorded bad sector.
+    /// Such a report must not qualify as a complete replacement backup (D-125).
+    /// This does not establish source consistency, target readiness or durability.
+    ///
+    /// # Errors
+    /// Returns [`Error::Unsupported`] when source data was not backed up.
+    pub fn ensure_complete_recovery(&self) -> Result<()> {
+        if self.recorded_bad_chunks != 0 {
+            return Err(Error::unsupported(crate::plan::bad_sector_message(
+                self.recorded_bad_chunks,
+                None,
+            )));
+        }
+        Ok(())
+    }
+
     /// One line per verified member, for the CLI's summary.
     #[must_use]
     pub fn summary(&self) -> String {
@@ -108,7 +126,8 @@ pub fn verify_image(request: &VerifyRequest) -> Result<VerifyReport> {
 }
 
 /// Record a successful whole-chain verification in the set's catalog, so
-/// retention knows which chains were proven restorable (R20).
+/// the UI can show historical verification (R20). Retention still performs
+/// fresh verification before deletion; this timestamp is not deletion authority.
 ///
 /// Only a report that read every member counts. The set lock is taken
 /// briefly; when another job holds it, the record is skipped and the
@@ -122,6 +141,9 @@ pub fn record_verification(
 ) -> Result<Option<String>> {
     if !report.every_member {
         return Ok(None);
+    }
+    if let Err(error) = report.ensure_complete_recovery() {
+        return Ok(Some(format!("verification was not recorded: {error}")));
     }
     let location = uri::split_image(&request.image)?;
     let mut options = request.destination_options.clone();

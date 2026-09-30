@@ -432,12 +432,11 @@ pub(crate) enum RetentionCommand {
         #[arg(long)]
         dry_run: bool,
 
-        /// Verify every payload of the chains to keep before deleting any;
-        /// a chain that fails does not count as a backup.
+        /// Verify candidate chains before keep-selection; destructive apply always verifies at least one kept chain before deletion.
         #[arg(long)]
         verify_first: bool,
 
-        /// Passphrase file, to verify encrypted chains with --verify-first.
+        /// Passphrase file to verify encrypted retained chains before deletion.
         #[arg(long, value_name = "PATH")]
         passphrase_file: Option<PathBuf>,
 

@@ -647,6 +647,14 @@ fn commands(context: &CommandContext<'_>, job: &JobConfig, member_type: &str) ->
         ]
         .map(str::to_owned)
         .to_vec();
+        // Retention verifies a kept chain before deletion, even without
+        // --verify-first. Use the same key file as this job's backups.
+        if job.encrypt
+            && let Some(passphrase) = &job.passphrase_file
+        {
+            command.push("--passphrase-file".to_owned());
+            command.push(passphrase.display().to_string());
+        }
         context.ssh_options(&mut command);
         all.push(command);
     }
@@ -991,6 +999,8 @@ keep_chains = 3
                 "odd-set",
                 "--keep-chains",
                 "3",
+                "--passphrase-file",
+                "/etc/linuxreflect/key with space",
             ]
         );
     }
