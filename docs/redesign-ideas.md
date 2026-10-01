@@ -5,6 +5,35 @@ come from the single-source-of-truth review of `99afcb5`, refreshed against
 `553c2db` on 2026-09-28. Keep the frozen specification intact; record decisions
 before changing format semantics or operator-visible guarantees.
 
+## Implementation follow-up, 2026-10-01
+
+The discussion below preserves the original review context. Subsequent work
+has implemented these parts without claiming production acceptance for every
+deployment:
+
+- D-125 makes retention require fresh verification of a kept, complete-recovery
+  chain before deletion. Catalog timestamps remain advisory; this is not the
+  durable verification-history store proposed in idea 6.
+- D-126 adds opt-in required-mount identity checks to named destinations. D-128
+  identifies the visible kernel mount, including systemd automount stacks.
+  Checks do not pin the mount against a later replacement.
+- D-127 preverifies selected restore payloads before target mutation, retaining
+  checks during writes. This reduces avoidable partial restores; it does not
+  make a restore transactional or freeze the backing storage.
+- D-129 makes achieved consistency authoritative for the redundant wire flag,
+  controlled writer updates and reports. Contradictory image headers are
+  rejected, addressing idea 3 without a format-layout change.
+- D-130 introduces an immutable resolved backup plan for Block, File and
+  Stream producers, addressing idea 2's repeated parent/policy resolution.
+  Reports distinguish logical policy from encoding. A v1 header-only catalog
+  still cannot recover a File member's historical comparison policy; its
+  structural `kind` is not authority for that missing fact.
+
+Job-result projection, durable content-bound verification history and SFTP
+stale-writer fencing remain separate work. Historical maintainer acceptance
+results below are not evidence that the current tree passed privileged tests
+on this user's machine.
+
 ## One owner for each fact
 
 Every property needs one authoritative meaning, an owner, and controlled

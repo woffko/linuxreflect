@@ -84,8 +84,10 @@ linuxreflect destination add --name archive --uri /mnt/nas/backups \
 Use `--dest @archive` for backups, retention and scheduled jobs. The three
 required fields must match `/proc/self/mountinfo` in the executing process's
 mount namespace. Missing or wrong mounts are refused before directory creation;
-subdirectories of the required mount are supported. Nested/stacked mounts,
-non-root bind projections and paths containing `..` are refused. A raw path
+subdirectories of the required mount are supported. Systemd automounts are
+supported when the kernel-visible mount matches the requirement. Nested mounts,
+unresolved visibility, non-root bind projections and paths containing `..` are
+refused (D-128). A raw path
 such as `--dest /mnt/nas/backups` does not inherit a named destination's guard.
 
 The registry stores this under `[destination.required_mount]` with `path`,
@@ -93,8 +95,9 @@ The registry stores this under `[destination.required_mount]` with `path`,
 destination without those fields preserves its existing guard; remove and
 recreate the entry to clear it. Checks run before storage operations but do not
 atomically pin the mount, prove server durability, or distinguish every mount
-with identical source/type. Test your actual NFS deployment before relying on
-it (D-126).
+with identical source/type. Use `@archive/<set>/<chain>/<file>.lrimg` to retain
+the guard during verification and restore. Test your actual NFS or SMB
+deployment before relying on it (D-126).
 
 **SFTP.** Configure SFTP destinations on the daemon, not per request:
 
@@ -135,7 +138,10 @@ restorable from one image.
 snapshot (`point-in-time`), a frozen filesystem (`frozen`), an unmounted device
 (`offline`), `per-file` for a live file backup, or `none` for a live block
 read, which needs `--allow-inconsistent` to start and `--accept-inconsistent`
-to restore. Nothing claims a snapshot that was not made.
+to restore. A file that keeps changing while read also downgrades the image to
+`none`, with a warning and the same restore acceptance requirement. Headers
+whose consistency value contradicts their inconsistent flag are refused
+(D-129). Nothing claims a snapshot that was not made.
 
 **File mode** (`--mode file`) records the tree: content, ownership, mode,
 timestamps, xattrs, ACLs, hard links, device nodes and sparse regions. A file
@@ -171,6 +177,14 @@ A chain is one full backup and the members that follow it.
   possible; keep whole chains.
 - `--max-incrementals N` starts a new chain after N incrementals, and a
   schedule's `new_chain_on_calendar` starts one on a calendar.
+
+After a limit rollover, the new image's filename and report identify a full
+backup. Reports use `member_kind` for the effective backup policy and
+`manifest_encoding` for the representation actually written (D-130). File
+incrementals and differentials both store a complete tree; their comparison
+bases differ. The v1 header-only catalog calls a noninitial full-tree member
+`Differential`, a structural label that does not recover its requested policy.
+Neither label makes a recovery point independent of its recorded ancestry.
 
 ## Retention
 

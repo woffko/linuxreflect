@@ -1723,3 +1723,64 @@ minutes does not require extending the token lifetime.
 The check detects corruption already present before destructive work. It does
 not make mutable storage immutable, eliminate later I/O failures, or make a
 restore transactional. An interrupted restore can leave a partial target.
+
+## D-128 — Required mounts are matched by visible mount identity
+
+A systemd automount can legitimately expose an autofs record and the active
+network filesystem at the same path. Rejecting every duplicate target prevents
+guarded backups on that layout. Accepting any matching row would instead allow
+a hidden expected share to mask the wrong visible filesystem.
+
+For a configured mount requirement, open the required directory and the existing
+destination ancestor and read their kernel mount IDs from `/proc/self/fdinfo`.
+Match those observations to `/proc/self/mountinfo` in the same process namespace.
+Require the expected path, source, filesystem type and root projection, and
+require the destination to be on that same mount. Missing or unresolved IDs,
+wrong shares and nested mounts remain refusal cases. Do not infer visibility
+from row order or numeric mount-ID order.
+
+This check may activate an automount and requires access to the observed
+directories and procfs. It does not hold a mount lease through subsequent I/O,
+prove server durability or remove the check/use race documented in D-126.
+
+## D-129 — Achieved consistency owns the redundant image flag
+
+The consistency enum is the authoritative achieved level. `INCONSISTENT` is its
+wire projection: it must be set exactly when the level is `None`. Shared
+superblock validation rejects disagreements on both encoding and decoding;
+readers do not silently choose one contradictory field. Valid historical v1
+images keep the same layout and interpretation.
+
+Producers set the level through one method that derives the flag. If a file
+keeps changing while read, the writer updates the header and its footer copy
+through one consistency-update operation. Reports, warnings and metadata then
+use that finalized superblock value. A failed rewrite aborts publication; it is
+not a transactional update of the temporary file.
+
+The restore refusal classification uses the enum, after header agreement has
+been validated. An inconsistent image still requires explicit acceptance.
+This change does not turn per-file consistency into a point-in-time snapshot.
+
+## D-130 — Backup execution owns one resolved parent and policy
+
+Block, File and Btrfs Stream backups resolve the selected parent once under the
+set lock into an immutable execution plan. That plan owns the parent chain and
+derives effective policy, identities, sequence, filename tag and manifest
+encoding. A chain-limit rollover has effective policy `Full`, even when the
+request was incremental or differential. Consumers must not reuse the original
+request to describe resolved facts. Parent vectors are borrowed, not copied.
+
+Logical backup policy and physical encoding are different facts. Block
+incrementals encode deltas; block differentials encode a full manifest while
+retaining the ancestry requirements of D-114. File incrementals and
+differentials both encode a full tree but use different comparison bases.
+Stream backups encode Btrfs sends and still refuse differential policy.
+
+Backup reports describe effective logical policy in `member_kind` and expose
+`manifest_encoding` separately. Older serialized reports without that field
+deserialize as unknown encoding, not an inferred value. The v1 header-only
+catalog `kind` remains a legacy structural classification: a noninitial File
+member is classified as `Differential` because it has a full-tree manifest.
+It cannot establish the historical caller's comparison policy. Do not infer
+that policy from mutable filenames or set a false block-delta flag. No image
+format bits, catalog topology or restore ancestry rules change in this step.
