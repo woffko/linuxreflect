@@ -7,8 +7,8 @@
 //! * a device whose sectors fail (`dm-flakey` with `error_reads`) is either
 //!   refused (`--on-bad-sector abort`) or recorded (`record`), the image
 //!   verifies, and a restore **refuses** to fabricate the missing data;
-//! * an interrupted SMB or NFS destination leaves no image behind and a lock
-//!   that a retry can break;
+//! * an interrupted SMB or NFS destination leaves no finalized image in its
+//!   server-side export;
 //! * a 16 TB virtual disk produces a valid image whose metadata stream keeps
 //!   the process inside a documented RSS bound.
 
@@ -800,9 +800,13 @@ fn start_nfs(work: &Path, dir: &Path, at: &Path) -> Option<String> {
     Some(export)
 }
 
-/// Interrupt a running backup by breaking the destination, then check the
-/// destination and a retry.
-fn interrupt_destination(mount: &Path, break_share: impl FnOnce(), label: &str) {
+/// Interrupt a running backup, then check the server-side backing directory.
+fn interrupt_destination(
+    mount: &Path,
+    server_root: &Path,
+    break_share: impl FnOnce(),
+    label: &str,
+) {
     let dir = tempfile::tempdir().expect("tempdir");
     // A source large enough that the backup is still running when the share
     // goes away.
@@ -817,7 +821,12 @@ fn interrupt_destination(mount: &Path, break_share: impl FnOnce(), label: &str) 
     assert!(source.unmount(&filled), "umount failed");
 
     let dest = mount.join("backups");
+    let server_dest = server_root.join("backups");
     std::fs::create_dir_all(&dest).expect("destination directory");
+    assert!(
+        server_dest.is_dir(),
+        "server-side destination is missing: {server_dest:?}"
+    );
     let request = request(&source.path(), &dest);
     let started = Instant::now();
     let handle = std::thread::spawn(move || backup_block_full(&request));
@@ -835,8 +844,13 @@ fn interrupt_destination(mount: &Path, break_share: impl FnOnce(), label: &str) 
         "a backup whose destination vanished must fail ({label})"
     );
 
-    // A partial image must never be finalized, and the lock must be breakable.
-    let leftovers = list_images(&dest);
+    // Inspect the backing directory directly; the forced-unmounted client path
+    // may resolve to the empty mount-point directory instead.
+    assert!(
+        server_dest.is_dir(),
+        "server-side destination disappeared: {server_dest:?}"
+    );
+    let leftovers = list_images(&server_dest).expect("enumerate server-side backup images");
     assert!(
         leftovers.is_empty(),
         "the interrupted {label} backup left images behind: {leftovers:?}"
@@ -844,19 +858,42 @@ fn interrupt_destination(mount: &Path, break_share: impl FnOnce(), label: &str) 
 }
 
 /// Every `.lrimg` file below `root`, recursively.
-fn list_images(root: &Path) -> Vec<PathBuf> {
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "find {} -name '*.lrimg' 2>/dev/null",
-            root.display()
-        ))
-        .output()
-        .expect("find");
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(PathBuf::from)
-        .collect()
+fn list_images(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut directories = vec![root.to_path_buf()];
+    let mut images = Vec::new();
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                directories.push(entry.path());
+            } else if file_type.is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "lrimg")
+            {
+                images.push(entry.path());
+            }
+        }
+    }
+    images.sort();
+    Ok(images)
+}
+
+#[test]
+fn list_images_finds_nested_final_images_and_rejects_missing_roots() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sentinel = dir.path().join("set/chain/final.lrimg");
+    std::fs::create_dir_all(sentinel.parent().expect("sentinel parent")).expect("nested dirs");
+    std::fs::write(&sentinel, b"test final image").expect("sentinel image");
+    std::fs::write(dir.path().join("not-an-image.tmp"), b"temporary").expect("temporary file");
+
+    assert_eq!(
+        list_images(dir.path()).expect("scan images"),
+        vec![sentinel]
+    );
+    assert!(list_images(&dir.path().join("missing")).is_err());
 }
 
 #[test]
@@ -876,6 +913,7 @@ fn an_smb_destination_survives_an_interruption() {
     let mount_point = mount.display().to_string();
     interrupt_destination(
         &mount,
+        &share,
         move || {
             // A lazy unmount alone leaves the detached filesystem connected, so
             // the write can still succeed. Stop the server too; the mount is
@@ -911,6 +949,7 @@ fn an_nfs_destination_survives_an_interruption() {
     // client's open file unusable, which is what the writer must notice.
     interrupt_destination(
         &mount,
+        &export_dir,
         || {
             let _ = run("exportfs", &["-u", &export]);
             let _ = run("umount", &["-f", &mount.display().to_string()]);
