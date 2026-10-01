@@ -46,6 +46,28 @@ took 451 s for the full backup and peaked at about 800 MiB (sampled), and
   map keyed by another copy of the path (1,297 → 1,151 MiB). A restore sorts
   its entries for the metadata pass by reference instead of cloning them.
 
+## Restore preverification follow-up, 2026-10-01
+
+The existing scale gate caught a regression after required-payload
+preverification was added: the xattr restore peaked at 1,141 MiB, exceeding
+its unchanged 1,024 MiB budget. File verification deep-cloned every decoded
+record into a second tree for structural validation, including every xattr
+value. Validation now borrows paths and records instead. It keeps the same
+structural checks and still verifies every original record's payload.
+
+All three release-mode profiles then passed on Linux 6.12.96, using local
+ext4 scratch. No budget or allocator setting changed:
+
+| Profile | Full backup | Incremental | Restore prepare | Restore apply |
+|---|---|---|---|---|
+| Million-file tree | 761 MiB | 1,153 MiB | 545 MiB | 1,011 MiB |
+| Large xattr sets | 454 MiB | — | 748 MiB | 796 MiB |
+| 200-member chain | 10 MiB | 12 MiB maximum | 11 MiB | 12 MiB |
+
+These measurements cover the unprivileged profiles, not the privileged 16 TB
+virtual-disk scenario. Keep validation views borrowed: required safety checks
+must not introduce another owned copy of a large tree.
+
 ## Rules of thumb
 
 - **Block and whole-disk images** stream their manifests: memory does not

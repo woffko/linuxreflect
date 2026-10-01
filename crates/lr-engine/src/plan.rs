@@ -5,6 +5,8 @@
 //! so an image that verifies can be restored and one that cannot be restored
 //! is refused up front.
 
+use std::borrow::Borrow;
+
 use lr_core::{Error, Result};
 use lr_format::{ChunkState, Superblock};
 
@@ -134,13 +136,16 @@ pub(crate) fn whole_disk<R: std::io::Read + std::io::Seek>(
 ///
 /// # Errors
 /// Returns [`Error::Corrupt`] naming the first violation.
-pub(crate) fn file_tree(
-    records: &std::collections::BTreeMap<Vec<u8>, lr_format::FileRecord>,
-) -> Result<()> {
-    crate::file::validate_tree(records)?;
+pub(crate) fn file_tree<K, V>(records: &std::collections::BTreeMap<K, V>) -> Result<()>
+where
+    K: Ord + Borrow<[u8]>,
+    V: Borrow<lr_format::FileRecord>,
+{
+    crate::file::validate_tree_records(records)?;
     let name = |path: &[u8]| String::from_utf8_lossy(path).into_owned();
     let mut groups = std::collections::HashSet::new();
     for record in records.values() {
+        let record: &lr_format::FileRecord = record.borrow();
         let entry = &record.entry;
         if !record.holes.is_empty() && entry.file_kind != lr_format::FILE_KIND_REGULAR {
             return Err(Error::corrupt(format!(
@@ -166,6 +171,7 @@ pub(crate) fn file_tree(
         }
     }
     for record in records.values() {
+        let record: &lr_format::FileRecord = record.borrow();
         let entry = &record.entry;
         if entry.file_kind == lr_format::FILE_KIND_HARDLINK
             && !groups.contains(&entry.hardlink_group)

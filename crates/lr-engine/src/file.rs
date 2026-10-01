@@ -13,6 +13,7 @@
 //! ordinary stored chunks (a compressed zero chunk is tiny and repeats dedupe),
 //! which keeps the reader free of a special "how long is a zero chunk" case.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Cursor, Read, Seek, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -1284,7 +1285,18 @@ fn write_skipping_holes(
 /// # Errors
 /// Returns [`Error::Corrupt`] naming the first offending path.
 pub fn validate_tree(entries: &BTreeMap<Vec<u8>, FileRecord>) -> Result<()> {
+    validate_tree_records(entries)
+}
+
+/// Validate owned restore records or a borrowed verification view without
+/// copying their xattrs, ACLs or content references.
+pub(crate) fn validate_tree_records<K, V>(entries: &BTreeMap<K, V>) -> Result<()>
+where
+    K: Ord + Borrow<[u8]>,
+    V: Borrow<FileRecord>,
+{
     for path in entries.keys() {
+        let path: &[u8] = path.borrow();
         if path.is_empty() {
             continue;
         }
@@ -1303,9 +1315,10 @@ pub fn validate_tree(entries: &BTreeMap<Vec<u8>, FileRecord>) -> Result<()> {
         if parent.is_empty() {
             continue;
         }
-        let parent_is_directory = entries
-            .get(parent)
-            .is_some_and(|record| record.entry.file_kind == lr_format::FILE_KIND_DIRECTORY);
+        let parent_is_directory = entries.get(parent).is_some_and(|record| {
+            let record: &FileRecord = record.borrow();
+            record.entry.file_kind == lr_format::FILE_KIND_DIRECTORY
+        });
         if !parent_is_directory {
             return Err(Error::corrupt(format!(
                 "the image places {:?} below {:?}, which is not a directory of the image; \

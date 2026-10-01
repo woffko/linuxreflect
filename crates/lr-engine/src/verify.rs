@@ -457,12 +457,15 @@ fn verify_file(
         };
         reporter.phase(&format!("member {file_name}"));
         // The tree a restore of this recovery point would build (R25).
-        let tree: std::collections::BTreeMap<Vec<u8>, lr_format::FileRecord> = records
+        // Borrow the records: cloning this view would duplicate every xattr,
+        // ACL and chunk reference during restore's preverification pass.
+        let tree: std::collections::BTreeMap<&[u8], &lr_format::FileRecord> = records
             .iter()
-            .map(|record| (record.entry.path.clone(), record.clone()))
+            .map(|record| (record.entry.path.as_slice(), record))
             .collect();
         crate::plan::file_tree(&tree)
             .map_err(|error| Error::corrupt(format!("{file_name}: {error}")))?;
+        drop(tree);
         for record in &records {
             restored_files += 1;
             let mut position_in_file = 0u64;
