@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod backup;
+mod backup_plan;
 pub mod catalog;
 pub mod chain;
 pub mod file;
@@ -32,6 +33,7 @@ pub use backup::{
     BackupReport, BackupRequest, BadSectorPolicy, Compression, ImageReport, backup_block_full,
     backup_image,
 };
+pub use backup_plan::ManifestEncoding;
 pub use file::{FileBackupOptions, FileReport, FileRestoreReport, FileRestoreRequest};
 pub use keys::Encryption;
 pub use keystore::{

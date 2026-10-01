@@ -33,9 +33,8 @@ use lr_format::{
 use lr_snapshot::btrfs::{self, TreeSnapshotOpts};
 use lr_store::Destination;
 
-use crate::backup::{
-    BackupRequest, MemberType, TempGuard, acquire_set_lock, now_unix, resolve_parent_chain,
-};
+use crate::backup::{BackupRequest, MemberType, TempGuard, acquire_set_lock, now_unix};
+use crate::backup_plan::{BackupMode, ManifestEncoding, ResolvedBackupPlan};
 use crate::keys::{self, Encryption};
 
 /// Minimum stream chunk size (spec §D).
@@ -101,8 +100,13 @@ pub struct StreamReport {
     pub image_bytes: u64,
     /// Whether chunks are encrypted.
     pub encrypted: bool,
-    /// Chain member role.
+    /// Resolved logical comparison/report role, distinct from the legacy
+    /// catalog's structural classification.
     pub member_kind: MemberKind,
+    /// Physical manifest encoding, when known. `None` means an older report
+    /// did not record this field.
+    #[serde(default)]
+    pub manifest_encoding: Option<ManifestEncoding>,
     /// Position in the chain; 0 is the full.
     pub seq_in_chain: u32,
     /// Parent image UUID; zero for a full.
@@ -247,12 +251,7 @@ fn chunk_streams<W: Write + Seek>(
 /// filesystem, [`Error::StreamParentMissing`] when a required parent snapshot
 /// is gone, and propagates snapshot, chunking, AEAD and format errors.
 pub fn backup_stream(request: &BackupRequest) -> Result<StreamReport> {
-    if request.member_type == MemberType::Differential {
-        return Err(Error::unsupported(
-            "btrfs Stream images are incremental or full; a differential would need the \
-             chain's first snapshot, which is not kept",
-        ));
-    }
+    ResolvedBackupPlan::validate_mode(BackupMode::BtrfsStream, request.member_type)?;
     let layout = discover_source(&request.source)?;
 
     // The catalog and the set lock come first so a refused parent never leaves
@@ -261,26 +260,14 @@ pub fn backup_stream(request: &BackupRequest) -> Result<StreamReport> {
     let set = destination.open_set(&request.set_id)?;
     let lock = acquire_set_lock(&*destination, &set, request)?;
     let now = now_unix();
-    let parent = resolve_parent_chain(request, &*destination, &set, now)?;
-    let set_id = parent
-        .as_ref()
-        .map(|parent| parent.set_id)
-        .filter(|id| *id != SetId::ZERO)
-        .unwrap_or(request.set_id);
-    let chain_id = parent
-        .as_ref()
-        .map_or(request.chain_id, |parent| parent.chain_id);
-    let seq_in_chain = parent
-        .as_ref()
-        .map_or(0, |parent| parent.member.seq_in_chain + 1);
-    let parent_uuid = parent
-        .as_ref()
-        .map_or(ImageId::ZERO, |parent| parent.member.image_uuid);
-    let member_kind = if parent.is_none() {
-        MemberKind::Full
-    } else {
-        MemberKind::Incremental
-    };
+    let resolved_plan =
+        ResolvedBackupPlan::resolve(request, BackupMode::BtrfsStream, &*destination, &set, now)?;
+    let parent = resolved_plan.parent();
+    let set_id = resolved_plan.set_id();
+    let chain_id = resolved_plan.chain_id();
+    let seq_in_chain = resolved_plan.seq_in_chain();
+    let parent_uuid = resolved_plan.parent_uuid();
+    let member_kind = resolved_plan.member_kind();
 
     let tree_opts = TreeSnapshotOpts {
         set_name: request.set_name.clone(),
@@ -290,13 +277,13 @@ pub fn backup_stream(request: &BackupRequest) -> Result<StreamReport> {
         // `max_incrementals_per_chain`) is sent without `-p`, and an
         // incremental must be sent relative to exactly its catalog parent's
         // snapshots, or it is refused.
-        incremental: if parent.is_none() {
+        incremental: if resolved_plan.member_type() == MemberType::Full {
             btrfs::Incremental::Never
         } else {
             btrfs::Incremental::Require
         },
-        parent_image: parent
-            .as_ref()
+        parent_image: resolved_plan
+            .parent()
             .map(|parent| *parent.member.image_uuid.inner()),
         mount_root: PathBuf::from(btrfs::DEFAULT_MOUNT_ROOT),
         general: crate::backup::snapshot_opts(request),
@@ -307,7 +294,7 @@ pub fn backup_stream(request: &BackupRequest) -> Result<StreamReport> {
     let mut reporter = request.context.clone().reporter(0)?;
     reporter.phase("stream");
 
-    let new_keys = match &parent {
+    let new_keys = match parent {
         Some(parent) => keys::member_chain_keys(
             &request.encryption,
             &parent.superblock,
@@ -364,7 +351,7 @@ pub fn backup_stream(request: &BackupRequest) -> Result<StreamReport> {
     let mode = if all_full { "full" } else { "incr" };
     let base_name = format!(
         "{seq_in_chain:03}-{}-{}.lrimg",
-        request.member_type.file_tag(),
+        resolved_plan.file_tag(),
         request.image_uuid
     );
     let image_name = format!("{chain_dir}/{base_name}");
@@ -519,7 +506,7 @@ pub fn backup_stream(request: &BackupRequest) -> Result<StreamReport> {
         excluded_subvolumes: snapshot.excluded.clone(),
         image_path: crate::backup::local_image_path(&set_root, &image_name),
         image_uuid: request.image_uuid,
-        chain_id: request.chain_id,
+        chain_id: resolved_plan.chain_id(),
         consistency: superblock.consistency,
         fs_uuid: snapshot.fs_uuid.clone(),
         label: snapshot.label.clone(),
@@ -532,6 +519,7 @@ pub fn backup_stream(request: &BackupRequest) -> Result<StreamReport> {
         image_bytes,
         encrypted: new_keys.encrypted,
         member_kind,
+        manifest_encoding: Some(resolved_plan.manifest_encoding()),
         seq_in_chain,
         parent_uuid,
     })

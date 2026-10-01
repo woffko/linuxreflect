@@ -163,7 +163,11 @@ pub fn open_chain(
     Ok(members)
 }
 
-/// The role of a member, from its sequence and delta flag.
+/// Legacy structural classification from the sequence, image kind and delta flag.
+///
+/// This is not a record of the caller's comparison policy: noninitial File
+/// members are classified as `Differential` because their manifests contain
+/// full trees, including those produced with incremental policy (D-130).
 #[must_use]
 pub fn member_kind(superblock: &Superblock) -> MemberKind {
     if superblock.seq_in_chain == 0 {

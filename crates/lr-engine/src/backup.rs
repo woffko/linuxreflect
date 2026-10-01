@@ -27,6 +27,7 @@ use lr_fsmap::provider_for;
 use lr_snapshot::offline_provider;
 use lr_store::{Destination, DestinationOptions};
 
+use crate::backup_plan::{BackupMode, ManifestEncoding, ResolvedBackupPlan};
 use crate::keys::{self, Encryption};
 use crate::keystore::Passphrase;
 
@@ -288,8 +289,12 @@ pub struct BackupReport {
     pub map_complete: bool,
     /// Whether chunks are encrypted.
     pub encrypted: bool,
-    /// Chain member role.
+    /// Resolved logical comparison/report role, distinct from physical encoding.
     pub member_kind: MemberKind,
+    /// Physical manifest encoding, when known. `None` means an older report
+    /// did not record this field.
+    #[serde(default)]
+    pub manifest_encoding: Option<ManifestEncoding>,
     /// Position in the chain; 0 is the full.
     pub seq_in_chain: u32,
     /// Parent image UUID; zero for a full.
@@ -402,30 +407,18 @@ pub fn backup_block_with(
     let set = destination.open_set(&request.set_id)?;
     let lock = acquire_set_lock(&*destination, &set, request)?;
     let now = now_unix();
-    let parent = resolve_parent_chain(request, &*destination, &set, now)?;
-    let set_id = parent
-        .as_ref()
-        .map(|parent| parent.set_id)
-        .filter(|id| *id != SetId::ZERO)
-        .unwrap_or(request.set_id);
-    let chain_id = parent
-        .as_ref()
-        .map_or(request.chain_id, |parent| parent.chain_id);
-    let seq_in_chain = parent
-        .as_ref()
-        .map_or(0, |parent| parent.member.seq_in_chain + 1);
-    let parent_uuid = parent
-        .as_ref()
-        .map_or(ImageId::ZERO, |parent| parent.member.image_uuid);
-    let member_kind = match (&parent, request.member_type) {
-        (None, _) => MemberKind::Full,
-        (Some(_), MemberType::Incremental) => MemberKind::Incremental,
-        (Some(_), _) => MemberKind::Differential,
-    };
+    let resolved_plan =
+        ResolvedBackupPlan::resolve(request, BackupMode::Block, &*destination, &set, now)?;
+    let parent = resolved_plan.parent();
+    let set_id = resolved_plan.set_id();
+    let chain_id = resolved_plan.chain_id();
+    let seq_in_chain = resolved_plan.seq_in_chain();
+    let parent_uuid = resolved_plan.parent_uuid();
+    let member_kind = resolved_plan.member_kind();
 
     // 5. Keys and superblock. A member reuses the chain key of its parent, so
     //    the whole chain shares one `dedup_key` (spec §G.4).
-    let new_keys = match &parent {
+    let new_keys = match parent {
         Some(parent) => keys::member_chain_keys(
             &request.encryption,
             &parent.superblock,
@@ -443,7 +436,7 @@ pub fn backup_block_with(
     if matches!(request.compression, Compression::Zstd { .. }) {
         sb_flags |= flags::COMPRESSED;
     }
-    if member_kind == MemberKind::Incremental {
+    if resolved_plan.manifest_encoding() == ManifestEncoding::BlockDelta {
         sb_flags |= flags::DELTA_MANIFEST;
     }
     let mut superblock = Superblock {
@@ -479,7 +472,7 @@ pub fn backup_block_with(
     let chain_dir = chain_id.to_string();
     let base_name = format!(
         "{seq_in_chain:03}-{}-{}.lrimg",
-        request.member_type.file_tag(),
+        resolved_plan.file_tag(),
         request.image_uuid
     );
     let image_name = format!("{chain_dir}/{base_name}");
@@ -527,7 +520,7 @@ pub fn backup_block_with(
                 .unwrap_or_default(),
         };
         let header_offset = spool.stream_position().map_err(Error::Io)?;
-        let counts = match &parent {
+        let counts = match parent {
             None => {
                 header.write(&mut spool, false)?;
                 let counts = write_full_entries(
@@ -548,7 +541,7 @@ pub fn backup_block_with(
                 counts
             }
             Some(parent) => {
-                let delta = member_kind == MemberKind::Incremental;
+                let delta = resolved_plan.manifest_encoding() == ManifestEncoding::BlockDelta;
                 header.write(&mut spool, delta)?;
                 let member = u16::try_from(seq_in_chain).map_err(|_| {
                     Error::unsupported("chains longer than 65535 members are not supported")
@@ -686,7 +679,7 @@ pub fn backup_block_with(
             "source={}\nconsistency={}\nfs_type={fs_type}\nkind={}\nseq={seq_in_chain}\n",
             request.source.display(),
             superblock.consistency,
-            request.member_type.file_tag()
+            resolved_plan.file_tag()
         );
         write_extras_record(&mut extras, EXTRAS_IMAGE_METADATA, metadata.as_bytes())?;
         extras.finish()?;
@@ -740,6 +733,7 @@ pub fn backup_block_with(
         map_complete: map.complete,
         encrypted: new_keys.encrypted,
         member_kind,
+        manifest_encoding: Some(resolved_plan.manifest_encoding()),
         seq_in_chain,
         parent_uuid,
         changed_chunks: counts.changed,

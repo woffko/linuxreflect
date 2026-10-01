@@ -17,7 +17,7 @@ use std::process::Command;
 use lr_engine::backup::{BackupRequest, Compression, MemberType};
 use lr_engine::keys::Encryption;
 use lr_engine::stream::{StreamRestoreRequest, restore_stream};
-use lr_engine::{ImageReport, backup_image};
+use lr_engine::{ImageReport, ManifestEncoding, backup_image};
 
 fn root_tests_enabled() -> bool {
     if std::env::var("LR_ROOT_TESTS").as_deref() != Ok("1") {
@@ -547,11 +547,42 @@ fn btrfs_send_parents_follow_the_catalog() {
 
     // 1. Rollover: full, one incremental, then a requested incremental that
     //    exceeds the limit and becomes a new full.
-    stream_report(backup_image(&request(&dest_a, MemberType::Full)).expect("full"));
+    let full = stream_report(backup_image(&request(&dest_a, MemberType::Full)).expect("full"));
+    assert_eq!(full.member_kind, lr_core::catalog::MemberKind::Full);
+    assert_eq!(full.manifest_encoding, Some(ManifestEncoding::BtrfsSend));
+    assert_eq!(full.seq_in_chain, 0);
+    assert_eq!(full.parent_uuid, lr_core::ImageId::ZERO);
+    assert!(
+        full.image_path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.starts_with("000-full-")),
+        "{}",
+        full.image_path.display()
+    );
     write_file(&root_subvol.path().join("etc/f2"), "two\n");
     let first_incremental =
         stream_report(backup_image(&request(&dest_a, MemberType::Incremental)).expect("incr"));
     assert_eq!(first_incremental.seq_in_chain, 1);
+    assert_eq!(
+        first_incremental.member_kind,
+        lr_core::catalog::MemberKind::Incremental
+    );
+    assert_eq!(
+        first_incremental.manifest_encoding,
+        Some(ManifestEncoding::BtrfsSend)
+    );
+    assert_eq!(first_incremental.parent_uuid, full.image_uuid);
+    assert_eq!(first_incremental.chain_id, full.chain_id);
+    assert!(
+        first_incremental
+            .image_path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.starts_with("001-incr-")),
+        "{}",
+        first_incremental.image_path.display()
+    );
     write_file(&root_subvol.path().join("etc/f3"), "three\n");
     // The catalog orders chains by their creation second, and a tie makes
     // `--parent latest` ambiguous (D-116): start each new chain on A in a
@@ -560,7 +591,23 @@ fn btrfs_send_parents_follow_the_catalog() {
     next_second();
     let rollover =
         stream_report(backup_image(&request(&dest_a, MemberType::Incremental)).expect("rollover"));
+    assert_eq!(rollover.member_kind, lr_core::catalog::MemberKind::Full);
+    assert_eq!(
+        rollover.manifest_encoding,
+        Some(ManifestEncoding::BtrfsSend)
+    );
     assert_eq!(rollover.seq_in_chain, 0, "the rollover starts a new chain");
+    assert_eq!(rollover.parent_uuid, lr_core::ImageId::ZERO);
+    assert_ne!(rollover.chain_id, first_incremental.chain_id);
+    assert!(
+        rollover
+            .image_path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.starts_with("000-full-")),
+        "a requested incremental that rolls over must be named full: {}",
+        rollover.image_path.display()
+    );
     assert!(
         rollover
             .subvolumes

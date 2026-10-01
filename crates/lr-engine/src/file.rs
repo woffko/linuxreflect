@@ -33,8 +33,8 @@ use lr_format::{
 
 use crate::backup::{
     BackupRequest, Compression, MemberType, TempGuard, acquire_set_lock, now_unix,
-    resolve_parent_chain,
 };
+use crate::backup_plan::{BackupMode, ManifestEncoding, ResolvedBackupPlan};
 use crate::keys::{self, Encryption};
 use crate::tree::{self, WalkOptions};
 
@@ -203,8 +203,14 @@ pub struct FileReport {
     pub image_bytes: u64,
     /// Whether chunks are encrypted.
     pub encrypted: bool,
-    /// Chain member role.
+    /// Resolved logical comparison/report role. This is distinct from the
+    /// legacy catalog's structural classification: every file member stores
+    /// a full tree manifest regardless of Incremental or Differential policy.
     pub member_kind: MemberKind,
+    /// Physical manifest encoding, when known. `None` means an older report
+    /// did not record this field.
+    #[serde(default)]
+    pub manifest_encoding: Option<ManifestEncoding>,
     /// Position in the chain; 0 is the full.
     pub seq_in_chain: u32,
     /// Parent image UUID; zero for a full.
@@ -246,40 +252,27 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
     let set = destination.open_set(&request.set_id)?;
     let lock = acquire_set_lock(&*destination, &set, request)?;
     let now = now_unix();
-    let parent = resolve_parent_chain(request, &*destination, &set, now)?;
-    let set_id = parent
-        .as_ref()
-        .map(|parent| parent.set_id)
-        .filter(|id| *id != SetId::ZERO)
-        .unwrap_or(request.set_id);
-    let chain_id = parent
-        .as_ref()
-        .map_or(request.chain_id, |parent| parent.chain_id);
-    let seq_in_chain = parent
-        .as_ref()
-        .map_or(0, |parent| parent.member.seq_in_chain + 1);
-    let parent_uuid = parent
-        .as_ref()
-        .map_or(ImageId::ZERO, |parent| parent.member.image_uuid);
-    let member_kind = match (&parent, request.member_type) {
-        (None, _) => MemberKind::Full,
-        (Some(_), MemberType::Incremental) => MemberKind::Incremental,
-        (Some(_), _) => MemberKind::Differential,
-    };
+    let resolved_plan =
+        ResolvedBackupPlan::resolve(request, BackupMode::File, &*destination, &set, now)?;
+    let parent = resolved_plan.parent();
+    let set_id = resolved_plan.set_id();
+    let chain_id = resolved_plan.chain_id();
+    let seq_in_chain = resolved_plan.seq_in_chain();
+    let parent_uuid = resolved_plan.parent_uuid();
+    let member_kind = resolved_plan.member_kind();
 
-    // The base state an incremental/differential compares against: the newest
-    // member of the parent chain.
+    // The base state selected by the resolved comparison policy below.
     // Each entry is keyed by its path, moved out of the entry so it is held
     // once, with what the reference member recorded to detect a change
     // without reading the file (D-111; none for a parent written before).
     let mut base: HashMap<Vec<u8>, (FileEntry, Option<ChangeStamp>)> = HashMap::new();
-    if let Some(parent) = &parent {
+    if let Some(parent) = parent {
         let mut members =
             crate::chain::open_chain(&*destination, &set, &parent.files, &request.encryption)?;
         // A differential compares against the chain's full (D-066); an
         // incremental compares against the newest member. Both are restored
         // with their whole ancestry (D-114).
-        let against_full = request.member_type == MemberType::Differential;
+        let against_full = resolved_plan.member_type() == MemberType::Differential;
         let reference = if against_full {
             members.first_mut()
         } else {
@@ -296,7 +289,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
         }
     }
 
-    let new_keys = match &parent {
+    let new_keys = match parent {
         Some(parent) => keys::member_chain_keys(
             &request.encryption,
             &parent.superblock,
@@ -354,7 +347,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
     let chain_dir = chain_id.to_string();
     let base_name = format!(
         "{seq_in_chain:03}-{}-{}.lrimg",
-        request.member_type.file_tag(),
+        resolved_plan.file_tag(),
         request.image_uuid
     );
     let image_name = format!("{chain_dir}/{base_name}");
@@ -622,6 +615,7 @@ pub fn backup_file(request: &BackupRequest, options: &FileBackupOptions) -> Resu
         image_bytes,
         encrypted: new_keys.encrypted,
         member_kind,
+        manifest_encoding: Some(resolved_plan.manifest_encoding()),
         seq_in_chain,
         parent_uuid,
         warnings,

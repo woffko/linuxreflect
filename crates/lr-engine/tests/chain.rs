@@ -15,7 +15,7 @@ use lr_engine::catalog;
 use lr_engine::keys::Encryption;
 use lr_engine::keystore::Passphrase;
 use lr_engine::restore::{ApplyRequest, PrepareRequest, apply_restore, prepare_restore};
-use lr_engine::{ImageReport, backup_image};
+use lr_engine::{ImageReport, ManifestEncoding, backup_image};
 use lr_store::{Destination, LocalDestination, LockOwner};
 
 const DEVICE_SIZE: u64 = 1024 * 1024 * 1024;
@@ -159,7 +159,24 @@ fn an_incremental_stores_only_what_changed() {
         backup_image(&request(&source, &dest, Encryption::NoEncrypt)).expect("full backup"),
     );
     assert_eq!(full.member_kind, MemberKind::Full);
+    assert_eq!(full.manifest_encoding, Some(ManifestEncoding::BlockFull));
     assert_eq!(full.seq_in_chain, 0);
+    let full_chain_dir = full.chain_id.to_string();
+    assert_eq!(
+        full.image_path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(std::ffi::OsStr::to_str),
+        Some(full_chain_dir.as_str())
+    );
+    assert!(
+        full.image_path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.starts_with("000-full-")),
+        "full role and sequence come from the resolved plan: {}",
+        full.image_path.display()
+    );
     assert_eq!(
         full.total_chunks,
         DEVICE_SIZE.div_ceil(u64::from(CHUNK_SIZE))
@@ -175,9 +192,22 @@ fn an_incremental_stores_only_what_changed() {
     let incremental =
         stream_report(backup_image(&incremental_request).expect("incremental backup"));
     assert_eq!(incremental.member_kind, MemberKind::Incremental);
+    assert_eq!(
+        incremental.manifest_encoding,
+        Some(ManifestEncoding::BlockDelta)
+    );
     assert_eq!(incremental.seq_in_chain, 1);
     assert_eq!(incremental.parent_uuid, full.image_uuid);
     assert_eq!(incremental.chain_id, full.chain_id);
+    assert!(
+        incremental
+            .image_path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.starts_with("001-incr-")),
+        "incremental role and sequence come from the resolved plan: {}",
+        incremental.image_path.display()
+    );
 
     let changed_bytes = incremental.changed_chunks * u64::from(CHUNK_SIZE);
     assert!(
@@ -201,6 +231,7 @@ fn an_incremental_stores_only_what_changed() {
     let mut quiet_request = request(&source, &dest, Encryption::NoEncrypt);
     quiet_request.member_type = MemberType::Incremental;
     let quiet = stream_report(backup_image(&quiet_request).expect("quiet incremental"));
+    assert_eq!(quiet.manifest_encoding, Some(ManifestEncoding::BlockDelta));
     assert_eq!(quiet.seq_in_chain, 2);
     assert_eq!(quiet.changed_chunks, 0, "nothing changed");
     assert!(

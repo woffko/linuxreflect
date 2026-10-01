@@ -10,6 +10,7 @@
 use std::path::Path;
 use std::process::Command;
 
+use lr_engine::ManifestEncoding;
 use lr_engine::backup::{BackupRequest, Compression, MemberType};
 use lr_engine::file::{FileBackupOptions, backup_file};
 use lr_engine::keys::Encryption;
@@ -120,6 +121,28 @@ fn a_tree_round_trips_with_no_rsync_difference() {
     )
     .expect("backup");
     assert!(report.files >= 4, "{report:?}");
+    assert_eq!(report.member_kind, lr_core::catalog::MemberKind::Full);
+    assert_eq!(report.manifest_encoding, Some(ManifestEncoding::FileTree));
+    assert_eq!(report.seq_in_chain, 0);
+    assert_eq!(report.parent_uuid, lr_core::ImageId::ZERO);
+    let chain_dir = report.chain_id.to_string();
+    assert_eq!(
+        report
+            .image_path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(std::ffi::OsStr::to_str),
+        Some(chain_dir.as_str())
+    );
+    assert!(
+        report
+            .image_path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.starts_with("000-full-")),
+        "{}",
+        report.image_path.display()
+    );
     assert_eq!(report.consistency, lr_core::Consistency::PerFile);
     assert!(report.chunked_bytes >= 300 * 1024);
 
@@ -156,6 +179,10 @@ fn an_incremental_stores_only_the_changed_file() {
     full.member_type = MemberType::Full;
     let full_report = backup_file(&full, &FileBackupOptions::default()).expect("full");
     assert_eq!(full_report.unchanged_files, 0);
+    assert_eq!(
+        full_report.manifest_encoding,
+        Some(ManifestEncoding::FileTree)
+    );
 
     // One file changes; the other files must be inherited from the full.
     std::fs::write(source.join("var/lib/data.bin"), payload(9, 301 * 1024)).expect("change");
@@ -173,7 +200,26 @@ fn an_incremental_stores_only_the_changed_file() {
         incremental_report.chunked_bytes <= 400 * 1024,
         "an incremental should not re-chunk unchanged files: {incremental_report:?}"
     );
+    assert_eq!(
+        incremental_report.member_kind,
+        lr_core::catalog::MemberKind::Incremental
+    );
+    assert_eq!(
+        incremental_report.manifest_encoding,
+        Some(ManifestEncoding::FileTree)
+    );
+    assert_eq!(incremental_report.seq_in_chain, 1);
     assert_eq!(incremental_report.parent_uuid, full_report.image_uuid);
+    assert_eq!(incremental_report.chain_id, full_report.chain_id);
+    assert!(
+        incremental_report
+            .image_path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.starts_with("001-incr-")),
+        "{}",
+        incremental_report.image_path.display()
+    );
 
     let plan = prepare_restore(&PrepareRequest::from_path(
         &incremental_report.image_path,
@@ -188,6 +234,61 @@ fn an_incremental_stores_only_the_changed_file() {
     assert!(
         difference.is_empty(),
         "rsync -nac reports differences after an incremental restore:\n{difference}"
+    );
+}
+
+#[test]
+fn a_resolved_file_rollover_uses_the_new_full_identity_and_encoding() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = dir.path().join("source");
+    let dest = dir.path().join("backups");
+    std::fs::create_dir_all(&source).expect("source");
+    std::fs::write(source.join("data.txt"), b"one\n").expect("file");
+
+    let mut full_request = request(&source, &dest, "rollover-set");
+    full_request.member_type = MemberType::Full;
+    let full = backup_file(&full_request, &FileBackupOptions::default()).expect("full");
+
+    let mut incremental_request = request(&source, &dest, "rollover-set");
+    incremental_request.member_type = MemberType::Incremental;
+    incremental_request.parent = Some("latest".to_owned());
+    incremental_request.max_incrementals_per_chain = Some(1);
+    let incremental =
+        backup_file(&incremental_request, &FileBackupOptions::default()).expect("incremental");
+
+    let mut rollover_request = request(&source, &dest, "rollover-set");
+    rollover_request.member_type = MemberType::Incremental;
+    rollover_request.parent = Some(incremental.image_uuid.to_string());
+    rollover_request.max_incrementals_per_chain = Some(1);
+    let requested_chain_id = rollover_request.chain_id;
+    let rollover = backup_file(&rollover_request, &FileBackupOptions::default())
+        .expect("resolved rollover becomes a full");
+
+    assert_eq!(incremental.seq_in_chain, 1);
+    assert_eq!(incremental.parent_uuid, full.image_uuid);
+    assert_eq!(rollover.member_kind, lr_core::catalog::MemberKind::Full);
+    assert_eq!(rollover.manifest_encoding, Some(ManifestEncoding::FileTree));
+    assert_eq!(rollover.seq_in_chain, 0);
+    assert_eq!(rollover.parent_uuid, lr_core::ImageId::ZERO);
+    assert_eq!(rollover.chain_id, requested_chain_id);
+    assert_ne!(rollover.chain_id, incremental.chain_id);
+    let chain_dir = rollover.chain_id.to_string();
+    assert_eq!(
+        rollover
+            .image_path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(std::ffi::OsStr::to_str),
+        Some(chain_dir.as_str())
+    );
+    assert!(
+        rollover
+            .image_path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.starts_with("000-full-")),
+        "a requested incremental that rolls over must be named full: {}",
+        rollover.image_path.display()
     );
 }
 
