@@ -250,6 +250,33 @@ listed per file in the report and summed up in a warning;
 `--strict-metadata` makes that a failure instead (D-123). Success is reported
 only after the files are on stable storage.
 
+## Recovering an interrupted operation
+
+A disconnected CLI or GUI does not prove that a daemon job stopped. Check its
+status before retrying. `GetJob` retains the terminal report for the daemon's
+process lifetime; it cannot recover a job after the daemon itself restarts.
+
+For a killed backup using a local or mounted destination, first confirm the
+writer is no longer running and check the destination mount. A leftover
+`.lrimg.<uuid>.tmp` is not a published recovery point: do not rename it to
+`.lrimg` or treat it as a backup. Verify an older finalized image and test its
+restore before relying on the set.
+
+The set lock can survive an abrupt kill. The default lease is 300 seconds from
+its last refresh. Ordinary retry still refuses an expired lock; after confirming
+there is no writer and waiting for expiry, explicitly add `--break-stale-lock`
+to the backup command. An unexpired lock must still refuse that request. Do not
+delete the lock manually or change the clock to bypass it. This procedure is
+not a guarantee of distributed writer fencing on every storage backend.
+
+Once restore apply is admitted, its one-use token is consumed. Interruption
+during writes can leave a partial target; preserve it for inspection. For file
+mode, the safe retry is a new prepare/token and a fresh empty directory, followed
+by content and metadata comparison. Preparing the nonempty partial directory
+without `--merge` is refused; `--merge` is an explicit overwrite choice, not
+automatic resume or rollback. A block-device restore requires a separately
+reviewed target and new authorization, not this directory retry procedure.
+
 ## Scheduling
 
 Jobs are described in `/etc/linuxreflect/config.toml` (spec §J.2) and turned
