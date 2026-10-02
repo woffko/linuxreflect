@@ -221,7 +221,14 @@ impl LocalDestination {
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     match read_lock(&path)? {
                         Some(existing) if existing.is_stale(now_unix()) && break_stale => {
-                            let file = open_nofollow(&path).map_err(Error::Io)?;
+                            // NFS exclusive locks require a writable descriptor.
+                            // Open the existing record without creating or truncating it.
+                            let file = OpenOptions::new()
+                                .read(true)
+                                .write(true)
+                                .custom_flags(O_NOFOLLOW)
+                                .open(&path)
+                                .map_err(Error::Io)?;
                             match file.try_lock() {
                                 Ok(()) => {
                                     std::fs::remove_file(&path).map_err(Error::Io)?;

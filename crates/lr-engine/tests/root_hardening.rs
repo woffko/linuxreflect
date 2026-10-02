@@ -12,6 +12,7 @@
 //! * a 16 TB virtual disk produces a valid image whose metadata stream keeps
 //!   the process inside a documented RSS bound.
 
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -20,6 +21,7 @@ use lr_engine::backup::{BackupRequest, BadSectorPolicy, Compression};
 use lr_engine::keys::Encryption;
 use lr_engine::restore::{ApplyRequest, PrepareRequest, apply_restore, prepare_restore};
 use lr_engine::{backup_block_full, backup_image};
+use lr_store::{Destination, LocalDestination, LockOwner, LockRecord};
 
 fn root_tests_enabled() -> bool {
     if std::env::var("LR_ROOT_TESTS").as_deref() != Ok("1") {
@@ -942,9 +944,17 @@ fn an_nfs_destination_survives_an_interruption() {
     let dir = tempfile::tempdir().expect("tempdir");
     let export_dir = dir.path().join("export");
     let mount = dir.path().join("nfs");
+    let _layers = MountLayers { at: mount.clone() };
     let Some(export) = start_nfs(dir.path(), &export_dir, &mount) else {
         return;
     };
+    if let Err(error) = check_nfs_stale_lock_behavior(&mount) {
+        let mount_path = mount.display().to_string();
+        let _ = run("umount", &["-f", &mount_path]);
+        let _ = run("umount", &["-l", &mount_path]);
+        let _ = run("exportfs", &["-u", &export]);
+        panic!("NFS stale-lock regression failed: {error}");
+    }
     // Unexport and force-unmount: an NFS server that goes away leaves the
     // client's open file unusable, which is what the writer must notice.
     interrupt_destination(
@@ -959,6 +969,85 @@ fn an_nfs_destination_survives_an_interruption() {
     );
     let _ = run("umount", &["-f", &mount.display().to_string()]);
     let _ = run("exportfs", &["-u", &export]);
+}
+
+fn write_nfs_test_lock(
+    destination: &LocalDestination,
+    owner: &LockOwner,
+    created: u64,
+    ttl_secs: u64,
+) -> Result<(), String> {
+    let record = LockRecord {
+        owner: owner.clone(),
+        created,
+        ttl_secs,
+        ..LockRecord::default()
+    };
+    let bytes = serde_json::to_vec(&record)
+        .map_err(|error| format!("serialize NFS test lock record: {error}"))?;
+    std::fs::write(destination.lock_path(), bytes)
+        .map_err(|error| format!("write NFS test lock record: {error}"))
+}
+
+/// Exercise local set-lock behavior only under a disposable set on the NFS mount.
+fn check_nfs_stale_lock_behavior(mount: &Path) -> Result<(), String> {
+    let destination = LocalDestination::new(mount.join("lock-regression"), "stale-lock-set");
+    let set = destination
+        .open_set(&lr_core::SetId::ZERO)
+        .map_err(|error| format!("create NFS lock test set: {error}"))?;
+    let owner = LockOwner {
+        host_id: "nfs-lock-regression".to_owned(),
+        pid: std::process::id(),
+    };
+    let ttl = Duration::from_secs(60);
+
+    write_nfs_test_lock(&destination, &owner, 1, 1)?;
+    match destination.lock_set(&set, &owner, ttl) {
+        Err(lr_core::Error::SetLocked { .. }) => {}
+        Err(error) => return Err(format!("ordinary stale-lock acquisition returned {error}")),
+        Ok(lock) => {
+            drop(lock);
+            return Err("ordinary acquisition accepted an expired lock".to_owned());
+        }
+    }
+
+    let reclaimed = destination
+        .lock_set_breaking_stale(&set, &owner, ttl)
+        .map_err(|error| format!("explicit stale-lock acquisition failed: {error}"))?;
+    drop(reclaimed);
+
+    write_nfs_test_lock(&destination, &owner, 1, 1)?;
+    let live_holder = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(destination.lock_path())
+        .map_err(|error| format!("open NFS live-holder fixture: {error}"))?;
+    live_holder
+        .try_lock()
+        .map_err(|error| format!("lock NFS live-holder fixture: {error:?}"))?;
+    match destination.lock_set_breaking_stale(&set, &owner, ttl) {
+        Err(lr_core::Error::SetLocked { .. }) => {}
+        Err(error) => return Err(format!("live-holder stale-lock refusal returned {error}")),
+        Ok(lock) => {
+            drop(lock);
+            return Err("explicit stale-lock acquisition broke a live holder".to_owned());
+        }
+    }
+    drop(live_holder);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("read current time for NFS lock fixture: {error}"))?
+        .as_secs();
+    write_nfs_test_lock(&destination, &owner, now, 3_600)?;
+    match destination.lock_set_breaking_stale(&set, &owner, ttl) {
+        Err(lr_core::Error::SetLocked { .. }) => Ok(()),
+        Err(error) => Err(format!("unexpired-lock refusal returned {error}")),
+        Ok(lock) => {
+            drop(lock);
+            Err("explicit stale-lock acquisition accepted an unexpired lock".to_owned())
+        }
+    }
 }
 
 /// A tiny initramfs that announces itself on the serial console.
