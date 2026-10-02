@@ -1784,3 +1784,21 @@ member is classified as `Differential` because it has a full-tree manifest.
 It cannot establish the historical caller's comparison policy. Do not infer
 that policy from mutable filenames or set a false block-delta flag. No image
 format bits, catalog topology or restore ancestry rules change in this step.
+
+## D-131 — Terminal job replies derive from the retained outcome
+
+The daemon registry owns each job's terminal outcome. Completion events and
+`GetJob` project the same retained snapshot, including the successful report or
+the failure/cancellation code. Store the outcome, capture its snapshot and
+publish the terminal event while holding the registry lock; a reused ID cannot
+publish its next start before the prior completion. Clear an old success report
+when recording an error.
+
+The GUI uses the recovered report for the same result details as live completion.
+A daemon-confirmed finished job with a missing or malformed report is explicitly
+shown as finished with its result unavailable, not replaced by an empty success
+report. Terminal UI updates recheck generation and job identity before clearing
+admission, so late replies cannot finish a newer job.
+
+Results remain in memory for the daemon process's lifetime only. This does not
+persist jobs across daemon restart or implement durable verification history.

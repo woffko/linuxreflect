@@ -3,6 +3,15 @@
 
 use super::*;
 
+fn recovered_summary(state: &lr_proto::v1::JobState) -> Option<String> {
+    let summary = state.progress.as_ref().and_then(client::summary_of)?;
+    let value = serde_json::from_str::<serde_json::Value>(&summary).ok()?;
+    value
+        .as_object()
+        .filter(|object| !object.is_empty())
+        .map(|_| summary)
+}
+
 /// State shared by the callbacks and the running actions.
 pub(crate) struct Shared {
     pub(crate) busy: AtomicBool,
@@ -570,8 +579,11 @@ impl Actions {
                 }
                 match result {
                     Ok(state) if state.state == "finished" => {
-                        let summary = state.progress.as_ref().and_then(client::summary_of).unwrap_or_default();
-                        actions.finish(&ui, &operation, &summary);
+                        if let Some(summary) = recovered_summary(&state) {
+                            actions.finish(&ui, &operation, &summary);
+                        } else {
+                            actions.finish_without_report(&ui, &operation);
+                        }
                     }
                     Ok(state) if state.state == "failed" || state.state == "cancelled" => {
                         let failure = match state.progress.and_then(|progress| progress.step) {
@@ -788,10 +800,12 @@ mod lifecycle_tests {
             // The original stream can terminate after GetJob has confirmed
             // completion and another operation has been admitted.
             stale_stream.finish(&weak, "backup", "{}");
+            stale_stream.finish_without_report(&weak, "backup");
             stale_stream.fail(&weak, "backup", &anyhow::anyhow!("late stream disconnect"));
             let mut stale = actions.clone_handle();
             stale.expected_job = Some("completed-job".into());
             stale.finish(&weak, "backup", "{}");
+            stale.finish_without_report(&weak, "backup");
             stale.fail(
                 &weak,
                 "backup",
@@ -810,8 +824,27 @@ mod lifecycle_tests {
                 assert_eq!(ui.get_progress(), 0.25);
                 assert_eq!(ui.get_backup_job().stage, generated::JobStage::Succeeded);
                 assert!(actions.shared.failure.lock().unwrap().is_none());
-                observed.store(true, Ordering::SeqCst);
-                slint::quit_event_loop().expect("stop test event loop");
+                let mut recovered = actions.clone_handle();
+                recovered.expected_job = Some("replacement-job".into());
+                recovered.finish_without_report(&weak, "restore");
+                assert!(actions.shared.busy.load(Ordering::SeqCst));
+                assert!(!actions.start(&weak, "backup"));
+                assert_eq!(ui.get_job_id(), "replacement-job");
+                slint::invoke_from_event_loop(move || {
+                    let ui = weak.upgrade().expect("test UI remains alive");
+                    assert!(!actions.shared.busy.load(Ordering::SeqCst));
+                    assert!(!ui.get_busy());
+                    assert!(!ui.get_has_job());
+                    assert!(ui.get_job_id().is_empty());
+                    assert_eq!(ui.get_status(), "restore finished; result unavailable");
+                    assert_eq!(ui.get_restore_job().stage, generated::JobStage::Succeeded);
+                    assert_eq!(ui.get_restore_job().report, "Result report unavailable.");
+                    assert!(ui.get_result_text().contains("missing or malformed"));
+                    assert!(actions.shared.failure.lock().unwrap().is_none());
+                    observed.store(true, Ordering::SeqCst);
+                    slint::quit_event_loop().expect("stop test event loop");
+                })
+                .expect("queue unavailable-report assertions");
             })
             .expect("queue stale-reply assertions");
         })
@@ -959,6 +992,85 @@ impl ActionsHandle {
                 shared.busy.store(false, Ordering::SeqCst);
             }
         });
+    }
+
+    pub(crate) fn finish_without_report(&self, ui: &slint::Weak<MainWindow>, label: &str) {
+        let shared = Arc::clone(&self.shared);
+        let generation = self.generation;
+        let expected_job = self.expected_job.clone();
+        let weak = ui.clone();
+        let label = label.to_owned();
+        let message = format!(
+            "The daemon reports this {label} job finished, but its result report is missing or malformed. Review the destination before retrying."
+        );
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                if shared.generation.load(Ordering::SeqCst) != generation
+                    || !shared.busy.load(Ordering::SeqCst)
+                {
+                    return;
+                }
+                if expected_job
+                    .as_ref()
+                    .is_some_and(|id| !ui.get_has_job() || ui.get_job_id().as_str() != id.as_str())
+                {
+                    return;
+                }
+                ui.set_status(format!("{label} finished; result unavailable").into());
+                job_view::update(&ui, &label, |view| {
+                    view.stage = generated::JobStage::Succeeded;
+                    view.detail = message.clone().into();
+                    view.report = "Result report unavailable.".into();
+                });
+                ui.set_phase("idle".into());
+                ui.set_busy(false);
+                ui.set_progress(1.0);
+                ui.set_progress_text("Completed; result report unavailable.".into());
+                ui.set_result_text(message.into());
+                ui.set_has_job(false);
+                ui.set_job_id("".into());
+                if label == "backup" {
+                    ui.set_history(slint::ModelRc::default());
+                }
+                shared.busy.store(false, Ordering::SeqCst);
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod recovered_job_result_tests {
+    use super::recovered_summary;
+    use lr_proto::v1::{Finished, JobState, Progress, progress::Step};
+
+    fn status(summary_json: Option<&str>) -> JobState {
+        JobState {
+            state: "finished".to_owned(),
+            progress: summary_json.map(|summary_json| Progress {
+                step: Some(Step::Finished(Finished {
+                    summary_json: summary_json.to_owned(),
+                })),
+            }),
+            ..JobState::default()
+        }
+    }
+
+    #[test]
+    fn recovery_requires_a_nonempty_json_report() {
+        for summary in ["", "not json", "[]", "{}"] {
+            assert_eq!(
+                recovered_summary(&status(Some(summary))),
+                None,
+                "{summary:?}"
+            );
+        }
+        assert_eq!(recovered_summary(&status(None)), None);
+
+        let summary = r#"{"image_uri":"/backup/full.lrimg","warnings":["one"]}"#;
+        assert_eq!(
+            recovered_summary(&status(Some(summary))).as_deref(),
+            Some(summary)
+        );
     }
 }
 

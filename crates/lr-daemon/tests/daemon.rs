@@ -868,6 +868,34 @@ async fn a_named_destination_is_used_by_name() {
         progress.push(step);
     }
     assert!(failure_code(&progress).is_none(), "{progress:?}");
+    let summary = finished_summary(&progress)
+        .expect("the file backup report")
+        .to_owned();
+    let job_id = progress
+        .iter()
+        .find_map(|item| match &item.step {
+            Some(Step::Started(started)) => Some(started.job_id.clone()),
+            _ => None,
+        })
+        .expect("the stream identifies its job");
+    let recovered = client
+        .get_job(JobRef { job_id })
+        .await
+        .expect("recover completed job")
+        .into_inner();
+    assert_eq!(recovered.state, "finished");
+    let recovered_summary = recovered
+        .progress
+        .and_then(|progress| progress.step)
+        .and_then(|step| match step {
+            Step::Finished(finished) => Some(finished.summary_json),
+            _ => None,
+        })
+        .expect("GetJob retains the successful report");
+    assert_eq!(
+        recovered_summary, summary,
+        "stream and GetJob results match"
+    );
     assert!(
         backups.join("named").is_dir(),
         "the backup went to the named folder"

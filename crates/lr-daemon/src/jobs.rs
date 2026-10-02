@@ -46,6 +46,31 @@ pub struct JobSnapshot {
     pub error: Option<(String, String)>,
 }
 
+impl JobSnapshot {
+    /// Reconstruct the terminal event from the retained result.
+    #[must_use]
+    pub(crate) fn terminal_event(&self) -> Option<JobEvent> {
+        match self.state {
+            JobState::Finished => {
+                self.summary_json
+                    .as_ref()
+                    .map(|summary_json| JobEvent::Finished {
+                        job_id: self.job_id.clone(),
+                        summary_json: summary_json.clone(),
+                    })
+            }
+            JobState::Failed | JobState::Cancelled => {
+                self.error.as_ref().map(|(code, message)| JobEvent::Failed {
+                    job_id: self.job_id.clone(),
+                    code: code.clone(),
+                    message: message.clone(),
+                })
+            }
+            JobState::Pending | JobState::Running => None,
+        }
+    }
+}
+
 /// One event published to `WatchEvents` and to a job's own stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobEvent {
@@ -114,6 +139,9 @@ struct Entry {
 }
 
 /// The registry plus the event bus.
+///
+/// Job results are retained in memory for this daemon process's lifetime;
+/// restarting the daemon clears them.
 pub struct Jobs {
     entries: Mutex<HashMap<String, Entry>>,
     events: broadcast::Sender<JobEvent>,
@@ -286,32 +314,28 @@ impl Jobs {
         match outcome {
             Ok(summary) => {
                 entry.state = JobState::Finished;
-                entry.summary_json = Some(summary.clone());
+                entry.summary_json = Some(summary);
                 entry.error = None;
-                drop(entries);
-                self.publish(JobEvent::Finished {
-                    job_id: job_id.to_owned(),
-                    summary_json: summary,
-                });
             }
             Err(error) => {
-                let cancelled = matches!(error, Error::Cancelled);
+                let cancelled = matches!(&error, Error::Cancelled);
                 let (code, message) = crate::status::error_code(&error);
                 entry.state = if cancelled {
                     JobState::Cancelled
                 } else {
                     JobState::Failed
                 };
-                entry.error = Some((code.clone(), message.clone()));
-                drop(entries);
-                self.publish(JobEvent::Failed {
-                    job_id: job_id.to_owned(),
-                    code,
-                    message,
-                });
+                entry.summary_json = None;
+                entry.error = Some((code, message));
             }
         }
-        self.snapshot(job_id)
+        let snapshot = snapshot_of(job_id, entry);
+        if let Some(event) = snapshot.terminal_event() {
+            // Keep publication under the entry lock so a reused ID cannot
+            // publish its next Started event before this terminal event.
+            self.publish(event);
+        }
+        Ok(snapshot)
     }
 
     /// Report a job.
@@ -323,13 +347,7 @@ impl Jobs {
         let entry = entries
             .get(job_id)
             .ok_or_else(|| Error::unsupported(format!("no job {job_id}")))?;
-        Ok(JobSnapshot {
-            job_id: job_id.to_owned(),
-            set: entry.set.clone(),
-            state: entry.state,
-            summary_json: entry.summary_json.clone(),
-            error: entry.error.clone(),
-        })
+        Ok(snapshot_of(job_id, entry))
     }
 
     /// The uid that started `job_id`.
@@ -369,16 +387,20 @@ impl Jobs {
         let entries = self.lock();
         let mut jobs: Vec<JobSnapshot> = entries
             .iter()
-            .map(|(job_id, entry)| JobSnapshot {
-                job_id: job_id.clone(),
-                set: entry.set.clone(),
-                state: entry.state,
-                summary_json: entry.summary_json.clone(),
-                error: entry.error.clone(),
-            })
+            .map(|(job_id, entry)| snapshot_of(job_id, entry))
             .collect();
         jobs.sort_by(|left, right| left.job_id.cmp(&right.job_id));
         Ok(jobs)
+    }
+}
+
+fn snapshot_of(job_id: &str, entry: &Entry) -> JobSnapshot {
+    JobSnapshot {
+        job_id: job_id.to_owned(),
+        set: entry.set.clone(),
+        state: entry.state,
+        summary_json: entry.summary_json.clone(),
+        error: entry.error.clone(),
     }
 }
 
@@ -468,10 +490,13 @@ mod tests {
     fn a_failed_job_keeps_its_error_code() {
         let jobs = Jobs::new();
         let _registered = jobs.register("j1", "set-a").expect("register");
+        jobs.finish("j1", Ok("stale success summary".to_owned()))
+            .expect("record first result");
         let snapshot = jobs
             .finish("j1", Err(Error::TargetChanged))
             .expect("finish");
         assert_eq!(snapshot.state, JobState::Failed);
+        assert_eq!(snapshot.summary_json, None);
         assert_eq!(
             snapshot.error.as_ref().map(|(code, _)| code.as_str()),
             Some("E_TARGET_CHANGED")

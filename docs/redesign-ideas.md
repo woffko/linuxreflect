@@ -5,7 +5,7 @@ come from the single-source-of-truth review of `99afcb5`, refreshed against
 `553c2db` on 2026-09-28. Keep the frozen specification intact; record decisions
 before changing format semantics or operator-visible guarantees.
 
-## Implementation follow-up, 2026-10-01
+## Implementation follow-up, 2026-10-02
 
 The discussion below preserves the original review context. Subsequent work
 has implemented these parts without claiming production acceptance for every
@@ -29,8 +29,16 @@ deployment:
   still cannot recover a File member's historical comparison policy; its
   structural `kind` is not authority for that missing fact.
 
-Job-result projection, durable content-bound verification history and SFTP
-stale-writer fencing remain separate work. Historical maintainer acceptance
+- D-131 makes terminal events and `GetJob` project the same retained outcome,
+  including successful reports. GUI reconnect preserves result details and
+  explicitly reports unavailable legacy/malformed reports. Results still last
+  only for the daemon process's lifetime, addressing idea 5 below.
+
+Durable content-bound verification history and SFTP stale-writer fencing remain
+separate work. The history design compares fresh-only checks, a host-local
+receipt ledger and portable per-set receipts. No store is implemented or selected;
+the captured-byte approach needs an approved ancestry-sized scratch/I/O budget.
+All choices retain D-125's fresh deletion gate. Historical maintainer acceptance
 results below are not evidence that the current tree passed privileged tests
 on this user's machine.
 

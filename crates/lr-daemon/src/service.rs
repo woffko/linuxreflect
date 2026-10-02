@@ -405,18 +405,77 @@ fn job_state_of(snapshot: &crate::jobs::JobSnapshot) -> JobState {
         JobStateInner::Failed => "failed",
         JobStateInner::Cancelled => "cancelled",
     };
-    let progress = snapshot.error.as_ref().map(|(code, message)| {
-        progress_of(&JobEvent::Failed {
-            job_id: snapshot.job_id.clone(),
-            code: code.clone(),
-            message: message.clone(),
-        })
-    });
+    let progress = snapshot.terminal_event().as_ref().map(progress_of);
     JobState {
         job_id: snapshot.job_id.clone(),
         set: snapshot.set.clone(),
         state: state.to_owned(),
         progress,
+    }
+}
+
+#[cfg(test)]
+mod job_result_projection {
+    use super::{job_state_of, progress_of};
+    use crate::jobs::{JobEvent, Jobs};
+    use lr_core::Error;
+    use lr_proto::v1::progress::Step;
+
+    fn terminal_event_from(events: &mut tokio::sync::broadcast::Receiver<JobEvent>) -> JobEvent {
+        let started = events.try_recv().expect("Started event");
+        assert!(matches!(started, JobEvent::Started { .. }));
+        match events.try_recv().expect("terminal event") {
+            event @ (JobEvent::Finished { .. } | JobEvent::Failed { .. }) => event,
+            other => panic!("expected a terminal event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn success_event_and_get_job_recover_the_same_summary() {
+        let jobs = Jobs::new();
+        let mut events = jobs.subscribe();
+        let _ = jobs.register("success", "set").expect("register");
+        let summary = r#"{"image_uri":"/backup/full.lrimg","warnings":["one"]}"#;
+        jobs.finish("success", Ok(summary.to_owned()))
+            .expect("finish");
+        let event = terminal_event_from(&mut events);
+        let snapshot = jobs.snapshot("success").expect("GetJob snapshot");
+
+        let status = job_state_of(&snapshot);
+        assert_eq!(status.state, "finished");
+        assert_eq!(status.progress, Some(progress_of(&event)));
+        assert!(matches!(
+            status.progress.and_then(|progress| progress.step),
+            Some(Step::Finished(finished)) if finished.summary_json == summary
+        ));
+    }
+
+    #[test]
+    fn failures_and_cancellations_project_the_same_terminal_error() {
+        for (job_id, error, expected_state, expected_code) in [
+            (
+                "failure",
+                Error::TargetChanged,
+                "failed",
+                "E_TARGET_CHANGED",
+            ),
+            ("cancel", Error::Cancelled, "cancelled", "E_CANCELLED"),
+        ] {
+            let jobs = Jobs::new();
+            let mut events = jobs.subscribe();
+            let _ = jobs.register(job_id, "set").expect("register");
+            jobs.finish(job_id, Err(error)).expect("finish");
+            let event = terminal_event_from(&mut events);
+            let snapshot = jobs.snapshot(job_id).expect("GetJob snapshot");
+
+            let status = job_state_of(&snapshot);
+            assert_eq!(status.state, expected_state);
+            assert_eq!(status.progress, Some(progress_of(&event)));
+            assert!(matches!(
+                status.progress.and_then(|progress| progress.step),
+                Some(Step::Failure(failure)) if failure.code == expected_code
+            ));
+        }
     }
 }
 
