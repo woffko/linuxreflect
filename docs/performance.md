@@ -68,6 +68,50 @@ These measurements cover the unprivileged profiles, not the privileged 16 TB
 virtual-disk scenario. Keep validation views borrowed: required safety checks
 must not introduce another owned copy of a large tree.
 
+## Verification-history capture experiment, 2026-10-03
+
+This is a design experiment, not a history-store implementation or a new CI
+gate. In the isolated Debian 13 client/storage VMs (8 GiB client RAM), compare
+the pinned release CLI's `verify --chain` with raw BLAKE3 capture into private
+local scratch followed by the same CLI verification. File-mode fixtures use
+uncompressed, unencrypted images. Three alternating paired repeats per case
+and backend passed (18 pairs); reports matched except the locator, original
+image hashes stayed unchanged, and capture cleanup/quota refusal passed.
+
+Times below are medians; RSS and allocated image-file scratch are maxima.
+RSS is measured by a fresh Rust launcher using `wait_with_peak_rss`, avoiding
+Python pre-exec memory contamination. It excludes page cache and retains a
+roughly 2 MiB launcher floor. Candidate RSS is the maximum of its sequential
+capture and verification processes, not their sum.
+
+| Workload | Source | Direct verify (s) | Capture + verify (s) | Ratio | Scratch (MiB) | Direct / candidate peak RSS (MiB) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 GiB + 128 MiB delta | Local ext4 | 1.08 | 2.91 | 2.69× | 1154.0 | 11.8 / 11.8 |
+| 1 GiB + 128 MiB delta | NFSv4.2 | 1.17 | 2.87 | 2.45× | 1154.0 | 11.9 / 11.7 |
+| 200 members / 2,000 files | Local ext4 | 2.34 | 4.72 | 2.02× | 70.0 | 10.3 / 10.5 |
+| 200 members / 2,000 files | NFSv4.2 | 2.78 | 4.73 | 1.70× | 70.0 | 10.4 / 10.5 |
+| 100,000 files / 8 × 400 B xattrs | Local ext4 | 1.39 | 1.99 | 1.44× | 334.9 | 747.9 / 748.4 |
+| 100,000 files / 8 × 400 B xattrs | NFSv4.2 | 1.52 | 2.12 | 1.39× | 334.9 | 749.7 / 749.1 |
+
+The 64 KiB-buffer copier peaked below 2.71 MiB; large-xattr verification still
+needed about 750 MiB. Scratch follows raw ancestry size, not RAM buffer size.
+The 200-member check covered 1,562.5 MiB of logical plaintext but copied only
+69.6 MiB of raw images; neither counter measures NFS network traffic.
+
+These are warm/cached virtual-storage attempts, not cold-NAS throughput or
+physical power-loss evidence. The named-copy proxy includes per-file/directory
+capture sync and the CLI's advisory catalog updates; disposable unnamed scratch
+need not require the former. Capture timings exclude independent byte-equality
+validation, performed after verification. The complete verifier has no public
+captured-reader entry point, so this does not validate the future read-only
+handle API, other image modes or receipt publication.
+
+Suggested opt-in limits are 8 GiB raw capture with allocation headroom, a fixed
+64 KiB buffer, and explicit history-unavailable on refusal. These are proposals,
+not selected runtime defaults. Preserve existing scale budgets; remeasure the
+integrated path before enabling history. See the design ownership discussion in
+[redesign-ideas.md](redesign-ideas.md#verification-history-review-direction-2026-10-03).
+
 ## Rules of thumb
 
 - **Block and whole-disk images** stream their manifests: memory does not

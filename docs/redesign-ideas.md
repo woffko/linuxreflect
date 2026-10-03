@@ -205,6 +205,28 @@ changes between verification and recording, and reports with recorded bad
 sectors. Losing a cache must not silently remove the protection for the last
 qualifying recovery chain.
 
+### Verification-history review direction, 2026-10-03
+
+The recommended first store is a private host-local receipt ledger, independent
+of the catalog. This remains a proposal, not an implemented or selected policy.
+One engine-owned observation must carry the actual checked-byte identities,
+ordered ancestry, per-member/mode coverage and outcome into recording; a recorder
+must not resolve filenames again. Reports, job summaries, indexes and UI history
+are projections of that observation, not separate health owners.
+
+Keep three facts distinct: the check's outcome, confirmed receipt publication,
+and a newly dated association with current image bytes. A past successful check
+does not prove that a mutable NFS object is unchanged. Missing history is unknown;
+"passed, not recorded" is not durable history. D-125's fresh retention verification
+and restore checks remain unchanged, as does the legacy extra-chain keep rule.
+
+The rigorous capture route needs private scratch proportional to the selected
+raw ancestry, not just a fixed RAM buffer. Resource measurements must compare
+the same verification scope and distinguish capture RSS, verifier metadata,
+allocated scratch and logical versus physical I/O before default enablement.
+The complete verifier currently has no public captured-reader entry point; a
+named-copy CLI experiment is a cost proxy, not production read-binding validation.
+
 ## Remediation-plan follow-up
 
 [remediation-plan.md](remediation-plan.md) now records phases 0-4 complete and
