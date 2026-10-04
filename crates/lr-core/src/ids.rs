@@ -96,7 +96,7 @@ impl FromStr for Id {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let hex: String = s.chars().filter(|c| *c != '-').collect();
-        if hex.len() != 32 {
+        if hex.len() != 32 || !hex.is_ascii() {
             return Err(Error::corrupt(format!(
                 "identifier '{s}' is not 32 hex digits"
             )));
@@ -227,6 +227,11 @@ mod tests {
     #[test]
     fn rejects_bad_input() {
         assert!("not-a-uuid".parse::<Id>().is_err());
+        // The byte-length check alone permitted a slice inside a UTF-8 code point.
+        let unicode = format!("0é{}", "0".repeat(29));
+        assert_eq!(unicode.len(), 32);
+        assert!(unicode.parse::<Id>().is_err());
+        assert!(serde_json::from_str::<Id>(&format!("\"{unicode}\"")).is_err());
         assert!(
             "00000000-0000-0000-0000-00000000000g"
                 .parse::<Id>()
