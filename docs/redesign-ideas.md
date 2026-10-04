@@ -35,8 +35,8 @@ deployment:
   only for the daemon process's lifetime, addressing idea 5 below.
 
 Durable content-bound verification history and SFTP stale-writer fencing remain
-separate work. D-132 selects opt-in host-local history and implements its engine
-boundary first; no receipt store or history-facing consumer is enabled yet.
+separate work. D-132 implements captured engine observations; D-133 adds private
+immutable receipts and bounded loading. No history-facing consumer is enabled yet.
 Captured verification requires caller-selected ancestry-sized scratch limits.
 All choices retain D-125's fresh deletion gate. Historical maintainer acceptance
 results below are not evidence that the current tree passed privileged tests
@@ -208,8 +208,8 @@ qualifying recovery chain.
 ### Verification-history review direction, 2026-10-03
 
 The recommended first store is a private host-local receipt ledger, independent
-of the catalog. D-132 subsequently selected this direction; persistence remains
-unimplemented and no history policy is enabled by default.
+of the catalog. D-132 subsequently selected this direction; D-133 implements
+opt-in persistence without enabling a default history policy.
 One engine-owned observation must carry the actual checked-byte identities,
 ordered ancestry, per-member/mode coverage and outcome into recording; a recorder
 must not resolve filenames again. Reports, job summaries, indexes and UI history
@@ -247,9 +247,31 @@ the full CI gate passed; unchanged privileged interruption suites were not rerun
 The actual release API passed 18 paired local/NFS resource comparisons on retained
 fixtures, with equal reports and unchanged original hashes. See
 [performance.md](performance.md#captured-verification-api-2026-10-04) for costs
-and limits. Receipt publication, bounded loading/indexing and CLI/daemon/GUI
-history projections remain the next batches. Current callers, fresh restore and
+and limits. Receipt publication and bounded loading/indexing followed in D-133;
+CLI/daemon/GUI history projections remain subsequent work. Current callers, fresh restore and
 retention verification, image format and conservative legacy retention are unchanged.
+
+### Receipt-store acceptance, 2026-10-04
+
+`record_verification_attempt` publishes only the existing attempt's bounded
+observation; it never reopens original images or updates the catalog. Confirmed
+recording follows file sync, atomic no-replace publication and directory sync.
+Verification outcome and uncertain publication remain separate typed facts.
+
+`load_verification_history` strictly checks versions, fields, member limits and
+coverage prerequisites. Entry and byte quotas include private crash debris;
+cooperating writers use a permanent nonblocking lock. The existing mode-0700
+ledger must have trusted ancestry on ext4, XFS or Btrfs. Loading is read-only,
+and missing, corrupt or unavailable history is unknown. Its in-memory index
+matches exact ordered captured identities, lengths and digests, not names or
+catalog timestamps. Receipts are local observations, not authenticated evidence
+against the owner or proof that current mutable image bytes are unchanged.
+
+The 15 mandatory receipt tests and eight extended capture integration tests
+passed. The full CI gate passed on local ext4 fixtures; physical power-cut and
+XFS/Btrfs runtime durability were not exercised. No unchanged privileged suites
+were rerun. The next batch starts explicit direct CLI recording and inspection;
+administrator-controlled daemon policy and GUI projections follow separately.
 
 ## Remediation-plan follow-up
 

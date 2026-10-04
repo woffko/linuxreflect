@@ -23,9 +23,15 @@ use lr_store::{Destination, DestinationOptions, SetHandle, uri};
 use crate::keys::{self, Encryption};
 
 mod capture;
+mod history;
 mod observation;
 
 pub use capture::CaptureOptions;
+pub use history::{
+    HistoryFailure, PublicationFailure, RecordingOutcome, VerificationHistory,
+    VerificationHistoryOptions, VerificationReceipt, load_verification_history,
+    record_verification_attempt,
+};
 use observation::VerificationRecorder;
 pub use observation::{
     AttemptOutcome, AttemptStage, ContentCoverage, DigestAlgorithm, FailureKind,

@@ -1,12 +1,22 @@
 //! Bounded, content-bound facts from one captured verification attempt.
 
 use lr_core::{ChainId, Consistency, Error, ImageId, ImageKind, MemberKind, SetId};
+use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use std::fmt;
 
 use super::VerifyReport;
 
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    <Option<T> as serde::Deserialize>::deserialize(deserializer)
+}
+
 /// The requested recovery scope. This records what was asked, not restore
 /// readiness or current image health.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryScope {
     /// Verify the selected member's recovery point.
@@ -16,7 +26,7 @@ pub enum RecoveryScope {
 }
 
 /// Bounded verification phase that stopped or completed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptStage {
     /// Source ancestry was being resolved.
@@ -34,7 +44,7 @@ pub enum AttemptStage {
 }
 
 /// Bounded classification of an incomplete attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureKind {
     /// Cooperative cancellation was requested.
@@ -67,7 +77,8 @@ pub enum FailureKind {
 /// consistency, target readiness, durability, or current remote health. A
 /// recorded bad source region is represented separately so it never appears
 /// as an unqualified successful recovery.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum AttemptOutcome {
     /// The requested integrity checks finished and the report has no recorded
@@ -86,7 +97,7 @@ pub enum AttemptOutcome {
 }
 
 /// Capture/read/verification progress for one ordered ancestry member.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemberStage {
     /// This member was outside the per-member content scope of the request.
@@ -102,7 +113,7 @@ pub enum MemberStage {
 }
 
 /// Bounded notice emitted by a specific verifier branch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StructureNotice {
     /// An encrypted legacy image reuses metadata-page nonces.
@@ -110,7 +121,7 @@ pub enum StructureNotice {
 }
 
 /// Actual content branch used by the verifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContentCoverage {
     /// Block recovery point's merged references across its ancestry.
@@ -130,7 +141,7 @@ pub enum ContentCoverage {
 }
 
 /// Versioned algorithm label for raw-member byte digests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DigestAlgorithm {
     /// BLAKE3 over every raw image byte, without a framing prefix.
     #[serde(rename = "blake3-raw-v1")]
@@ -138,7 +149,8 @@ pub enum DigestAlgorithm {
 }
 
 /// Captured logical identity decoded from the raw member's superblock.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemberIdentity {
     /// Member's stable image identifier.
     pub image_uuid: ImageId,
@@ -163,7 +175,8 @@ pub struct MemberIdentity {
 
 /// Per-member content facts. These components describe verifier work, not
 /// general restore readiness or unreferenced stored-payload health.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemberContentStages {
     /// Recovery-point selection structure: block manifest state, file tree,
     /// stream sections/layout, or whole-disk layout, depending on mode.
@@ -215,14 +228,19 @@ impl MemberContentStages {
 
 /// Bounded facts for one member. A missing digest or incomplete stage is
 /// explicit and cannot be confused with a fully captured member.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemberObservation {
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(super) identity: Option<MemberIdentity>,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(super) raw_length: Option<u64>,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(super) blake3_bytes: Option<[u8; 32]>,
     pub(super) capture: MemberStage,
     pub(super) structure: MemberStage,
     /// No notice was recorded; interpret this with `structure` completion.
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(super) structure_notice: Option<StructureNotice>,
     pub(super) content: MemberContentStages,
 }
@@ -297,6 +315,191 @@ pub struct VerificationObservation {
     requested_scope: RecoveryScope,
     content_coverage: Option<ContentCoverage>,
     members: Vec<MemberObservation>,
+}
+
+/// Strict, member-bounded deserializer used by the local receipt reader.
+pub(super) struct ObservationSeed {
+    max_members: usize,
+}
+
+impl ObservationSeed {
+    pub(super) const fn new(max_members: usize) -> Self {
+        Self { max_members }
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for ObservationSeed {
+    type Value = VerificationObservation;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_struct(
+            "VerificationObservation",
+            &[
+                "schema_version",
+                "digest_algorithm",
+                "coverage_contract_version",
+                "outcome",
+                "requested_scope",
+                "content_coverage",
+                "members",
+            ],
+            ObservationVisitor {
+                max_members: self.max_members,
+            },
+        )
+    }
+}
+
+struct ObservationVisitor {
+    max_members: usize,
+}
+
+impl<'de> Visitor<'de> for ObservationVisitor {
+    type Value = VerificationObservation;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a strict verification observation")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut schema_version = None;
+        let mut digest_algorithm = None;
+        let mut coverage_contract_version = None;
+        let mut outcome = None;
+        let mut requested_scope = None;
+        let mut content_coverage: Option<Option<ContentCoverage>> = None;
+        let mut members = None;
+
+        while let Some(field) = map.next_key::<String>()? {
+            match field.as_str() {
+                "schema_version" => {
+                    if schema_version.is_some() {
+                        return Err(de::Error::duplicate_field("schema_version"));
+                    }
+                    schema_version = Some(map.next_value()?);
+                }
+                "digest_algorithm" => {
+                    if digest_algorithm.is_some() {
+                        return Err(de::Error::duplicate_field("digest_algorithm"));
+                    }
+                    digest_algorithm = Some(map.next_value()?);
+                }
+                "coverage_contract_version" => {
+                    if coverage_contract_version.is_some() {
+                        return Err(de::Error::duplicate_field("coverage_contract_version"));
+                    }
+                    coverage_contract_version = Some(map.next_value()?);
+                }
+                "outcome" => {
+                    if outcome.is_some() {
+                        return Err(de::Error::duplicate_field("outcome"));
+                    }
+                    outcome = Some(map.next_value()?);
+                }
+                "requested_scope" => {
+                    if requested_scope.is_some() {
+                        return Err(de::Error::duplicate_field("requested_scope"));
+                    }
+                    requested_scope = Some(map.next_value()?);
+                }
+                "content_coverage" => {
+                    if content_coverage.is_some() {
+                        return Err(de::Error::duplicate_field("content_coverage"));
+                    }
+                    content_coverage = Some(map.next_value()?);
+                }
+                "members" => {
+                    if members.is_some() {
+                        return Err(de::Error::duplicate_field("members"));
+                    }
+                    members = Some(map.next_value_seed(MemberListSeed {
+                        max_members: self.max_members,
+                    })?);
+                }
+                _ => {
+                    return Err(de::Error::unknown_field(
+                        &field,
+                        &[
+                            "schema_version",
+                            "digest_algorithm",
+                            "coverage_contract_version",
+                            "outcome",
+                            "requested_scope",
+                            "content_coverage",
+                            "members",
+                        ],
+                    ));
+                }
+            }
+        }
+
+        Ok(VerificationObservation {
+            schema_version: schema_version
+                .ok_or_else(|| de::Error::missing_field("schema_version"))?,
+            digest_algorithm: digest_algorithm
+                .ok_or_else(|| de::Error::missing_field("digest_algorithm"))?,
+            coverage_contract_version: coverage_contract_version
+                .ok_or_else(|| de::Error::missing_field("coverage_contract_version"))?,
+            outcome: outcome.ok_or_else(|| de::Error::missing_field("outcome"))?,
+            requested_scope: requested_scope
+                .ok_or_else(|| de::Error::missing_field("requested_scope"))?,
+            content_coverage: content_coverage
+                .ok_or_else(|| de::Error::missing_field("content_coverage"))?,
+            members: members.ok_or_else(|| de::Error::missing_field("members"))?,
+        })
+    }
+}
+
+struct MemberListSeed {
+    max_members: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for MemberListSeed {
+    type Value = Vec<MemberObservation>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(MemberListVisitor {
+            max_members: self.max_members,
+        })
+    }
+}
+
+struct MemberListVisitor {
+    max_members: usize,
+}
+
+impl<'de> Visitor<'de> for MemberListVisitor {
+    type Value = Vec<MemberObservation>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "at most {} captured members", self.max_members)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut members = Vec::new();
+        while let Some(member) = sequence.next_element()? {
+            if members.len() >= self.max_members {
+                return Err(de::Error::invalid_length(
+                    members.len().saturating_add(1),
+                    &self,
+                ));
+            }
+            members.push(member);
+        }
+        Ok(members)
+    }
 }
 
 impl VerificationObservation {
@@ -625,6 +828,13 @@ mod tests {
         assert_eq!(
             attempt.observation().outcome(),
             AttemptOutcome::IntegrityVerifiedWithRecordedLoss
+        );
+        let serialized =
+            serde_json::to_string(attempt.observation()).expect("serialize typed outcome");
+        assert!(serialized.contains("integrity_verified_with_recorded_loss"));
+        assert!(
+            !serialized.contains("recorded_bad_chunks"),
+            "schema-v1 observation does not duplicate aggregate report counters"
         );
     }
 

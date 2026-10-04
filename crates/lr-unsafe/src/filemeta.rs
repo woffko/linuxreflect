@@ -248,6 +248,27 @@ pub fn punch_hole(fd: &impl AsRawFd, offset: u64, len: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// Linux filesystem magic for the filesystem holding a pinned descriptor.
+///
+/// Unlike a mount-table pathname lookup, this cannot race a directory rename.
+/// It identifies the filesystem, not its physical durability guarantees.
+///
+/// # Errors
+/// Returns the raw `fstatfs` error.
+pub fn filesystem_type(fd: &impl AsRawFd) -> io::Result<i64> {
+    // SAFETY: an all-zero integer-only statfs is valid initialization; fstatfs
+    // fills it before any field is read.
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: the descriptor remains borrowed for the call and stat is writable.
+    if unsafe { libc::fstatfs(fd.as_raw_fd(), &mut stat) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // The field is 32 or 64 bits depending on the Linux target architecture.
+    #[allow(clippy::useless_conversion)]
+    let kind = i64::from(stat.f_type);
+    Ok(kind)
+}
+
 /// Free and total bytes of the filesystem holding `path`.
 ///
 /// File-mode restores go into an existing filesystem, so the space check is

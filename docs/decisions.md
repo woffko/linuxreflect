@@ -1841,3 +1841,35 @@ verification outcome from confirmed recording. No legacy dates are backfilled
 into bound observations. Fresh retention verification (D-125), restore checks
 (D-127), the conservative legacy extra-chain keep rule and the image format are
 unchanged.
+
+## D-133 — Private immutable verification receipts
+
+The first history store is a host-local ledger separate from the backup catalog.
+Publication consumes an engine-owned captured attempt, never a reconstructed
+report or a later image pathname read. Receipts contain versioned bounded facts,
+a generated receipt ID, the effective recorder UID and recording time. The time
+is not retroactively a verification timestamp; recorder authority is not the
+image writer's identity or consistency guarantee. Locators, secrets, diagnostic
+strings and aggregate reports are not receipt contents.
+
+An existing private directory is pinned through trusted ancestry. The initial
+supported ledger filesystems are ext4, XFS and Btrfs; network, volatile and unknown
+filesystems are refused. Limits for receipt bytes, members, entries and total
+ledger bytes are explicit. Cooperating writers serialize quota checking and
+publication. Receipts are published without replacing an existing entry, with
+data synchronized before publication and the directory afterward. Recording is
+confirmed only after synchronization; a possibly published but unconfirmed
+receipt is distinct from both confirmed recording and a pre-publication failure.
+These guarantees do not establish physical power-loss durability or multi-host
+fencing. The local owner can modify files; this is not signed or authenticated
+evidence against that owner.
+
+Loading is bounded, versioned and semantically checked. Its index is rebuilt
+from immutable receipts and is not another health authority. Temporary debris
+is not evidence but is conservatively included in resource accounting; there is
+no automatic pruning or import/backfill of old catalog dates. A valid loaded
+receipt does not reconstruct the original publisher's confirmation outcome.
+Historical association compares ordered captured identities, lengths and raw
+digests, not names or sizes alone. Missing or unavailable evidence remains
+unknown; historical success never implies current mutable-image health or
+general restore readiness. D-125 and D-127 remain fresh independent gates.

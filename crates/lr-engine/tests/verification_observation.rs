@@ -18,7 +18,8 @@ use lr_engine::keystore::Passphrase;
 use lr_engine::progress::{EngineContext, ProgressSink};
 use lr_engine::verify::{
     AttemptOutcome, AttemptStage, CaptureOptions, ContentCoverage, FailureKind, MemberStage,
-    RecoveryScope, VerifyReport, VerifyRequest, verify_image_captured,
+    RecordingOutcome, RecoveryScope, VerificationAttempt, VerificationHistoryOptions, VerifyReport,
+    VerifyRequest, load_verification_history, record_verification_attempt, verify_image_captured,
 };
 use lr_format::disk::{DiskHeader, PtType, RegionKind, RegionRecord};
 use lr_format::{
@@ -76,6 +77,45 @@ fn private_local_tempdir() -> tempfile::TempDir {
         .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir()
         .expect("create private local temporary directory")
+}
+
+fn history_tempdir() -> tempfile::TempDir {
+    let root = std::env::var_os("LR_TEST_HISTORY_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/tmp"));
+    tempfile::Builder::new()
+        .prefix("lr-verification-history-integration-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in(root)
+        .expect("create receipt history fixture on a persistent local filesystem")
+}
+
+fn append_history_attempt(history_dir: &Path, attempt: &VerificationAttempt) {
+    let options = VerificationHistoryOptions::new(history_dir, 256 * 1024, 16, 16, 4 * 1024 * 1024);
+    assert!(matches!(
+        record_verification_attempt(attempt, &options),
+        RecordingOutcome::Recorded { .. }
+    ));
+}
+
+fn record_and_round_trip(
+    history_dir: &Path,
+    attempt: &VerificationAttempt,
+) -> Vec<lr_engine::verify::VerificationReceipt> {
+    append_history_attempt(history_dir, attempt);
+    let options = VerificationHistoryOptions::new(history_dir, 256 * 1024, 16, 16, 4 * 1024 * 1024);
+    let loaded = load_verification_history(&options).expect("load local receipt history");
+    assert_eq!(
+        loaded.matching_receipts(attempt).count(),
+        1,
+        "association uses the exact captured identities, lengths, and digests"
+    );
+    assert!(
+        loaded
+            .matching_receipts(attempt)
+            .all(|receipt| receipt.observation() == attempt.observation())
+    );
+    loaded.receipts().to_vec()
 }
 
 fn source_image(path: &Path) {
@@ -550,6 +590,60 @@ fn captured_verification_uses_independent_read_cursors_and_never_falls_back_to_c
     assert!(!serialized.contains("warnings"));
     assert!(!serialized.contains("diagnostic"));
     assert!(serialized.contains("blake3-raw-v1"));
+
+    // Re-capture after a same-size source mutation. The image identities and
+    // lengths are unchanged, but the captured digest must keep the attempts
+    // in separate history associations.
+    let mutated_scratch = private_local_tempdir();
+    let mutated = verify_image_captured(
+        &request,
+        &CaptureOptions::new(mutated_scratch.path(), 16 * 1024 * 1024, 0),
+    );
+    assert_eq!(
+        mutated.observation().outcome(),
+        AttemptOutcome::Incomplete {
+            stage: AttemptStage::Content,
+            reason: FailureKind::Corrupt,
+        }
+    );
+    assert_eq!(
+        captured.observation().members()[0].raw_length(),
+        mutated.observation().members()[0].raw_length()
+    );
+    assert_eq!(
+        captured.observation().members()[0].identity(),
+        mutated.observation().members()[0].identity()
+    );
+    assert_ne!(
+        captured.observation().members()[0].blake3_bytes(),
+        mutated.observation().members()[0].blake3_bytes()
+    );
+
+    let history = history_tempdir();
+    let catalog = _destination
+        .path()
+        .join("captured-verify")
+        .join("catalog.json");
+    std::fs::remove_file(catalog).expect("remove mutable cache before history round-trip");
+    drop(_destination);
+    assert_eq!(record_and_round_trip(history.path(), &captured).len(), 1);
+    let receipts = record_and_round_trip(history.path(), &mutated);
+    assert_eq!(receipts.len(), 2);
+    let options =
+        VerificationHistoryOptions::new(history.path(), 256 * 1024, 16, 16, 4 * 1024 * 1024);
+    let loaded = load_verification_history(&options).expect("catalog-independent local history");
+    let original_matches = loaded.matching_receipts(&captured).collect::<Vec<_>>();
+    let mutated_matches = loaded.matching_receipts(&mutated).collect::<Vec<_>>();
+    assert_eq!(original_matches.len(), 1);
+    assert_eq!(mutated_matches.len(), 1);
+    assert_eq!(
+        original_matches[0].observation().outcome(),
+        AttemptOutcome::IntegrityVerified
+    );
+    assert!(matches!(
+        mutated_matches[0].observation().outcome(),
+        AttemptOutcome::Incomplete { .. }
+    ));
 }
 
 #[test]
@@ -873,6 +967,26 @@ fn file_mode_reports_tree_and_referenced_payload_scope_separately() {
             .iter()
             .all(|member| { member.content().recovery_point() == MemberStage::Complete })
     );
+
+    let history = history_tempdir();
+    append_history_attempt(history.path(), &selected);
+    append_history_attempt(history.path(), &every);
+    let history_options =
+        VerificationHistoryOptions::new(history.path(), 256 * 1024, 16, 16, 4 * 1024 * 1024);
+    let loaded = load_verification_history(&history_options).expect("load file-mode receipts");
+    assert_eq!(loaded.receipts().len(), 2);
+    assert_eq!(loaded.matching_receipts(&selected).count(), 2);
+    assert_eq!(loaded.matching_receipts(&every).count(), 2);
+    assert!(loaded.receipts().iter().any(|receipt| {
+        receipt.observation().requested_scope() == RecoveryScope::SelectedRecoveryPoint
+            && receipt.observation().content_coverage()
+                == Some(ContentCoverage::FileSelectedTreeReferences)
+    }));
+    assert!(loaded.receipts().iter().any(|receipt| {
+        receipt.observation().requested_scope() == RecoveryScope::EveryMember
+            && receipt.observation().content_coverage()
+                == Some(ContentCoverage::FileEveryTreeReferences)
+    }));
 }
 
 #[test]
@@ -948,6 +1062,24 @@ fn captured_stream_verifier_records_selected_and_every_member_coverage() {
             && member.content().recovery_point() == MemberStage::Complete
             && member.content().every_stored_payload() == MemberStage::Complete
     }));
+
+    let history = history_tempdir();
+    append_history_attempt(history.path(), &selected);
+    append_history_attempt(history.path(), &every);
+    let history_options =
+        VerificationHistoryOptions::new(history.path(), 256 * 1024, 16, 16, 4 * 1024 * 1024);
+    let loaded = load_verification_history(&history_options).expect("load stream receipts");
+    assert_eq!(loaded.receipts().len(), 2);
+    assert_eq!(loaded.matching_receipts(&selected).count(), 2);
+    assert_eq!(loaded.matching_receipts(&every).count(), 2);
+    assert!(loaded.receipts().iter().any(|receipt| {
+        receipt.observation().content_coverage()
+            == Some(ContentCoverage::StreamSelectedMemberPayloadsSectionsAndLayout)
+    }));
+    assert!(loaded.receipts().iter().any(|receipt| {
+        receipt.observation().content_coverage()
+            == Some(ContentCoverage::StreamEveryMemberPayloadsSectionsAndLayout)
+    }));
 }
 
 #[test]
@@ -992,5 +1124,13 @@ fn captured_whole_disk_verifier_records_regions_layout_and_report_parity() {
     assert_eq!(
         member.content().every_stored_payload(),
         MemberStage::NotRequested
+    );
+
+    let history = history_tempdir();
+    let receipts = record_and_round_trip(history.path(), &captured);
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(
+        receipts[0].observation().content_coverage(),
+        Some(ContentCoverage::WholeDiskRegionsAndLayout)
     );
 }
