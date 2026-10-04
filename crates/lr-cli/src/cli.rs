@@ -109,6 +109,17 @@ pub(crate) enum Command {
         /// Skip host-key verification (tests only).
         #[arg(long)]
         insecure_ignore_host_key: bool,
+
+        /// Explicitly use in-process captured verification and local receipts.
+        #[arg(long, value_name = "PATH", conflicts_with = "socket")]
+        local_history_config: Option<PathBuf>,
+    },
+
+    /// Inspect bounded historical local verification receipts.
+    VerificationHistory {
+        /// Private version-1 local history policy file.
+        #[arg(long, value_name = "PATH", conflicts_with = "socket")]
+        config: PathBuf,
     },
 
     /// Rebuild a set's catalog (Slice S9).

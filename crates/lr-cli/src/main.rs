@@ -8,6 +8,7 @@
 
 mod cli;
 mod client;
+mod verification_history;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -309,6 +310,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             identity,
             known_hosts,
             insecure_ignore_host_key,
+            local_history_config,
         } => verify(
             cli.json,
             image,
@@ -320,8 +322,12 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
                 known_hosts: known_hosts.clone(),
                 insecure_ignore_host_key: *insecure_ignore_host_key,
             },
+            local_history_config.as_deref(),
             cli.socket.as_deref(),
         ),
+        Command::VerificationHistory { config } => {
+            verification_history::inspect_history(cli.json, config, cli.socket.as_deref())
+        }
         Command::Catalog {
             dest,
             set,
@@ -815,8 +821,20 @@ fn verify(
     chain: bool,
     passphrase_file: Option<&Path>,
     options: &DestinationOptions,
+    local_history_config: Option<&Path>,
     socket: Option<&Path>,
 ) -> anyhow::Result<()> {
+    if let Some(policy_path) = local_history_config {
+        return verification_history::verify_captured(
+            json,
+            image,
+            chain,
+            passphrase_file,
+            options,
+            policy_path,
+            socket,
+        );
+    }
     if let Some(mut client) = client_if_available(socket) {
         let spec = lr_proto::v1::VerifySpec {
             image: image.to_owned(),

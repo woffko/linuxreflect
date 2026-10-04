@@ -27,7 +27,8 @@ pub(super) const CAPTURE_BUFFER_BYTES: usize = 64 * 1024;
 ///
 /// There is deliberately no `Default`: callers must choose both a raw-byte
 /// limit and free-space headroom for every captured verification.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CaptureOptions {
     /// Existing effective-user-owned mode-0700 directory on the scratch filesystem.
     pub scratch_directory: PathBuf,

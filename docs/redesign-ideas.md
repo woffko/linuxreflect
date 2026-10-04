@@ -36,7 +36,8 @@ deployment:
 
 Durable content-bound verification history and SFTP stale-writer fencing remain
 separate work. D-132 implements captured engine observations; D-133 adds private
-immutable receipts and bounded loading. No history-facing consumer is enabled yet.
+immutable receipts and bounded loading. D-134 starts explicit direct CLI recording
+and inspection; daemon/GUI receipt enablement remains follow-up work.
 Captured verification requires caller-selected ancestry-sized scratch limits.
 All choices retain D-125's fresh deletion gate. Historical maintainer acceptance
 results below are not evidence that the current tree passed privileged tests
@@ -261,7 +262,8 @@ Verification outcome and uncertain publication remain separate typed facts.
 `load_verification_history` strictly checks versions, fields, member limits and
 coverage prerequisites. Entry and byte quotas include private crash debris;
 cooperating writers use a permanent nonblocking lock. The existing mode-0700
-ledger must have trusted ancestry on ext4, XFS or Btrfs. Loading is read-only,
+ledger must have trusted ancestry and an allowed local filesystem magic
+(ext-family, XFS or Btrfs; ext2/3/4 share a magic value). Loading is read-only,
 and missing, corrupt or unavailable history is unknown. Its in-memory index
 matches exact ordered captured identities, lengths and digests, not names or
 catalog timestamps. Receipts are local observations, not authenticated evidence
@@ -272,6 +274,25 @@ passed. The full CI gate passed on local ext4 fixtures; physical power-cut and
 XFS/Btrfs runtime durability were not exercised. No unchanged privileged suites
 were rerun. The next batch starts explicit direct CLI recording and inspection;
 administrator-controlled daemon policy and GUI projections follow separately.
+
+### First history consumer, 2026-10-04
+
+D-134 implements explicit direct CLI recording and read-only inspection with
+a bounded private policy and no implicit limits. JSON streams borrowed report,
+observation and recording facts without duplicating a whole output buffer.
+Integrity completion and confirmed publication must both hold for a successful
+recording request; neither fact substitutes for the other. Inspection explicitly
+does not associate receipts with current image bytes or reconstruct the
+publisher's recording confirmation.
+
+Five grouped mandatory CLI tests cover real selected/whole-chain File flows,
+exact receipt parity, unchanged catalog bytes, quota and incomplete exits,
+strict policy/socket refusal, and read-only empty/unknown history. Main's
+independent focused run and full CI passed (675 passed, 0 failed, 73 ignored,
+2 existing unavailable scenarios). No actual host policy is enabled. Next:
+administrator-controlled daemon configuration and typed protocol projections,
+then GUI history showing the same distinct facts; unchanged fresh restore and
+retention gates remain mandatory.
 
 ## Remediation-plan follow-up
 

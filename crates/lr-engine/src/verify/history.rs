@@ -32,7 +32,9 @@ const BTRFS_MAGIC_SIGNED_32: i64 = 0x9123_683e_u32 as i32 as i64;
 /// Explicit limits and location for one host-local verification ledger.
 ///
 /// The directory must already exist, be owned by the effective UID with mode
-/// 0700, and live on ext4, XFS, or Btrfs. No default limits are supplied.
+/// 0700, and use a recognized local filesystem magic (ext-family, XFS or Btrfs).
+/// Linux shares the ext2/ext3/ext4 magic; runtime fixtures validate ext4 only.
+/// No default limits are supplied.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerificationHistoryOptions {
@@ -115,7 +117,7 @@ pub enum HistoryFailure {
     InvalidAttempt,
     /// The final directory or one of its ancestors was not trusted.
     UntrustedDirectory,
-    /// The pinned directory is not on ext4, XFS, or Btrfs.
+    /// The pinned directory does not have an allowed local filesystem magic.
     UnsupportedFilesystem,
     /// A configured quota would be exceeded.
     QuotaExceeded,

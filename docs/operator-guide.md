@@ -203,13 +203,75 @@ same-size payload change cannot bypass the fresh check (D-125).
 ## Verification
 
 `linuxreflect verify --image <member>` checks that member and everything it
-needs from its ancestry; `--chain` checks every payload of the whole chain,
-older members included. A failure names the corrupted chunk or file. A
-successful `--chain` verification without recorded bad sectors is recorded in
-the catalog. Recorded bad sectors still appear as verification warnings, but
+needs from its ancestry; `--chain` checks every recovery point, older members
+included. For `--chain`, Block checks stored payloads, File checks trees and
+their referenced payloads, and Stream checks member payloads, sections and layout.
+This is not a uniform every-stored-byte guarantee. Ordinary verification failures
+name the corrupted chunk or file. Successful ordinary `--chain` verification
+without recorded bad sectors is recorded in the catalog. Recorded bad sectors
+still appear as verification warnings, but
 do not qualify the image as a complete recovery point. This history can be
 lost when the catalog is rebuilt; retention checks current content before
 deleting regardless.
+
+### Opt-in local verification receipts
+
+`verify --local-history-config <policy.json>` explicitly runs captured
+verification in the CLI process, even if a daemon is available. It cannot be
+combined with `--socket`. Ordinary verification remains unchanged; this route
+does not update catalog dates. Daemon/GUI receipt enablement is not implemented.
+
+Create the policy yourself as an effective-user-owned, single-link regular file
+with mode 0600 (not a symlink). Both directories must already exist, be owned by
+the same user and have mode 0700, with trusted ancestry. Keep the history ledger
+on local ext4, XFS or Btrfs, not NFS/SMB or tmpfs. Images may still come from a
+mounted share or SFTP. The CLI creates no policy or scratch/history directory.
+The filesystem gate uses magic values: ext2/3/4 share one value. Only ext4 was
+exercised in this batch; acceptance of that value is not ext2/3 qualification.
+
+Every field is required. This example uses an 8 GiB total raw-ancestry cap,
+10 GiB additional preflight headroom and explicit ledger quotas; these are
+example operator choices, not defaults. Replace the paths and size the limits
+for your own workload:
+
+```json
+{
+  "schema_version": 1,
+  "capture": {
+    "scratch_directory": "/home/user/.local/state/linuxreflect/verification-scratch",
+    "max_raw_bytes": 8589934592,
+    "headroom_bytes": 10737418240
+  },
+  "history": {
+    "history_directory": "/home/user/.local/state/linuxreflect/verification-history",
+    "max_receipt_bytes": 1048576,
+    "max_members": 1024,
+    "max_entries": 10000,
+    "max_total_ledger_bytes": 268435456
+  }
+}
+```
+
+```sh
+linuxreflect --json verify --image <member> --chain --local-history-config <policy.json>
+linuxreflect --json verification-history --config <policy.json>
+```
+
+Captured verification reads private copied bytes and hashes the complete raw
+ancestry; it needs proportional scratch storage and additional I/O. Free-space
+headroom is a preflight check, not a reservation. See
+[the resource measurements](performance.md#captured-verification-api-2026-10-04).
+
+Output separates integrity outcome, actual coverage and recording confirmation.
+Incomplete verification fails even if its receipt was recorded. Completed
+verification with failed/unconfirmed recording also exits unsuccessfully.
+Recorded source loss remains a warning, not a complete-recovery claim.
+
+Inspection is read-only and labels current-image association as `not_checked`.
+A loaded receipt is not current health, original publication confirmation or
+authenticated evidence against the local owner. Missing, uninitialized, corrupt
+or unavailable history is unknown/error. Quotas include private crash debris;
+there is no automatic pruning. Fresh restore and retention checks still run.
 
 ## Restoring
 

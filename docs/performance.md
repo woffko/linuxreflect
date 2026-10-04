@@ -154,6 +154,25 @@ changed. Evidence is retained outside Git in
 `_handoff/artifacts/verification-observation-20261004/` under the project root
 (`api-summary.json`, `api-evidence.tar.gz`, build provenance and `nfs-tests.log`).
 
+## Verification receipt bounds, 2026-10-04
+
+D-133 requires explicit receipt-byte, member, entry and total-ledger-byte limits.
+Publication counts serialized bytes before writing and scans old entry metadata,
+without loading every previous receipt. Loading checks sizes before allocation,
+deserializes bounded member lists and rebuilds an in-memory index. Decoded
+metadata has overhead beyond the serialized ledger size; byte quotas are not a
+precise RSS limit. Crash debris consumes quota and is never silently pruned.
+
+Critical receipt fixtures use private directories on persistent local ext4.
+`LR_TEST_HISTORY_ROOT` selects a different test-fixture parent when `/var/tmp`
+is not on a supported local filesystem. An unknown/network/volatile ledger
+filesystem is a refusal, not a reason to skip or weaken the tests. XFS/Btrfs
+runtime durability and physical power cuts have not been measured in this batch.
+Linux's ext2/3/4 magic is shared; the gate cannot distinguish those variants,
+and ext2/3 runtime durability has not been qualified either.
+The captured-API numbers above still exclude receipt publication and CLI output;
+no new throughput claim or permanent performance gate is introduced.
+
 ## Rules of thumb
 
 - **Block and whole-disk images** stream their manifests: memory does not

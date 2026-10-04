@@ -1853,9 +1853,11 @@ image writer's identity or consistency guarantee. Locators, secrets, diagnostic
 strings and aggregate reports are not receipt contents.
 
 An existing private directory is pinned through trusted ancestry. The initial
-supported ledger filesystems are ext4, XFS and Btrfs; network, volatile and unknown
-filesystems are refused. Limits for receipt bytes, members, entries and total
-ledger bytes are explicit. Cooperating writers serialize quota checking and
+filesystem-magic gate recognizes the ext family, XFS and Btrfs; network, volatile
+and unknown magic values are refused. Linux shares the ext2/ext3/ext4 magic, so
+this gate cannot distinguish those variants. Runtime fixtures validate ext4;
+ext2/3 are not production-accepted by these tests. Limits for receipt bytes,
+members, entries and total ledger bytes are explicit. Cooperating writers serialize quota checking and
 publication. Receipts are published without replacing an existing entry, with
 data synchronized before publication and the directory afterward. Recording is
 confirmed only after synchronization; a possibly published but unconfirmed
@@ -1873,3 +1875,32 @@ Historical association compares ordered captured identities, lengths and raw
 digests, not names or sizes alone. Missing or unavailable evidence remains
 unknown; historical success never implies current mutable-image health or
 general restore readiness. D-125 and D-127 remain fresh independent gates.
+
+## D-134 — Direct CLI opts into local verification history
+
+The first consumer is explicitly in-process: `verify --local-history-config`
+captures with caller-selected resource policy, records the resulting attempt,
+and projects that same report, observation and recording outcome. It never
+updates legacy catalog verification dates or forwards local policy to a daemon.
+An explicit `--socket` conflicts with this path, rather than silently changing
+execution authority. Without the flag, ordinary verification is unchanged.
+
+The version-1 JSON policy must be a bounded (64 KiB maximum), effective-user-owned
+mode-0600 single-link regular file opened without following its final symlink.
+All capture and history choices are required, with no defaults or unknown fields.
+The engine owns scratch/ledger validation. Existing private directories are
+required; the CLI never creates them or installs an actual host policy.
+
+CLI output keeps integrity outcome, mode-specific coverage and confirmed
+publication separate. Incomplete verification still fails even when its receipt
+is recorded; completed verification with unconfirmed recording also fails the
+explicit recording request. Recorded source loss remains warning-bearing
+integrity completion, never a complete-recovery or restore-readiness claim.
+
+`verification-history --config` only loads bounded historical observations.
+It does not read current images, reconstruct the original publisher's recording
+confirmation, or call old dates current health. Current-image association is
+explicitly not checked; missing/corrupt/unavailable history is an error/unknown,
+not a healthy or silently empty ledger. Daemon policy, protobuf projections and
+GUI enablement remain separate follow-up work requiring administrator-controlled
+locations and limits, not client-supplied privileged write authority.
