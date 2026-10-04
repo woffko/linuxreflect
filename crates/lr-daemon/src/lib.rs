@@ -13,3 +13,5 @@ pub mod service;
 pub mod shutdown;
 pub mod socket;
 pub mod status;
+pub mod verification;
+pub mod verification_policy;

@@ -1904,3 +1904,48 @@ explicitly not checked; missing/corrupt/unavailable history is an error/unknown,
 not a healthy or silently empty ledger. Daemon policy, protobuf projections and
 GUI enablement remain separate follow-up work requiring administrator-controlled
 locations and limits, not client-supplied privileged write authority.
+
+## D-135 — Daemon owns history policy and one typed terminal result
+
+History remains disabled unless the daemon starts with
+`--verification-history-config PATH`. The strict version-1 JSON file is at
+most 64 KiB, root-owned mode 0600 and single-link, opened beneath pinned trusted
+ancestry without symlinks. Non-root development mode permits an effective-user-owned
+test policy. Validation happens before token initialization and socket creation.
+There is no policy environment fallback, implicit limit, directory creation,
+automatic reload or pruning.
+
+The policy reuses engine capture and ledger options, with required concurrency,
+per-message and retained-result count/byte caps. Existing scratch and ledger
+directories must be effective-user-owned mode 0700. The engine owns ledger
+ancestry/filesystem preflight and rechecks it during each operation. Images may
+come from NFS/SMB/SFTP; receipts remain on recognized local storage.
+The ledger's private lock guard explicitly unlocks at the end of its critical
+section rather than relying on every fork-inherited descriptor being closed.
+
+The additive `VerifyImageWithHistory` RPC accepts only existing source/key fields,
+not privileged write paths or limits. It uses the same caller-file pinning and
+request conversion as ordinary verification, but never updates catalog dates.
+Operation admission is non-queued. Capture retains the existing four-reader
+bound. Each active/retained result reserves the full per-message cap against
+explicit count and encoded-byte budgets; its reservation lasts until its final
+shared owner drops. Budget exhaustion refuses new work instead of evicting
+evidence. These budgets do not claim to cap total daemon RSS or legacy jobs.
+
+One immutable native result owns the engine observation, transient recording
+outcome and once-rendered bounded aggregate report JSON. Job state, live terminal
+output, legacy projection and `GetVerificationResult` derive from that result.
+Owner checking and retained lookup share the job-entry lock. Cancellation and
+incomplete verification remain unsuccessful even when recorded; completed
+integrity with failed/unconfirmed recording also fails the recording job.
+Recorded source loss remains explicitly warning-bearing integrity completion,
+not complete recovery. Oversized results are refused, never truncated.
+
+`ListVerificationHistory` needs the existing administrator `backup.create`
+authorization: v1 receipts name recorder EUID, not requesting UID. It returns
+typed disabled/unknown/empty/available state and individual bounded receipts,
+checking all response sizes before an available header. Inspection creates no
+lock. Historical receipts never reconstruct publisher acknowledgement or current
+image association. In-memory job results disappear on daemon restart; receipts
+do not. Ordinary CLI/GUI verification, fresh restore and retention gates remain
+unchanged. Client controls and GUI history are separate follow-up work.

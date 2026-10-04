@@ -79,7 +79,9 @@ impl DrainWatch {
                 entry.total = *total;
                 self.jobs.insert(job_id.clone(), entry);
             }
-            JobEvent::Finished { job_id, .. } | JobEvent::Failed { job_id, .. } => {
+            JobEvent::Finished { job_id, .. }
+            | JobEvent::Failed { job_id, .. }
+            | JobEvent::VerificationCompleted { job_id, .. } => {
                 self.jobs.remove(job_id);
             }
             JobEvent::Started { .. } => {}

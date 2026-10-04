@@ -5,6 +5,109 @@
 //! that belong to later slices answer `UNIMPLEMENTED` with their slice number
 //! so the schema stays stable.
 
+#[cfg(test)]
+mod history_authorization_tests {
+    use std::future::Future;
+    use std::pin::Pin;
+
+    use super::*;
+    use crate::auth::AuthBackend;
+
+    struct ReadOnly;
+    impl AuthBackend for ReadOnly {
+        fn check<'a>(
+            &'a self,
+            _peer: &'a PeerIdentity,
+            action: Action,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+            Box::pin(async move {
+                if action == Action::DiskRead {
+                    Ok(())
+                } else {
+                    Err(Error::denied(action.id(), "administrator required"))
+                }
+            })
+        }
+    }
+
+    fn request<T>(uid: u32, body: T) -> GrpcRequest<T> {
+        let mut request = GrpcRequest::new(body);
+        request
+            .extensions_mut()
+            .insert(Peer(Arc::new(PeerIdentity::for_uid(uid))));
+        request
+    }
+
+    #[tokio::test]
+    async fn history_admin_authorization_precedes_policy_and_retained_lookup_is_owner_scoped() {
+        let jobs = Arc::new(Jobs::new());
+        let service = DaemonService::new(Arc::new(ReadOnly), Arc::clone(&jobs), true);
+        let denied = service
+            .list_verification_history(request(1000, Request::default()))
+            .await
+            .expect_err("disk-read permission cannot inspect global receipts");
+        assert_eq!(
+            denied.code(),
+            tonic::Code::PermissionDenied,
+            "authorization precedes disabled policy disclosure"
+        );
+
+        let _ = jobs
+            .register_for("typed-result", "set", 1000)
+            .expect("register");
+        let _ = jobs
+            .finish("typed-result", Ok("{}".to_owned()))
+            .expect("legacy result");
+        assert_eq!(
+            service
+                .get_verification_result(request(
+                    2000,
+                    JobRef {
+                        job_id: "typed-result".to_owned()
+                    }
+                ))
+                .await
+                .expect_err("another owner")
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        for uid in [1000, 0] {
+            assert_eq!(
+                service
+                    .get_verification_result(request(
+                        uid,
+                        JobRef {
+                            job_id: "typed-result".to_owned()
+                        }
+                    ))
+                    .await
+                    .expect_err("legacy result never masquerades as captured")
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+        }
+        let _ = jobs
+            .register_for("typed-result", "set", 2000)
+            .expect("reuse");
+        assert!(
+            jobs.snapshot_owned("typed-result", 1000).is_err(),
+            "owner and retained result are read under one lock after reuse"
+        );
+    }
+
+    #[test]
+    fn nonqueued_operation_admission_refuses_and_releases_exactly_one_slot() {
+        let slots = Arc::new(Slots::new(1));
+        let held = slots.try_acquire().expect("one slot");
+        assert!(
+            slots.try_acquire().is_none(),
+            "busy does not queue or spawn a worker"
+        );
+        drop(held);
+        assert!(slots.try_acquire().is_some());
+    }
+}
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +129,8 @@ use crate::auth::{Action, PeerIdentity, SharedAuth};
 use crate::client_files::{self, ClientFiles};
 use crate::jobs::{JobEvent, JobState as JobStateInner, Jobs};
 use crate::status;
+use crate::verification::{self, CapturedVerificationResult};
+use crate::verification_policy::DaemonVerificationPolicy;
 use lr_export::session::ExportState;
 
 /// Identity attached to a request by [`PeerInterceptor`].
@@ -61,6 +166,13 @@ pub struct DaemonService {
     exports: Arc<Mutex<HashMap<PathBuf, Arc<AtomicBool>>>>,
     /// Bounds concurrent verifications (A5).
     verifications: Arc<Slots>,
+    history: Option<Arc<HistoryRuntime>>,
+}
+
+struct HistoryRuntime {
+    policy: DaemonVerificationPolicy,
+    operations: Arc<Slots>,
+    results: Arc<verification::ResultBudget>,
 }
 
 /// How many verifications may read at once; further ones wait.
@@ -95,6 +207,18 @@ impl Slots {
         *free -= 1;
         SlotGuard(Arc::clone(self))
     }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<SlotGuard> {
+        let mut free = self
+            .free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *free == 0 {
+            return None;
+        }
+        *free -= 1;
+        Some(SlotGuard(Arc::clone(self)))
+    }
 }
 
 /// Returns a verification slot on drop.
@@ -122,7 +246,25 @@ impl DaemonService {
             dev_mode,
             exports: Arc::new(Mutex::new(HashMap::new())),
             verifications: Arc::new(Slots::new(MAX_VERIFICATIONS)),
+            history: None,
         }
+    }
+
+    /// Enable captured verification with an already validated startup policy.
+    /// The default service has no history policy and creates no history paths.
+    #[must_use]
+    pub fn with_verification_policy(mut self, policy: DaemonVerificationPolicy) -> Self {
+        let operations = Arc::new(Slots::new(policy.max_concurrent_operations()));
+        let results = Arc::new(verification::ResultBudget::new(
+            policy.max_retained_results(),
+            policy.max_retained_result_bytes(),
+        ));
+        self.history = Some(Arc::new(HistoryRuntime {
+            policy,
+            operations,
+            results,
+        }));
+        self
     }
 
     /// Start serving an image read-only and mount it (spec §K S13).
@@ -298,6 +440,44 @@ impl DaemonService {
         Ok(peer)
     }
 
+    /// Convert verification read options and pin caller-owned credential files.
+    async fn verification_request(
+        &self,
+        uid: u32,
+        spec: VerifySpec,
+    ) -> std::result::Result<(lr_engine::verify::VerifyRequest, ClientFiles), Status> {
+        // Both routes pin caller-owned files through their engine work (A4).
+        client_files::check_host_key_policy(spec.insecure_ignore_host_key, self.dev_mode)
+            .map_err(status::status_of)?;
+        let named = spec.clone();
+        let (encryption, files, identity, known_hosts) = Self::off_thread(move || {
+            let encryption = match ClientFiles::passphrase(uid, &named.passphrase_file)? {
+                Some(passphrase) => lr_engine::keys::Encryption::Passphrase(passphrase),
+                None => lr_engine::options::restore_encryption(None)?,
+            };
+            let mut files = ClientFiles::new();
+            let identity = files.pin(uid, &named.identity)?;
+            let known_hosts = files.pin(uid, &named.known_hosts)?;
+            Ok((encryption, files, identity, known_hosts))
+        })
+        .await?;
+        Ok((
+            lr_engine::verify::VerifyRequest {
+                image: spec.image,
+                encryption,
+                chain: spec.chain,
+                destination_options: lr_store::DestinationOptions {
+                    set_name: String::new(),
+                    identity,
+                    known_hosts,
+                    insecure_ignore_host_key: spec.insecure_ignore_host_key,
+                },
+                context: EngineContext::silent(),
+            },
+            files,
+        ))
+    }
+
     /// Run a job on a blocking thread, streaming its progress.
     fn run_job<F>(
         &self,
@@ -326,7 +506,12 @@ impl DaemonService {
                 if event.job_id() != forwarded {
                     continue;
                 }
-                let terminal = matches!(event, JobEvent::Finished { .. } | JobEvent::Failed { .. });
+                let terminal = matches!(
+                    event,
+                    JobEvent::Finished { .. }
+                        | JobEvent::Failed { .. }
+                        | JobEvent::VerificationCompleted { .. }
+                );
                 if sender.send(Ok(progress_of(&event))).await.is_err() {
                     break;
                 }
@@ -359,6 +544,94 @@ impl DaemonService {
         });
         Ok(ReceiverStream::new(receiver))
     }
+
+    fn run_verification_job<F>(
+        &self,
+        job_id: String,
+        owner: u32,
+        limit: usize,
+        permit: SlotGuard,
+        work: F,
+    ) -> Result<ReceiverStream<std::result::Result<lr_proto::v1::VerificationProgress, Status>>>
+    where
+        F: FnOnce(EngineContext) -> Result<CapturedVerificationResult> + Send + 'static,
+    {
+        // Subscribe before registration; retain terminal state before publication.
+        let mut events = self.jobs.subscribe();
+        let (sink, cancel) = self.jobs.register_for(&job_id, &job_id, owner)?;
+        let context = EngineContext {
+            progress: Some(Arc::new(sink)),
+            cancel: Some(cancel),
+        };
+        let (sender, receiver) = mpsc::channel(4);
+        let forwarded = job_id.clone();
+        let retained = Arc::clone(&self.jobs);
+        tokio::spawn(async move {
+            loop {
+                let event = match events.recv().await {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // A slow stream can recover the canonical terminal result.
+                        if let Ok(snapshot) = retained.snapshot(&forwarded)
+                            && let Some(event) = snapshot.terminal_event()
+                        {
+                            event
+                        } else {
+                            continue;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                if event.job_id() != forwarded {
+                    continue;
+                }
+                let terminal = matches!(
+                    event,
+                    JobEvent::Finished { .. }
+                        | JobEvent::Failed { .. }
+                        | JobEvent::VerificationCompleted { .. }
+                );
+                let message = verification_progress_of(&event);
+                let message = verification::check_size(&message, limit)
+                    .map(|()| message)
+                    .map_err(|_| {
+                        Status::resource_exhausted("verification response exceeds daemon policy")
+                    });
+                let failed = message.is_err();
+                if sender.send(message).await.is_err() || terminal || failed {
+                    break;
+                }
+            }
+        });
+        let jobs = Arc::clone(&self.jobs);
+        tokio::task::spawn_blocking(move || {
+            // Keep admission until the canonical result is retained and published.
+            let _permit = permit;
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(context)))
+                .unwrap_or_else(|_| {
+                    Err(Error::Io(std::io::Error::other(
+                        "internal error: captured verification panicked",
+                    )))
+                });
+            let finished = match outcome {
+                Ok(result) => jobs.finish_verification(&job_id, result),
+                Err(error) => jobs.finish(&job_id, Err(error)),
+            };
+            if let Err(error) = finished {
+                tracing::warn!(%error, "cannot retain verification result");
+            }
+        });
+        Ok(ReceiverStream::new(receiver))
+    }
+}
+
+fn verification_progress_of(event: &JobEvent) -> lr_proto::v1::VerificationProgress {
+    use lr_proto::v1::verification_progress::Step;
+    let step = match event {
+        JobEvent::VerificationCompleted { result, .. } => Step::Result(result.wire()),
+        _ => Step::Progress(progress_of(event)),
+    };
+    lr_proto::v1::VerificationProgress { step: Some(step) }
 }
 
 /// A one-shot `Progress` whose finished step carries `value` as JSON.
@@ -392,6 +665,7 @@ fn progress_of(event: &JobEvent) -> Progress {
             code: code.clone(),
             message: message.clone(),
         }),
+        JobEvent::VerificationCompleted { result, .. } => return result.legacy_progress(),
     };
     Progress { step: Some(step) }
 }
@@ -513,6 +787,10 @@ fn destination_list() -> std::result::Result<lr_proto::v1::DestinationList, Stat
 impl LinuxReflect for DaemonService {
     type CreateBackupStream = ReceiverStream<std::result::Result<Progress, Status>>;
     type VerifyImageStream = ReceiverStream<std::result::Result<Progress, Status>>;
+    type VerifyImageWithHistoryStream =
+        ReceiverStream<std::result::Result<lr_proto::v1::VerificationProgress, Status>>;
+    type ListVerificationHistoryStream =
+        ReceiverStream<std::result::Result<lr_proto::v1::VerificationHistoryItem, Status>>;
     type RestoreImageStream = ReceiverStream<std::result::Result<Progress, Status>>;
     type WatchEventsStream = ReceiverStream<std::result::Result<Event, Status>>;
 
@@ -693,36 +971,9 @@ impl LinuxReflect for DaemonService {
         request: GrpcRequest<VerifySpec>,
     ) -> std::result::Result<Response<Self::VerifyImageStream>, Status> {
         let peer = self.authorize(&request, Action::DiskRead).await?;
-        let spec = request.get_ref().clone();
-        client_files::check_host_key_policy(spec.insecure_ignore_host_key, self.dev_mode)
-            .map_err(status::status_of)?;
-        // Any session user may verify, so the named files must be the
-        // caller's own; they stay pinned until the job ends (A4).
-        let uid = peer.uid;
-        let named = spec.clone();
-        let (encryption, files, identity, known_hosts) = Self::off_thread(move || {
-            let encryption = match ClientFiles::passphrase(uid, &named.passphrase_file)? {
-                Some(passphrase) => lr_engine::keys::Encryption::Passphrase(passphrase),
-                None => lr_engine::options::restore_encryption(None)?,
-            };
-            let mut files = ClientFiles::new();
-            let identity = files.pin(uid, &named.identity)?;
-            let known_hosts = files.pin(uid, &named.known_hosts)?;
-            Ok((encryption, files, identity, known_hosts))
-        })
-        .await?;
-        let verify = lr_engine::verify::VerifyRequest {
-            image: spec.image.clone(),
-            encryption,
-            chain: spec.chain,
-            destination_options: lr_store::DestinationOptions {
-                set_name: String::new(),
-                identity,
-                known_hosts,
-                insecure_ignore_host_key: spec.insecure_ignore_host_key,
-            },
-            context: EngineContext::silent(),
-        };
+        let (verify, files) = self
+            .verification_request(peer.uid, request.into_inner())
+            .await?;
         // Every verification is its own job with its own set key, so one
         // user's long verification never blocks another's; a counting
         // semaphore bounds how many read at once (A5).
@@ -748,6 +999,159 @@ impl LinuxReflect for DaemonService {
             })
             .map_err(status::status_of)?;
         Ok(Response::new(stream))
+    }
+
+    async fn verify_image_with_history(
+        &self,
+        request: GrpcRequest<VerifySpec>,
+    ) -> std::result::Result<Response<Self::VerifyImageWithHistoryStream>, Status> {
+        let peer = self.authorize(&request, Action::DiskRead).await?;
+        let runtime = self.history.as_ref().map(Arc::clone).ok_or_else(|| {
+            Status::failed_precondition("daemon verification history is disabled")
+        })?;
+        let permit = runtime
+            .operations
+            .try_acquire()
+            .ok_or_else(|| Status::resource_exhausted("daemon verification history is busy"))?;
+        let reservation = runtime
+            .results
+            .try_reserve(runtime.policy.max_result_bytes())
+            .ok_or_else(|| {
+                Status::resource_exhausted("daemon retained verification result quota is full")
+            })?;
+        // Write authority comes exclusively from daemon startup policy.
+        let (verify, files) = self
+            .verification_request(peer.uid, request.into_inner())
+            .await?;
+        let id = format!(
+            "verify-captured-{}",
+            lr_core::Id::generate().map_err(|error| status::status_of(Error::Io(error)))?
+        );
+        let slots = Arc::clone(&self.verifications);
+        let limit = runtime.policy.max_result_bytes();
+        let stream = self
+            .run_verification_job(id, peer.uid, limit, permit, move |context| {
+                let _slot = slots.acquire();
+                // Keep caller-owned credential descriptors pinned through the engine
+                // attempt. Diagnostics stay outside the receipt and typed response.
+                let _files = files;
+                let mut verify = verify;
+                verify.context = context;
+                let attempt =
+                    lr_engine::verify::verify_image_captured(&verify, runtime.policy.capture());
+                let recording = lr_engine::verify::record_verification_attempt(
+                    &attempt,
+                    runtime.policy.history(),
+                );
+                CapturedVerificationResult::from_attempt(
+                    &attempt,
+                    recording,
+                    &runtime.policy,
+                    reservation,
+                )
+            })
+            .map_err(status::status_of)?;
+        Ok(Response::new(stream))
+    }
+
+    async fn get_verification_result(
+        &self,
+        request: GrpcRequest<JobRef>,
+    ) -> std::result::Result<Response<lr_proto::v1::VerificationResult>, Status> {
+        let peer = self.authorize(&request, Action::DiskRead).await?;
+        let id = &request.get_ref().job_id;
+        let snapshot = self
+            .jobs
+            .snapshot_owned(id, peer.uid)
+            .map_err(status::status_of)?;
+        let result = snapshot.verification.ok_or_else(|| {
+            Status::failed_precondition("no retained captured verification result")
+        })?;
+        let runtime = self.history.as_ref().ok_or_else(|| {
+            Status::failed_precondition("daemon verification history is disabled")
+        })?;
+        // Bound projection work, not only capture and ledger I/O. The canonical
+        // result stays shared; each response is an independently owned wire value.
+        let _permit = runtime
+            .operations
+            .try_acquire()
+            .ok_or_else(|| Status::resource_exhausted("daemon verification history is busy"))?;
+        Ok(Response::new(result.wire()))
+    }
+
+    async fn list_verification_history(
+        &self,
+        request: GrpcRequest<Request>,
+    ) -> std::result::Result<Response<Self::ListVerificationHistoryStream>, Status> {
+        // Version-1 receipts name recorder EUID, not requesting UID. Until
+        // per-caller provenance is designed, global inspection is admin-only.
+        self.authorize(&request, Action::BackupCreate).await?;
+        let (sender, receiver) = mpsc::channel(1);
+        let Some(runtime) = self.history.as_ref().map(Arc::clone) else {
+            sender
+                .send(Ok(verification::history_state(
+                    lr_proto::v1::VerificationHistoryAvailability::Disabled,
+                )))
+                .await
+                .map_err(|_| Status::internal("history stream closed"))?;
+            return Ok(Response::new(ReceiverStream::new(receiver)));
+        };
+        let permit = runtime
+            .operations
+            .try_acquire()
+            .ok_or_else(|| Status::resource_exhausted("daemon verification history is busy"))?;
+        let history = Self::off_thread(move || {
+            verification::check_size(
+                &verification::history_state(
+                    lr_proto::v1::VerificationHistoryAvailability::Available,
+                ),
+                runtime.policy.max_result_bytes(),
+            )?;
+            let history = lr_engine::verify::load_verification_history(runtime.policy.history());
+            // Validate every receipt before saying history is available.
+            if let Ok(history) = &history {
+                for receipt in history.receipts() {
+                    verification::check_observation_size(
+                        receipt.observation(),
+                        runtime.policy.max_result_bytes(),
+                    )?;
+                    verification::check_size(
+                        &verification::wire_receipt(receipt),
+                        runtime.policy.max_result_bytes(),
+                    )?;
+                }
+            }
+            Ok((history, permit))
+        })
+        .await?;
+        tokio::spawn(async move {
+            let (history, _permit) = history;
+            use lr_proto::v1::VerificationHistoryAvailability as Availability;
+            let availability = match &history {
+                Err(_) => Availability::Unknown,
+                Ok(history) if history.receipts().is_empty() => Availability::Empty,
+                Ok(_) => Availability::Available,
+            };
+            if sender
+                .send(Ok(verification::history_state(availability)))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            if let Ok(history) = history {
+                for receipt in history.receipts() {
+                    if sender
+                        .send(Ok(verification::wire_receipt(receipt)))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(receiver)))
     }
 
     async fn prepare_restore(
@@ -927,6 +1331,13 @@ impl LinuxReflect for DaemonService {
                         JobEvent::Bytes { .. } => "bytes",
                         JobEvent::Finished { .. } => "finished",
                         JobEvent::Failed { .. } => "failed",
+                        JobEvent::VerificationCompleted { result, .. } => {
+                            if result.job_outcome().0 == JobStateInner::Finished {
+                                "finished"
+                            } else {
+                                "failed"
+                            }
+                        }
                     }
                     .to_owned(),
                     message: event.job_id().to_owned(),

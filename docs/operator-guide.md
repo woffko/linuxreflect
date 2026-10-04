@@ -38,7 +38,7 @@ polkit (`/usr/share/polkit-1/actions/org.linuxreflect.policy`):
 | Action | Default for the active session | Covers |
 |---|---|---|
 | `org.linuxreflect.disk.read` | allowed | listing disks, sets and jobs, verifying, cancelling one's own jobs |
-| `org.linuxreflect.backup.create` | administrator, kept | backups, catalog rebuilds |
+| `org.linuxreflect.backup.create` | administrator, kept | backups, catalog rebuilds, global daemon receipt inspection |
 | `org.linuxreflect.restore.prepare` | administrator, kept | restore plans and tokens |
 | `org.linuxreflect.restore.apply` | administrator, every time | writing a restore target |
 | `org.linuxreflect.snapshot.manage`, `schedule.manage`, `destination.configure`, `export.manage` | administrator, kept | snapshots, timers and retention, named destinations, NBD exports |
@@ -219,7 +219,8 @@ deleting regardless.
 `verify --local-history-config <policy.json>` explicitly runs captured
 verification in the CLI process, even if a daemon is available. It cannot be
 combined with `--socket`. Ordinary verification remains unchanged; this route
-does not update catalog dates. Daemon/GUI receipt enablement is not implemented.
+does not update catalog dates. Daemon receipts have a separate opt-in policy and
+typed RPCs described below; GUI history and client controls are not implemented.
 
 Create the policy yourself as an effective-user-owned, single-link regular file
 with mode 0600 (not a symlink). Both directories must already exist, be owned by
@@ -272,6 +273,54 @@ A loaded receipt is not current health, original publication confirmation or
 authenticated evidence against the local owner. Missing, uninitialized, corrupt
 or unavailable history is unknown/error. Quotas include private crash debris;
 there is no automatic pruning. Fresh restore and retention checks still run.
+
+### Opt-in daemon verification receipts
+
+The daemon defaults to disabled history. Administrators may supply
+`linuxreflect-daemon --verification-history-config <policy.json>`; this does
+not change ordinary `VerifyImage` requests. The new generated-client RPCs are
+`VerifyImageWithHistory`, owner/root-only `GetVerificationResult` and
+administrator-only `ListVerificationHistory`. Existing CLI/GUI controls do not
+select these RPCs yet.
+
+Use a root-owned, mode-0600 single-link policy beneath trusted ancestry.
+Scratch and ledger must already exist, be daemon-EUID-owned mode 0700, and the
+ledger must use supported local storage. Invalid policy stops startup before
+socket or token-file creation. Non-root development mode accepts private
+effective-user-owned test policy. No paths are created or reloaded automatically.
+
+The daemon policy uses the same required `schema_version`, `capture` and
+`history` objects as the CLI example, plus all four required top-level fields:
+
+```json
+{
+  "max_concurrent_operations": 1,
+  "max_result_bytes": 1048576,
+  "max_retained_results": 128,
+  "max_retained_result_bytes": 134217728
+}
+```
+
+This fragment is not a complete policy. These are example limits, not defaults.
+Use private local daemon paths, for example
+`/var/lib/linuxreflect/verification-scratch` and
+`/var/lib/linuxreflect/verification-history`. Concurrency must be 1–4;
+per-message size must be 1–1 MiB; retained count must be positive and retained
+bytes at least the message cap. Each active/retained result reserves that full
+cap until its last shared owner drops. These are encoded-result budgets, not
+total process-memory guarantees.
+
+Busy/full budgets refuse new requests without queuing or silent eviction.
+Terminal job results last for this daemon process only; once it is idle, a
+controlled restart clears retained results, not receipts. No receipt pruning
+is automatic. Oversized terminal output or history rows are refused, never
+truncated into a successful result.
+
+Typed output distinguishes verification completion from receipt recording.
+Historical availability means the bounded ledger loaded, not that images are
+healthy now. Missing/corrupt/unavailable ledgers are unknown; inspection neither
+creates the permanent lock nor reconstructs publication confirmation. Fresh
+restore and retention verification remain mandatory.
 
 ## Restoring
 

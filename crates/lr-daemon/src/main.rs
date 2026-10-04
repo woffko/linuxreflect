@@ -31,6 +31,7 @@ struct Args {
     token_secret_file: Option<PathBuf>,
     /// Registry of named destinations (A6).
     destinations_file: Option<PathBuf>,
+    verification_history_config: Option<PathBuf>,
     help: bool,
 }
 
@@ -46,6 +47,7 @@ impl Default for Args {
             socket_mode: None,
             token_secret_file: None,
             destinations_file: None,
+            verification_history_config: None,
             help: false,
         }
     }
@@ -87,6 +89,13 @@ impl Args {
                             .into(),
                     );
                 }
+                "--verification-history-config" => {
+                    args.verification_history_config = Some(
+                        argv.next()
+                            .ok_or("--verification-history-config needs a path")?
+                            .into(),
+                    );
+                }
                 "--sd-notify=no" | "--no-sd-notify" => args.sd_notify = false,
                 "--sd-notify=yes" => args.sd_notify = true,
                 "--help" | "-h" => args.help = true,
@@ -100,7 +109,7 @@ impl Args {
         "linuxreflect-daemon [--socket PATH] [--socket-group NAME] [--no-create-group]\n\
          \x20                    [--socket-mode OCTAL] [--auth static:<uid,...>] [--dev-mode]\n\
          \x20                    [--sd-notify=no] [--token-secret-file PATH]\n\
-         \x20                    [--destinations-file PATH]"
+         \x20                    [--destinations-file PATH] [--verification-history-config PATH]"
     }
 }
 
@@ -147,6 +156,14 @@ fn init_logging() {
 
 /// Start the daemon and serve until the process is stopped.
 fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    // Refuse invalid opt-in policy before listener, token key or registry effects.
+    let verification_policy = args
+        .verification_history_config
+        .as_deref()
+        .map(|path| {
+            lr_daemon::verification_policy::DaemonVerificationPolicy::load(path, args.dev_mode)
+        })
+        .transpose()?;
     if let Some(path) = &args.destinations_file {
         lr_store::named::set_registry_path(path.clone());
     }
@@ -171,7 +188,10 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .await?;
         tracing::info!(socket = %args.socket.display(), ?origin, "listening");
 
-        let service = DaemonService::new(Arc::clone(&auth), Arc::clone(&jobs), args.dev_mode);
+        let mut service = DaemonService::new(Arc::clone(&auth), Arc::clone(&jobs), args.dev_mode);
+        if let Some(policy) = verification_policy {
+            service = service.with_verification_policy(policy);
+        }
         if args.sd_notify && notify::send("READY=1")? {
             tracing::info!("systemd notified");
         }

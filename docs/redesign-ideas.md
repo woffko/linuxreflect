@@ -37,7 +37,8 @@ deployment:
 Durable content-bound verification history and SFTP stale-writer fencing remain
 separate work. D-132 implements captured engine observations; D-133 adds private
 immutable receipts and bounded loading. D-134 starts explicit direct CLI recording
-and inspection; daemon/GUI receipt enablement remains follow-up work.
+and inspection; D-135 adds opt-in daemon-owned policy and typed RPC projections.
+GUI history and client controls remain follow-up work.
 Captured verification requires caller-selected ancestry-sized scratch limits.
 All choices retain D-125's fresh deletion gate. Historical maintainer acceptance
 results below are not evidence that the current tree passed privileged tests
@@ -249,7 +250,8 @@ The actual release API passed 18 paired local/NFS resource comparisons on retain
 fixtures, with equal reports and unchanged original hashes. See
 [performance.md](performance.md#captured-verification-api-2026-10-04) for costs
 and limits. Receipt publication and bounded loading/indexing followed in D-133;
-CLI/daemon/GUI history projections remain subsequent work. Current callers, fresh restore and
+Direct CLI and typed daemon projections followed in D-134/D-135; GUI history
+remains subsequent work. Current callers, fresh restore and
 retention verification, image format and conservative legacy retention are unchanged.
 
 ### Receipt-store acceptance, 2026-10-04
@@ -290,9 +292,33 @@ exact receipt parity, unchanged catalog bytes, quota and incomplete exits,
 strict policy/socket refusal, and read-only empty/unknown history. Main's
 independent focused run and full CI passed (675 passed, 0 failed, 73 ignored,
 2 existing unavailable scenarios). No actual host policy is enabled. Next:
-administrator-controlled daemon configuration and typed protocol projections,
-then GUI history showing the same distinct facts; unchanged fresh restore and
-retention gates remain mandatory.
+administrator-controlled daemon configuration and typed protocol projections
+subsequently followed in D-135. GUI history remains next; unchanged fresh
+restore and retention gates remain mandatory.
+
+### Daemon history boundary, 2026-10-05
+
+D-135 makes the private startup policy the sole authority for daemon scratch,
+ledger and resource choices. Request conversion/file pinning is shared with
+ordinary verification; ledger preflight delegates to the engine's trust rules.
+History stays disabled by default. No host directories or enabled policy were
+installed.
+
+Live output and reconnect lookup share one immutable retained result. Typed
+integrity/coverage, transient publication confirmation and historical receipts
+remain distinct. Global inspection is administrator-only because existing
+receipts do not identify the requesting user. Explicit operation, message and
+retained-result budgets refuse excess work without silent eviction or truncation.
+
+The mandatory additions cover strict policy refusal, startup before side effects,
+real daemon receipt/reconnect parity, restart semantics, unchanged catalog bytes,
+incomplete/recording failure, authorization and quota/response/concurrency bounds.
+GUI history, explicit client controls and deployment acceptance remain separate.
+Final full CI passed: 688 passed, zero failed, 73 ignored and two existing
+unavailable scenarios. Thirteen grouped critical tests were added; the existing
+ledger contention test gained a deterministic inherited-description regression.
+The guard now explicitly unlocks at critical-section end. No privileged,
+destructive or unchanged scale suites were rerun.
 
 ## Remediation-plan follow-up
 

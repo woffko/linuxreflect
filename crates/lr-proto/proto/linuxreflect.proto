@@ -298,6 +298,213 @@ message Event {
   Progress progress = 4;
 }
 
+// Additive captured-verification API (D-135). No client-selected privileged paths.
+// Zero enum values are unknown/unspecified, never completed checks.
+enum VerificationIntegrity {
+  VERIFICATION_INTEGRITY_UNSPECIFIED = 0;
+  VERIFICATION_INTEGRITY_INTEGRITY_VERIFIED = 1;
+  VERIFICATION_INTEGRITY_INTEGRITY_VERIFIED_WITH_RECORDED_LOSS = 2;
+}
+
+enum VerificationAttemptStage {
+  VERIFICATION_ATTEMPT_STAGE_UNSPECIFIED = 0;
+  VERIFICATION_ATTEMPT_STAGE_RESOLVE_ANCESTRY = 1;
+  VERIFICATION_ATTEMPT_STAGE_SCRATCH_PREFLIGHT = 2;
+  VERIFICATION_ATTEMPT_STAGE_CAPTURE = 3;
+  VERIFICATION_ATTEMPT_STAGE_IDENTITY_VALIDATION = 4;
+  VERIFICATION_ATTEMPT_STAGE_STRUCTURE = 5;
+  VERIFICATION_ATTEMPT_STAGE_CONTENT = 6;
+}
+
+enum VerificationFailureKind {
+  VERIFICATION_FAILURE_KIND_UNSPECIFIED = 0;
+  VERIFICATION_FAILURE_KIND_CANCELLED = 1;
+  VERIFICATION_FAILURE_KIND_INVALID_OPTIONS = 2;
+  VERIFICATION_FAILURE_KIND_RAW_CAP_EXCEEDED = 3;
+  VERIFICATION_FAILURE_KIND_HEADROOM_UNAVAILABLE = 4;
+  VERIFICATION_FAILURE_KIND_SCRATCH_UNTRUSTED = 5;
+  VERIFICATION_FAILURE_KIND_SOURCE_CHANGED = 6;
+  VERIFICATION_FAILURE_KIND_IDENTITY_CHANGED = 7;
+  VERIFICATION_FAILURE_KIND_KEY_OR_AUTHENTICATION_FAILURE = 8;
+  VERIFICATION_FAILURE_KIND_CORRUPT = 9;
+  VERIFICATION_FAILURE_KIND_UNSUPPORTED = 10;
+  VERIFICATION_FAILURE_KIND_UNAVAILABLE = 11;
+}
+
+enum VerificationMemberStage {
+  VERIFICATION_MEMBER_STAGE_UNSPECIFIED = 0;
+  VERIFICATION_MEMBER_STAGE_NOT_REQUESTED = 1;
+  VERIFICATION_MEMBER_STAGE_NOT_STARTED = 2;
+  VERIFICATION_MEMBER_STAGE_IN_PROGRESS = 3;
+  VERIFICATION_MEMBER_STAGE_COMPLETE = 4;
+  VERIFICATION_MEMBER_STAGE_FAILED = 5;
+}
+
+enum VerificationRecoveryScope {
+  VERIFICATION_RECOVERY_SCOPE_UNSPECIFIED = 0;
+  VERIFICATION_RECOVERY_SCOPE_SELECTED_RECOVERY_POINT = 1;
+  VERIFICATION_RECOVERY_SCOPE_EVERY_MEMBER = 2;
+}
+
+enum VerificationContentCoverage {
+  VERIFICATION_CONTENT_COVERAGE_UNSPECIFIED = 0;
+  VERIFICATION_CONTENT_COVERAGE_BLOCK_SELECTED_MERGED_REFERENCES = 1;
+  VERIFICATION_CONTENT_COVERAGE_BLOCK_EVERY_STORED_PAYLOAD = 2;
+  VERIFICATION_CONTENT_COVERAGE_FILE_SELECTED_TREE_REFERENCES = 3;
+  VERIFICATION_CONTENT_COVERAGE_FILE_EVERY_TREE_REFERENCES = 4;
+  VERIFICATION_CONTENT_COVERAGE_STREAM_SELECTED_MEMBER_PAYLOADS_SECTIONS_AND_LAYOUT = 5;
+  VERIFICATION_CONTENT_COVERAGE_STREAM_EVERY_MEMBER_PAYLOADS_SECTIONS_AND_LAYOUT = 6;
+  VERIFICATION_CONTENT_COVERAGE_WHOLE_DISK_REGIONS_AND_LAYOUT = 7;
+}
+
+enum VerificationDigestAlgorithm {
+  VERIFICATION_DIGEST_ALGORITHM_UNSPECIFIED = 0;
+  VERIFICATION_DIGEST_ALGORITHM_BLAKE3_RAW_V1 = 1;
+}
+
+enum VerificationStructureNotice {
+  VERIFICATION_STRUCTURE_NOTICE_UNSPECIFIED = 0;
+  VERIFICATION_STRUCTURE_NOTICE_REPEATED_ENCRYPTED_METADATA_PAGE_NONCE = 1;
+}
+
+enum VerificationImageKind {
+  VERIFICATION_IMAGE_KIND_UNSPECIFIED = 0;
+  VERIFICATION_IMAGE_KIND_BLOCK = 1;
+  VERIFICATION_IMAGE_KIND_STREAM = 2;
+  VERIFICATION_IMAGE_KIND_FILE = 3;
+}
+
+enum VerificationLegacyHeaderKind {
+  VERIFICATION_LEGACY_HEADER_KIND_UNSPECIFIED = 0;
+  VERIFICATION_LEGACY_HEADER_KIND_FULL = 1;
+  VERIFICATION_LEGACY_HEADER_KIND_INCREMENTAL = 2;
+  VERIFICATION_LEGACY_HEADER_KIND_DIFFERENTIAL = 3;
+}
+
+enum VerificationConsistency {
+  VERIFICATION_CONSISTENCY_UNSPECIFIED = 0;
+  VERIFICATION_CONSISTENCY_POINT_IN_TIME = 1;
+  VERIFICATION_CONSISTENCY_FROZEN = 2;
+  VERIFICATION_CONSISTENCY_OFFLINE = 3;
+  VERIFICATION_CONSISTENCY_PER_FILE = 4;
+  VERIFICATION_CONSISTENCY_NONE = 5;
+}
+
+enum VerificationHistoryFailure {
+  VERIFICATION_HISTORY_FAILURE_UNSPECIFIED = 0;
+  VERIFICATION_HISTORY_FAILURE_INVALID_OPTIONS = 1;
+  VERIFICATION_HISTORY_FAILURE_INVALID_ATTEMPT = 2;
+  VERIFICATION_HISTORY_FAILURE_UNTRUSTED_DIRECTORY = 3;
+  VERIFICATION_HISTORY_FAILURE_UNSUPPORTED_FILESYSTEM = 4;
+  VERIFICATION_HISTORY_FAILURE_QUOTA_EXCEEDED = 5;
+  VERIFICATION_HISTORY_FAILURE_RECEIPT_ID_COLLISION = 6;
+  VERIFICATION_HISTORY_FAILURE_BUSY = 7;
+  VERIFICATION_HISTORY_FAILURE_UNAVAILABLE = 8;
+}
+
+enum VerificationPublicationFailure {
+  VERIFICATION_PUBLICATION_FAILURE_UNSPECIFIED = 0;
+  VERIFICATION_PUBLICATION_FAILURE_LINK_UNCONFIRMED = 1;
+  VERIFICATION_PUBLICATION_FAILURE_TEMPORARY_NAME_REMOVAL_UNCONFIRMED = 2;
+  VERIFICATION_PUBLICATION_FAILURE_DIRECTORY_SYNC_UNCONFIRMED = 3;
+}
+
+enum VerificationHistoryAvailability {
+  VERIFICATION_HISTORY_AVAILABILITY_UNSPECIFIED = 0;
+  VERIFICATION_HISTORY_AVAILABILITY_DISABLED = 1;
+  VERIFICATION_HISTORY_AVAILABILITY_UNKNOWN = 2;
+  VERIFICATION_HISTORY_AVAILABILITY_EMPTY = 3;
+  VERIFICATION_HISTORY_AVAILABILITY_AVAILABLE = 4;
+}
+
+message VerificationIncomplete {
+  VerificationAttemptStage stage = 1;
+  VerificationFailureKind reason = 2;
+}
+message VerificationObservation {
+  uint32 schema_version = 1;
+  VerificationDigestAlgorithm digest_algorithm = 2;
+  uint32 coverage_contract_version = 3;
+  oneof outcome {
+    VerificationIntegrity integrity = 4;
+    VerificationIncomplete incomplete = 5;
+  }
+  VerificationRecoveryScope requested_scope = 6;
+  optional VerificationContentCoverage content_coverage = 7;
+  repeated VerificationMemberObservation members = 8;
+}
+message VerificationMemberIdentity {
+  string image_uuid = 1;
+  string chain_id = 2;
+  string parent_uuid = 3;
+  string set_id = 4;
+  uint32 seq_in_chain = 5;
+  VerificationImageKind image_kind = 6;
+  VerificationLegacyHeaderKind legacy_header_kind = 7;
+  bool whole_disk = 8;
+  VerificationConsistency consistency = 9;
+}
+message VerificationMemberObservation {
+  VerificationMemberIdentity identity = 1;
+  optional uint64 raw_length = 2;
+  optional bytes raw_digest = 3;
+  VerificationMemberStage capture = 4;
+  VerificationMemberStage structure = 5;
+  optional VerificationStructureNotice structure_notice = 6;
+  VerificationMemberContentStages content = 7;
+}
+message VerificationMemberContentStages {
+  VerificationMemberStage recovery_point = 1;
+  VerificationMemberStage referenced_payloads = 2;
+  VerificationMemberStage every_stored_payload = 3;
+  VerificationMemberStage disk_region_payloads = 4;
+}
+message VerificationRecorded { string receipt_id = 1; }
+message VerificationNotRecorded { VerificationHistoryFailure reason = 1; }
+message VerificationPublicationUnconfirmed {
+  string receipt_id = 1;
+  VerificationPublicationFailure reason = 2;
+}
+message VerificationRecordingOutcome {
+  oneof outcome {
+    VerificationRecorded recorded = 1;
+    VerificationNotRecorded not_recorded = 2;
+    VerificationPublicationUnconfirmed publication_unconfirmed = 3;
+  }
+}
+// Transient engine outcome and publisher acknowledgement retained for one job.
+// report_json is the original aggregate report, not another health authority.
+message VerificationResult {
+  uint32 schema_version = 1;
+  VerificationObservation observation = 2;
+  VerificationRecordingOutcome recording = 3;
+  optional string report_json = 4;
+}
+message VerificationProgress {
+  oneof step {
+    Progress progress = 1;
+    VerificationResult result = 2;
+  }
+}
+// Historical observation only: NOT current image health or publisher acknowledgement.
+// The clock sample is taken at recording start, not sync completion.
+message VerificationReceipt {
+  uint32 schema_version = 1;
+  string receipt_id = 2;
+  uint32 recorded_effective_uid = 3;
+  uint64 recorded_unix_seconds = 4;
+  VerificationObservation observation = 5;
+}
+message VerificationHistoryState {
+  VerificationHistoryAvailability availability = 1;
+}
+message VerificationHistoryItem {
+  oneof item {
+    VerificationHistoryState state = 1;
+    VerificationReceipt receipt = 2;
+  }
+}
+
 service LinuxReflect {
   // Version and mode; unauthenticated because it reveals nothing else.
   rpc GetVersion(Request) returns (Version);
@@ -320,6 +527,12 @@ service LinuxReflect {
 
   // disk.read
   rpc VerifyImage(VerifySpec) returns (stream Progress);
+  // disk.read, opt-in daemon-owned policy; never updates legacy catalog history.
+  rpc VerifyImageWithHistory(VerifySpec) returns (stream VerificationProgress);
+  // disk.read plus job owner/root; only results retained in this daemon process.
+  rpc GetVerificationResult(JobRef) returns (VerificationResult);
+  // backup.create administrator authorization; historical receipts are not per-caller.
+  rpc ListVerificationHistory(Request) returns (stream VerificationHistoryItem);
 
   // restore.prepare
   rpc PrepareRestore(RestoreSpec) returns (RestorePlanInfo);

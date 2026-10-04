@@ -14,6 +14,7 @@ use tokio::sync::broadcast;
 
 use crate::auth::{Action, PeerIdentity, SharedAuth};
 use crate::progress_bridge::Sink;
+use crate::verification::CapturedVerificationResult;
 
 /// Where a job is in its life.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -44,12 +45,21 @@ pub struct JobSnapshot {
     pub summary_json: Option<String>,
     /// Failure code and message, when the job failed.
     pub error: Option<(String, String)>,
+    /// Canonical captured result; never serialized as a second job summary.
+    #[serde(skip)]
+    pub(crate) verification: Option<Arc<CapturedVerificationResult>>,
 }
 
 impl JobSnapshot {
     /// Reconstruct the terminal event from the retained result.
     #[must_use]
     pub(crate) fn terminal_event(&self) -> Option<JobEvent> {
+        if let Some(result) = &self.verification {
+            return Some(JobEvent::VerificationCompleted {
+                job_id: self.job_id.clone(),
+                result: Arc::clone(result),
+            });
+        }
         match self.state {
             JobState::Finished => {
                 self.summary_json
@@ -111,6 +121,13 @@ pub enum JobEvent {
         /// Human-readable message.
         message: String,
     },
+    /// Captured verification completed; all terminal projections use this result.
+    VerificationCompleted {
+        /// Job identifier.
+        job_id: String,
+        /// Shared immutable observation and transient recording acknowledgement.
+        result: Arc<CapturedVerificationResult>,
+    },
 }
 
 impl JobEvent {
@@ -122,6 +139,7 @@ impl JobEvent {
             | Self::Phase { job_id, .. }
             | Self::Bytes { job_id, .. }
             | Self::Finished { job_id, .. }
+            | Self::VerificationCompleted { job_id, .. }
             | Self::Failed { job_id, .. } => job_id,
         }
     }
@@ -136,6 +154,7 @@ struct Entry {
     cancel: Arc<AtomicBool>,
     summary_json: Option<String>,
     error: Option<(String, String)>,
+    verification: Option<Arc<CapturedVerificationResult>>,
 }
 
 /// The registry plus the event bus.
@@ -293,6 +312,7 @@ impl Jobs {
                 cancel: Arc::clone(&cancel),
                 summary_json: None,
                 error: None,
+                verification: None,
             },
         );
         drop(entries);
@@ -311,6 +331,7 @@ impl Jobs {
         let entry = entries
             .get_mut(job_id)
             .ok_or_else(|| Error::unsupported(format!("no job {job_id}")))?;
+        entry.verification = None;
         match outcome {
             Ok(summary) => {
                 entry.state = JobState::Finished;
@@ -338,6 +359,28 @@ impl Jobs {
         Ok(snapshot)
     }
 
+    /// Publish and retain a captured result under the same entry lock (D-131).
+    pub(crate) fn finish_verification(
+        &self,
+        job_id: &str,
+        result: CapturedVerificationResult,
+    ) -> Result<JobSnapshot> {
+        let mut entries = self.lock();
+        let entry = entries
+            .get_mut(job_id)
+            .ok_or_else(|| Error::unsupported(format!("no job {job_id}")))?;
+        let (state, error) = result.job_outcome();
+        entry.state = state;
+        entry.error = error;
+        entry.summary_json = None;
+        entry.verification = Some(Arc::new(result));
+        let snapshot = snapshot_of(job_id, entry);
+        if let Some(event) = snapshot.terminal_event() {
+            self.publish(event);
+        }
+        Ok(snapshot)
+    }
+
     /// Report a job.
     ///
     /// # Errors
@@ -347,6 +390,21 @@ impl Jobs {
         let entry = entries
             .get(job_id)
             .ok_or_else(|| Error::unsupported(format!("no job {job_id}")))?;
+        Ok(snapshot_of(job_id, entry))
+    }
+
+    /// Read an owner-scoped snapshot without a check/use race on reused IDs.
+    pub(crate) fn snapshot_owned(&self, job_id: &str, uid: u32) -> Result<JobSnapshot> {
+        let entries = self.lock();
+        let entry = entries
+            .get(job_id)
+            .ok_or_else(|| Error::unsupported(format!("no job {job_id}")))?;
+        if uid != 0 && uid != entry.owner {
+            return Err(Error::denied(
+                Action::DiskRead.id(),
+                "verification result belongs to another user",
+            ));
+        }
         Ok(snapshot_of(job_id, entry))
     }
 
@@ -401,6 +459,7 @@ fn snapshot_of(job_id: &str, entry: &Entry) -> JobSnapshot {
         state: entry.state,
         summary_json: entry.summary_json.clone(),
         error: entry.error.clone(),
+        verification: entry.verification.as_ref().map(Arc::clone),
     }
 }
 

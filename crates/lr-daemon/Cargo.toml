@@ -30,6 +30,7 @@ nix.workspace = true
 enumflags2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+prost.workspace = true
 
 [[bin]]
 name = "linuxreflect-daemon"
@@ -41,4 +42,3 @@ workspace = true
 [dev-dependencies]
 lr-testkit.workspace = true
 tempfile.workspace = true
-
