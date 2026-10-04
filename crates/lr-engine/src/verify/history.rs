@@ -94,6 +94,19 @@ impl VerificationHistoryOptions {
         self.max_total_ledger_bytes
     }
 
+    /// Validate the existing local directory without creating or locking a ledger.
+    ///
+    /// Operations still pin and validate the directory again when they run.
+    ///
+    /// # Errors
+    /// Returns an error for invalid limits, untrusted ancestry or unsupported storage.
+    pub fn preflight_directory(&self) -> Result<()> {
+        self.validate().map_err(HistoryError::into_core)?;
+        let _directory =
+            PinnedHistory::open(&self.history_directory).map_err(HistoryError::into_core)?;
+        Ok(())
+    }
+
     fn validate(&self) -> std::result::Result<(), HistoryError> {
         if !self.history_directory.is_absolute()
             || self.max_receipt_bytes == 0
@@ -721,6 +734,20 @@ struct PinnedHistory {
     directory: File,
 }
 
+/// Own the critical section, not just the lock descriptor. Closing the parent's
+/// descriptor alone can leave a fork-inherited open description holding flock.
+struct HistoryLock {
+    file: File,
+}
+
+impl Drop for HistoryLock {
+    fn drop(&mut self) {
+        if self.file.unlock().is_err() {
+            tracing::warn!("cannot explicitly release verification history lock");
+        }
+    }
+}
+
 impl PinnedHistory {
     fn open(path: &Path) -> std::result::Result<Self, HistoryError> {
         if !path.is_absolute() {
@@ -787,7 +814,7 @@ impl PinnedHistory {
         lr_unsafe::beneath::entry_path(&self.directory, OsStr::new(name))
     }
 
-    fn lock(&self, create: bool) -> std::result::Result<File, HistoryError> {
+    fn lock(&self, create: bool) -> std::result::Result<HistoryLock, HistoryError> {
         let path = self.entry_path(LOCK_NAME).map_err(HistoryError::Io)?;
         let mut options = OpenOptions::new();
         options
@@ -805,7 +832,7 @@ impl PinnedHistory {
             Err(std::fs::TryLockError::WouldBlock) => return Err(HistoryError::Busy),
             Err(std::fs::TryLockError::Error(error)) => return Err(HistoryError::Io(error)),
         }
-        Ok(file)
+        Ok(HistoryLock { file })
     }
 
     fn sync(&self) -> io::Result<()> {
@@ -1731,6 +1758,38 @@ mod tests {
                 .receipts()
                 .len(),
             1
+        );
+
+        // A child may inherit an open description across fork before exec
+        // closes its CLOEXEC descriptor. Model that inheritance via stdin,
+        // without unsafe/fork test code, and retain it long enough to observe.
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let directory = super::PinnedHistory::open(history_dir.path()).expect("pin fixture");
+        let lock = directory
+            .lock(false)
+            .expect("lock before inherited description");
+        let mut child = ChildGuard(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .stdin(std::process::Stdio::from(
+                    lock.file.try_clone().expect("inherited description"),
+                ))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("own inherited-description child"),
+        );
+        assert!(child.0.try_wait().expect("child status").is_none());
+        drop(lock);
+        assert!(
+            directory.lock(false).is_ok(),
+            "ending the parent critical section must release even while a child holds its description"
         );
     }
 
