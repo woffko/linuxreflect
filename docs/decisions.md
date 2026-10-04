@@ -1802,3 +1802,42 @@ admission, so late replies cannot finish a newer job.
 
 Results remain in memory for the daemon process's lifetime only. This does not
 persist jobs across daemon restart or implement durable verification history.
+
+## D-132 — Bound verification observes private captured bytes
+
+Content-bound verification history is opt-in and host-local. Its first boundary
+is an engine-produced attempt, not a timestamp inferred from a later pathname
+read. Ordinary verification remains available and existing callers are unchanged.
+
+The explicit captured-verification path resolves the selected ancestry, copies
+and hashes its raw bytes with a fixed buffer into private unnamed scratch, closes
+all writable handles, and verifies only read-only captured readers. Each reader
+has an independent logical position. Captured headers must agree with the
+selected identities and form a valid ancestry. The observation names those
+bytes, requested recovery scope, completed checks and bounded outcome; it cannot
+claim that mutable originals were a storage snapshot or still match afterward.
+
+Raw digests use the versioned `blake3-raw-v1` algorithm and coverage has its own
+contract version. Per-member identity records the writer's consistency, not a
+new capture-time guarantee. Stage facts come from typed verifier control flow,
+not progress messages. Bounded legacy metadata-nonce notices accompany those
+facts; warning strings and locators stay in the diagnostic report.
+
+Scratch is caller-configured sensitive storage, with an explicit raw-byte cap
+and free-space reserve rather than an implicit 8 GiB limit. Untrusted directories,
+capacity exhaustion, cancellation and incomplete capture cannot produce complete
+success. File-mode coverage means the references of the checked trees, not every
+unreferenced stored chunk. Recorded bad source sectors can pass integrity checks
+but remain incomplete recovery.
+
+The free-space check is preflight, not an atomic reservation against other jobs.
+Anonymity is checked before sensitive writes; unlink failure cannot leave copied
+backup bytes in a named temporary file. Anonymous scratch is not a durable receipt.
+
+This engine boundary does not yet publish receipts or enable a CLI/daemon/GUI
+history feature. The later private ledger must consume the observation without
+reopening image names, keep daemon/user authorities separate, and distinguish
+verification outcome from confirmed recording. No legacy dates are backfilled
+into bound observations. Fresh retention verification (D-125), restore checks
+(D-127), the conservative legacy extra-chain keep rule and the image format are
+unchanged.

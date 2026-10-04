@@ -102,8 +102,9 @@ These are warm/cached virtual-storage attempts, not cold-NAS throughput or
 physical power-loss evidence. The named-copy proxy includes per-file/directory
 capture sync and the CLI's advisory catalog updates; disposable unnamed scratch
 need not require the former. Capture timings exclude independent byte-equality
-validation, performed after verification. The complete verifier has no public
-captured-reader entry point, so this does not validate the future read-only
+validation, performed after verification. At this experiment's baseline the
+verifier had no public captured-reader entry point, so it did not validate the
+then-future read-only
 handle API, other image modes or receipt publication.
 
 Suggested opt-in limits are 8 GiB raw capture with allocation headroom, a fixed
@@ -111,6 +112,47 @@ Suggested opt-in limits are 8 GiB raw capture with allocation headroom, a fixed
 not selected runtime defaults. Preserve existing scale budgets; remeasure the
 integrated path before enabling history. See the design ownership discussion in
 [redesign-ideas.md](redesign-ideas.md#verification-history-review-direction-2026-10-03).
+
+## Captured-verification API, 2026-10-04
+
+The integrated engine boundary (D-132) was measured on the same retained
+File-mode fixtures and local/NFS backends. Both ordinary and captured calls use
+one pinned release probe linked against the focused release tests' dependency
+graph. Three alternating paired repeats per workload/backend passed (18 pairs).
+Reports matched exactly; ordered observation identities, raw lengths, typed
+coverage and complete stages matched the fixtures. Original SHA-256 inventories
+were unchanged before/after, every capture descriptor was read-only at the
+structure-phase sample, and no named scratch entries remained.
+
+| Workload | Source | Ordinary API (s) | Captured API (s) | Ratio | Allocated scratch (MiB) | Ordinary / captured peak RSS (MiB) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 GiB + 128 MiB delta | Local ext4 | 0.97 | 1.96 | 2.02× | 1154.0 | 8.7 / 8.8 |
+| 1 GiB + 128 MiB delta | NFSv4.2 | 0.99 | 1.97 | 1.99× | 1154.0 | 8.6 / 8.7 |
+| 200 members / 2,000 files | Local ext4 | 2.29 | 2.60 | 1.14× | 70.0 | 7.0 / 7.4 |
+| 200 members / 2,000 files | NFSv4.2 | 2.45 | 2.62 | 1.07× | 70.0 | 7.1 / 7.3 |
+| 100,000 files / 8 × 400 B xattrs | Local ext4 | 1.20 | 1.54 | 1.29× | 334.9 | 745.0 / 746.8 |
+| 100,000 files / 8 × 400 B xattrs | NFSv4.2 | 1.23 | 1.51 | 1.23× | 334.9 | 745.2 / 745.8 |
+
+Times are engine-call medians; RSS and sampled file allocation are maxima.
+RSS covers the single capture-and-verify process, excludes page cache, and retains
+the small Rust launcher's pre-exec floor. The 64 KiB copy buffer does not remove
+the verifier's roughly 750 MiB xattr-metadata cost. Scratch allocation follows
+raw ancestry, including per-file allocation rounding, not logical plaintext size.
+
+These warm virtual-storage results exclude catalog recording, receipt publication
+and disposable-scratch sync. They are not directly equivalent to the earlier
+named-copy CLI proxy and do not establish cold-NAS throughput or physical durability.
+Resource comparisons alone do not prove read binding: the same-build focused NFS
+regression separately mutates its disposable source after capture, proves that
+ordinary verification then fails, and confirms captured verification still passes.
+Actual Stream and stored-payload whole-disk fixtures also pass that focused suite;
+no OS-level restore or interruption scenario is claimed by these measurements.
+
+The experiment explicitly used an 8 GiB raw cap and 10 GiB preflight headroom,
+not engine defaults or an atomic space reservation. No permanent scale thresholds
+changed. Evidence is retained outside Git in
+`_handoff/artifacts/verification-observation-20261004/` under the project root
+(`api-summary.json`, `api-evidence.tar.gz`, build provenance and `nfs-tests.log`).
 
 ## Rules of thumb
 

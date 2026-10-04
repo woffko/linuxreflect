@@ -35,9 +35,9 @@ deployment:
   only for the daemon process's lifetime, addressing idea 5 below.
 
 Durable content-bound verification history and SFTP stale-writer fencing remain
-separate work. The history design compares fresh-only checks, a host-local
-receipt ledger and portable per-set receipts. No store is implemented or selected;
-the captured-byte approach needs an approved ancestry-sized scratch/I/O budget.
+separate work. D-132 selects opt-in host-local history and implements its engine
+boundary first; no receipt store or history-facing consumer is enabled yet.
+Captured verification requires caller-selected ancestry-sized scratch limits.
 All choices retain D-125's fresh deletion gate. Historical maintainer acceptance
 results below are not evidence that the current tree passed privileged tests
 on this user's machine.
@@ -208,7 +208,8 @@ qualifying recovery chain.
 ### Verification-history review direction, 2026-10-03
 
 The recommended first store is a private host-local receipt ledger, independent
-of the catalog. This remains a proposal, not an implemented or selected policy.
+of the catalog. D-132 subsequently selected this direction; persistence remains
+unimplemented and no history policy is enabled by default.
 One engine-owned observation must carry the actual checked-byte identities,
 ordered ancestry, per-member/mode coverage and outcome into recording; a recorder
 must not resolve filenames again. Reports, job summaries, indexes and UI history
@@ -224,8 +225,31 @@ The rigorous capture route needs private scratch proportional to the selected
 raw ancestry, not just a fixed RAM buffer. Resource measurements must compare
 the same verification scope and distinguish capture RSS, verifier metadata,
 allocated scratch and logical versus physical I/O before default enablement.
-The complete verifier currently has no public captured-reader entry point; a
-named-copy CLI experiment is a cost proxy, not production read-binding validation.
+At that review's baseline the verifier had no public captured-reader entry point;
+the named-copy CLI experiment was a cost proxy, not production read-binding proof.
+
+### Captured-verification engine boundary, 2026-10-04
+
+`verify_image_captured` now returns one immutable attempt: the aggregate report
+is retained once, alongside bounded per-member facts and a non-serialized
+diagnostic. The verifier reads only private anonymous, read-only captured files
+through independent positional cursors. Raw BLAKE3 digests, logical identities,
+writer consistency, typed stages/notices and mode-specific coverage travel
+together; no recorder may reconstruct them from later pathname reads.
+
+Critical regressions cover resource refusal, cancellation, corrupt content and
+structure, unavailable keys, scratch pinning, independent cursors, recorded-loss
+classification and actual Block/File/Stream/whole-disk flows. In the isolated NFS
+lab, a same-size source mutation leaves captured verification successful while
+ordinary verification of the changed source fails. All eight focused tests and
+the full CI gate passed; unchanged privileged interruption suites were not rerun.
+
+The actual release API passed 18 paired local/NFS resource comparisons on retained
+fixtures, with equal reports and unchanged original hashes. See
+[performance.md](performance.md#captured-verification-api-2026-10-04) for costs
+and limits. Receipt publication, bounded loading/indexing and CLI/daemon/GUI
+history projections remain the next batches. Current callers, fresh restore and
+retention verification, image format and conservative legacy retention are unchanged.
 
 ## Remediation-plan follow-up
 

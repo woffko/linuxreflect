@@ -22,6 +22,17 @@ use lr_store::{Destination, DestinationOptions, SetHandle, uri};
 
 use crate::keys::{self, Encryption};
 
+mod capture;
+mod observation;
+
+pub use capture::CaptureOptions;
+use observation::VerificationRecorder;
+pub use observation::{
+    AttemptOutcome, AttemptStage, ContentCoverage, DigestAlgorithm, FailureKind,
+    MemberContentStages, MemberIdentity, MemberObservation, MemberStage, RecoveryScope,
+    StructureNotice, VerificationAttempt, VerificationObservation,
+};
+
 /// Largest plaintext a stream chunk can hold (CDC's maximum).
 const MAX_STREAM_CHUNK: usize = 256 * 1024;
 
@@ -125,6 +136,54 @@ pub fn verify_image(request: &VerifyRequest) -> Result<VerifyReport> {
     verify_in_set(&*destination, &set, &location.name, request)
 }
 
+/// Verify one selected recovery point against a private, content-bound capture.
+///
+/// This opt-in entry point copies the resolved ancestry into anonymous scratch
+/// files before invoking the same engine verifier used by [`verify_image`].
+/// The supplied cap and headroom are mandatory, and the source destination is
+/// never used as a verifier fallback after capture. The returned observation
+/// describes only the integrity checks requested; it is not a restore,
+/// retention, durability, source-consistency, or current-health decision.
+///
+/// Capture and verification failures are returned as an incomplete attempt;
+/// their diagnostic error is available separately and is not serialized in
+/// the observation.
+pub fn verify_image_captured(
+    request: &VerifyRequest,
+    options: &CaptureOptions,
+) -> VerificationAttempt {
+    let scope = if request.chain {
+        RecoveryScope::EveryMember
+    } else {
+        RecoveryScope::SelectedRecoveryPoint
+    };
+    let mut observation = VerificationObservation::new(scope);
+    let captured = match capture::capture_chain(request, options, &mut observation) {
+        Ok(captured) => captured,
+        Err(failure) => {
+            return VerificationAttempt::incomplete(
+                observation,
+                failure.stage,
+                failure.reason,
+                failure.error,
+            );
+        }
+    };
+    let (destination, set, members, name) = captured.into_verify_parts();
+    let mut recorder = VerificationRecorder::new(observation);
+    match verify_members_in_set_recorded(
+        &destination,
+        &set,
+        &name,
+        &members,
+        request,
+        &mut recorder,
+    ) {
+        Ok(report) => recorder.finish(report),
+        Err(error) => recorder.fail(error),
+    }
+}
+
 /// Record a successful whole-chain verification in the set's catalog, so
 /// the UI can show historical verification (R20). Retention still performs
 /// fresh verification before deletion; this timestamp is not deletion authority.
@@ -217,6 +276,28 @@ pub(crate) fn verify_members_in_set(
     members: &[crate::chain::ChainMemberFile],
     request: &VerifyRequest,
 ) -> Result<VerifyReport> {
+    verify_members_in_set_inner(destination, set, name, members, request, None)
+}
+
+fn verify_members_in_set_recorded(
+    destination: &dyn Destination,
+    set: &SetHandle,
+    name: &str,
+    members: &[crate::chain::ChainMemberFile],
+    request: &VerifyRequest,
+    recorder: &mut VerificationRecorder,
+) -> Result<VerifyReport> {
+    verify_members_in_set_inner(destination, set, name, members, request, Some(recorder))
+}
+
+fn verify_members_in_set_inner(
+    destination: &dyn Destination,
+    set: &SetHandle,
+    name: &str,
+    members: &[crate::chain::ChainMemberFile],
+    request: &VerifyRequest,
+    mut recorder: Option<&mut VerificationRecorder>,
+) -> Result<VerifyReport> {
     if members.last().map(|member| member.file_name.as_str()) != Some(name) {
         return Err(Error::corrupt(format!(
             "{name} is not the last member of the selected chain"
@@ -240,25 +321,49 @@ pub(crate) fn verify_members_in_set(
     };
 
     // 1. Structure, MACs and page tags, member by member.
-    for member in members {
-        request.context.check_cancel()?;
-        let superblock = crate::chain::read_superblock(destination, set, &member.file_name)?;
-        let keys = keys::unlock_image(&request.encryption, &superblock)?;
-        let encrypted = superblock.is_encrypted();
-        let page_report = verify_structure(
-            destination.open_ro(set, &member.file_name)?,
-            *keys.meta_key,
-            encrypted,
-        )
-        .map_err(|error| {
-            Error::corrupt(format!(
-                "{}: structure of {} failed: {error}",
-                member.file_name, superblock.image_uuid
-            ))
-        })?;
+    for (member_index, member) in members.iter().enumerate() {
+        if let Some(recorder) = recorder.as_deref_mut() {
+            recorder.begin_structure(member_index);
+        }
+        let structure = (|| {
+            request.context.check_cancel()?;
+            let superblock = crate::chain::read_superblock(destination, set, &member.file_name)?;
+            let keys = keys::unlock_image(&request.encryption, &superblock)?;
+            let encrypted = superblock.is_encrypted();
+            let page_report = verify_structure(
+                destination.open_ro(set, &member.file_name)?,
+                *keys.meta_key,
+                encrypted,
+            )
+            .map_err(|error| {
+                Error::corrupt(format!(
+                    "{}: structure of {} failed: {error}",
+                    member.file_name, superblock.image_uuid
+                ))
+            })?;
+            Ok((page_report, encrypted))
+        })();
+        let (page_report, encrypted) = match structure {
+            Ok(value) => value,
+            Err(error) => {
+                if let Some(recorder) = recorder.as_deref_mut() {
+                    recorder.fail_structure(member_index);
+                }
+                return Err(error);
+            }
+        };
+        if let Some(recorder) = recorder.as_deref_mut() {
+            recorder.complete_structure(member_index);
+        }
         report.pages += page_report.total_pages() as u64;
         report.members += 1;
         if encrypted && page_report.repeated_page_nonces {
+            if let Some(recorder) = recorder.as_deref_mut() {
+                recorder.note_structure(
+                    member_index,
+                    StructureNotice::RepeatedEncryptedMetadataPageNonce,
+                );
+            }
             report
                 .warnings
                 .push(legacy_nonce_warning(&member.file_name));
@@ -267,27 +372,50 @@ pub(crate) fn verify_members_in_set(
 
     // 2. Content: every stored chunk's plaintext must hash to the manifest.
     reporter.phase("content");
+    if let Some(recorder) = recorder.as_deref_mut() {
+        recorder.enter_content_phase();
+    }
     request.context.check_cancel()?;
     match target.image_kind {
         ImageKind::Block if target.is_whole_disk() => {
+            let target_index = members.len() - 1;
+            if let Some(recorder) = recorder.as_deref_mut() {
+                recorder.begin_content(
+                    content_coverage(target.image_kind, true, every_member),
+                    members.len(),
+                );
+            }
             verify_whole_disk(
                 destination,
                 set,
                 name,
                 &request.encryption,
-                &mut reporter,
-                &mut report,
+                VerificationProgress {
+                    reporter: &mut reporter,
+                    report: &mut report,
+                    recorder,
+                },
+                target_index,
             )?;
         }
         ImageKind::Block => {
+            if let Some(recorder) = recorder.as_deref_mut() {
+                recorder.begin_content(
+                    content_coverage(target.image_kind, false, every_member),
+                    members.len(),
+                );
+            }
             verify_block_chain(
                 destination,
                 set,
                 members,
                 &request.encryption,
                 every_member,
-                &mut reporter,
-                &mut report,
+                VerificationProgress {
+                    reporter: &mut reporter,
+                    report: &mut report,
+                    recorder,
+                },
             )?;
         }
         ImageKind::Stream => {
@@ -298,24 +426,43 @@ pub(crate) fn verify_members_in_set(
             } else {
                 &members[members.len() - 1..]
             };
+            if let Some(recorder) = recorder.as_deref_mut() {
+                recorder.begin_content(
+                    content_coverage(target.image_kind, false, every_member),
+                    members.len(),
+                );
+            }
             verify_stream(
                 destination,
                 set,
                 own,
+                if every_member { 0 } else { members.len() - 1 },
                 &request.encryption,
-                &mut reporter,
-                &mut report,
+                VerificationProgress {
+                    reporter: &mut reporter,
+                    report: &mut report,
+                    recorder,
+                },
             )?;
         }
         ImageKind::File => {
+            if let Some(recorder) = recorder.as_deref_mut() {
+                recorder.begin_content(
+                    content_coverage(target.image_kind, false, every_member),
+                    members.len(),
+                );
+            }
             verify_file(
                 destination,
                 set,
                 members,
                 &request.encryption,
                 every_member,
-                &mut reporter,
-                &mut report,
+                VerificationProgress {
+                    reporter: &mut reporter,
+                    report: &mut report,
+                    recorder,
+                },
             )?;
         }
     }
@@ -325,6 +472,42 @@ pub(crate) fn verify_members_in_set(
     Ok(report)
 }
 
+fn content_coverage(
+    image_kind: ImageKind,
+    whole_disk: bool,
+    every_member: bool,
+) -> ContentCoverage {
+    if whole_disk {
+        ContentCoverage::WholeDiskRegionsAndLayout
+    } else {
+        match (image_kind, every_member) {
+            (ImageKind::Block, false) => ContentCoverage::BlockSelectedMergedReferences,
+            (ImageKind::Block, true) => ContentCoverage::BlockEveryStoredPayload,
+            (ImageKind::File, false) => ContentCoverage::FileSelectedTreeReferences,
+            (ImageKind::File, true) => ContentCoverage::FileEveryTreeReferences,
+            (ImageKind::Stream, false) => {
+                ContentCoverage::StreamSelectedMemberPayloadsSectionsAndLayout
+            }
+            (ImageKind::Stream, true) => {
+                ContentCoverage::StreamEveryMemberPayloadsSectionsAndLayout
+            }
+        }
+    }
+}
+
+/// The shared mutable output for a mode-specific verifier branch.
+struct VerificationProgress<'a> {
+    reporter: &'a mut crate::progress::Reporter,
+    report: &'a mut VerifyReport,
+    recorder: Option<&'a mut VerificationRecorder>,
+}
+
+impl VerificationProgress<'_> {
+    fn recorder(&mut self) -> Option<&mut VerificationRecorder> {
+        self.recorder.as_deref_mut()
+    }
+}
+
 /// Re-hash every chunk of a block chain, using the merged state walker.
 fn verify_block_chain(
     destination: &dyn Destination,
@@ -332,16 +515,19 @@ fn verify_block_chain(
     members: &[crate::chain::ChainMemberFile],
     encryption: &Encryption,
     every_member: bool,
-    reporter: &mut crate::progress::Reporter,
-    report: &mut VerifyReport,
+    mut progress: VerificationProgress<'_>,
 ) -> Result<()> {
+    let target_index = members.len() - 1;
+    if let Some(recorder) = progress.recorder() {
+        recorder.begin_recovery_point(target_index);
+    }
     let opened = crate::chain::open_chain(destination, set, members, encryption)?;
     let mut walk = crate::chain::ChainWalk::new(opened)?;
     let mut bad = 0u64;
     let mut first_bad = None;
     let chunk_size = u64::from(walk.chunk_size());
     walk.walk(|index, state, access| {
-        reporter.report(index)?;
+        progress.reporter.report(index)?;
         if state == ChunkState::BadSector {
             bad += 1;
             first_bad.get_or_insert(index * chunk_size);
@@ -355,6 +541,10 @@ fn verify_block_chain(
         else {
             return Ok(());
         };
+        let owner_index = usize::from(member);
+        if let Some(recorder) = progress.recorder() {
+            recorder.begin_referenced_payload(owner_index);
+        }
         let member_name = members
             .get(usize::from(member))
             .map_or("?", |file| file.file_name.as_str());
@@ -364,23 +554,32 @@ fn verify_block_chain(
                  stored bytes) failed: {error}"
             ))
         })?;
-        report.chunks += 1;
-        report.bytes_checked += plaintext.len() as u64;
+        progress.report.chunks += 1;
+        progress.report.bytes_checked += plaintext.len() as u64;
         Ok(())
     })?;
+    if let Some(recorder) = progress.recorder() {
+        recorder.complete_referenced_payloads();
+        recorder.complete_recovery_point(target_index);
+    }
     // Recorded bad sectors are not corruption, but the image cannot be
     // restored completely, and `prepare` refuses it (R26).
-    report.recorded_bad_chunks += bad;
+    progress.report.recorded_bad_chunks += bad;
     if bad > 0 {
-        report
+        progress
+            .report
             .warnings
             .push(crate::plan::bad_sector_message(bad, first_bad));
     }
     if !every_member {
         return Ok(());
     }
+    if let Some(recorder) = progress.recorder() {
+        recorder.begin_all_stored_payloads();
+    }
     // Every payload every member stores, superseded ones included (R22).
     walk.walk_own_payloads(|index, state, access| {
+        progress.reporter.report(progress.report.chunks)?;
         let ChunkState::Stored {
             member,
             offset,
@@ -399,13 +598,16 @@ fn verify_block_chain(
                  bytes) failed: {error}"
             ))
         })?;
-        report.chunks += 1;
-        report.bytes_checked += plaintext.len() as u64;
+        progress.report.chunks += 1;
+        progress.report.bytes_checked += plaintext.len() as u64;
         Ok(())
-    })
+    })?;
+    if let Some(recorder) = progress.recorder() {
+        recorder.complete_all_stored_payloads();
+    }
+    Ok(())
 }
 
-/// Re-hash every chunk of every subvolume section of a stream image.
 /// Verify a file-mode chain: every reference resolves, every stored chunk
 /// hashes to its manifest value, and the names are reported when one fails.
 fn verify_file(
@@ -414,8 +616,7 @@ fn verify_file(
     members: &[crate::chain::ChainMemberFile],
     encryption: &Encryption,
     every_member: bool,
-    reporter: &mut crate::progress::Reporter,
-    report: &mut VerifyReport,
+    mut progress: VerificationProgress<'_>,
 ) -> Result<()> {
     let mut opened = crate::chain::open_chain(destination, set, members, encryption)?;
 
@@ -450,12 +651,15 @@ fn verify_file(
         vec![last]
     };
     for position in trees {
+        if let Some(recorder) = progress.recorder() {
+            recorder.begin_recovery_point(position);
+        }
         let (file_name, records) = {
             let member = &mut opened[position];
             let bytes = member.stream_bytes(StreamId::Manifest)?;
             (member.file_name.clone(), lr_format::read_manifest(&bytes)?)
         };
-        reporter.phase(&format!("member {file_name}"));
+        progress.reporter.phase(&format!("member {file_name}"));
         // The tree a restore of this recovery point would build (R25).
         // Borrow the records: cloning this view would duplicate every xattr,
         // ACL and chunk reference during restore's preverification pass.
@@ -476,6 +680,9 @@ fn verify_file(
                         String::from_utf8_lossy(&record.entry.path)
                     )));
                 };
+                if let Some(recorder) = progress.recorder() {
+                    recorder.begin_referenced_payload(*owner);
+                }
                 let holder = &mut opened[*owner];
                 let entry = BlockEntry::stored(
                     u16::try_from(*owner).unwrap_or(u16::MAX),
@@ -503,9 +710,9 @@ fn verify_file(
                 )
                 .map_err(|error| Error::corrupt(format!("{file_name}: {error}")))?;
                 position_in_file += plaintext.len() as u64;
-                reporter.report(report.bytes_checked)?;
-                report.chunks += 1;
-                report.bytes_checked += plaintext.len() as u64;
+                progress.reporter.report(progress.report.bytes_checked)?;
+                progress.report.chunks += 1;
+                progress.report.bytes_checked += plaintext.len() as u64;
             }
             if record.entry.file_kind == lr_format::FILE_KIND_REGULAR
                 && position_in_file != record.entry.size
@@ -517,21 +724,35 @@ fn verify_file(
                 )));
             }
         }
+        if let Some(recorder) = progress.recorder() {
+            recorder.complete_recovery_point(position);
+        }
+    }
+    if let Some(recorder) = progress.recorder() {
+        recorder.complete_referenced_payloads();
     }
     tracing::debug!(files = restored_files, "file manifest verified");
     Ok(())
 }
 
+/// Re-hash every chunk of every subvolume section of a stream image.
 fn verify_stream(
     destination: &dyn Destination,
     set: &SetHandle,
     members: &[crate::chain::ChainMemberFile],
+    member_offset: usize,
     encryption: &Encryption,
-    reporter: &mut crate::progress::Reporter,
-    report: &mut VerifyReport,
+    mut progress: VerificationProgress<'_>,
 ) -> Result<()> {
-    for member in members {
-        reporter.phase(&format!("member {}", member.file_name));
+    for (member_index, member) in members.iter().enumerate() {
+        let member_index = member_offset + member_index;
+        if let Some(recorder) = progress.recorder() {
+            recorder.begin_recovery_point(member_index);
+            recorder.begin_member_stored_payloads(member_index);
+        }
+        progress
+            .reporter
+            .phase(&format!("member {}", member.file_name));
         let mut reader = ImageReader::open(destination.open_ro(set, &member.file_name)?)?;
         let keys = keys::unlock_image(encryption, reader.superblock())?;
         let superblock = reader.superblock().clone();
@@ -574,9 +795,9 @@ fn verify_stream(
                         member.file_name, section.subvol_path, entry.offset
                     ))
                 })?;
-                reporter.report(report.chunks)?;
-                report.chunks += 1;
-                report.bytes_checked += plaintext.len() as u64;
+                progress.reporter.report(progress.report.chunks)?;
+                progress.report.chunks += 1;
+                progress.report.bytes_checked += plaintext.len() as u64;
             }
         }
         // What a restore needs, the section list and the Btrfs layout
@@ -584,6 +805,10 @@ fn verify_stream(
         // time (R25).
         crate::stream::read_stream_image(destination, set, &member.file_name, encryption)
             .map_err(|error| Error::corrupt(format!("{}: {error}", member.file_name)))?;
+        if let Some(recorder) = progress.recorder() {
+            recorder.complete_recovery_point(member_index);
+            recorder.complete_member_stored_payloads(member_index);
+        }
     }
     Ok(())
 }
@@ -594,21 +819,31 @@ fn verify_whole_disk(
     set: &SetHandle,
     name: &str,
     encryption: &Encryption,
-    reporter: &mut crate::progress::Reporter,
-    report: &mut VerifyReport,
+    mut progress: VerificationProgress<'_>,
+    member_index: usize,
 ) -> Result<()> {
+    if let Some(recorder) = progress.recorder() {
+        recorder.begin_recovery_point(member_index);
+    }
     let mut reader = ImageReader::open(destination.open_ro(set, name)?)?;
     let keys = keys::unlock_image(encryption, reader.superblock())?;
     let superblock: Superblock = reader.superblock().clone();
     // The restore plan's checks: counts, kinds, bounds, geometry and complete
     // consumption (R24), and recorded bad sectors (R26).
     let summary = crate::plan::whole_disk(&mut reader, &keys.meta_key, &superblock)?;
-    report.recorded_bad_chunks += summary.bad;
+    if let Some(recorder) = progress.recorder() {
+        recorder.complete_recovery_point(member_index);
+        recorder.begin_disk_region_payloads(member_index);
+    }
+    progress.report.recorded_bad_chunks += summary.bad;
     if summary.bad > 0 {
-        report.warnings.push(crate::plan::bad_sector_message(
-            summary.bad,
-            summary.first_bad,
-        ));
+        progress
+            .report
+            .warnings
+            .push(crate::plan::bad_sector_message(
+                summary.bad,
+                summary.first_bad,
+            ));
     }
     let kind = superblock.aead_kind()?;
     let chunk_size = u64::from(superblock.chunk_size);
@@ -627,7 +862,7 @@ fn verify_whole_disk(
         }
         let (header, _delta) = BlockManifestHeader::read(&mut wire)?;
         for index in 0..header.entry_count {
-            reporter.report(report.bytes_checked)?;
+            progress.reporter.report(progress.report.bytes_checked)?;
             let entry = BlockEntry::read(&mut wire)?;
             if !entry.is_stored() {
                 continue;
@@ -648,9 +883,12 @@ fn verify_whole_disk(
                     region.index, entry.offset
                 ))
             })?;
-            report.chunks += 1;
-            report.bytes_checked += plaintext.len() as u64;
+            progress.report.chunks += 1;
+            progress.report.bytes_checked += plaintext.len() as u64;
         }
+    }
+    if let Some(recorder) = progress.recorder() {
+        recorder.complete_disk_region_payloads(member_index);
     }
     Ok(())
 }
@@ -685,4 +923,70 @@ pub fn chain_names(image: &str, options: &DestinationOptions) -> Result<Vec<Stri
 #[must_use]
 pub fn member_label(dest: &str, set: &str, name: &str) -> PathBuf {
     PathBuf::from(format!("{dest}/{set}/{name}"))
+}
+
+#[cfg(test)]
+mod captured_coverage_tests {
+    use super::{ContentCoverage, content_coverage};
+    use lr_core::ImageKind;
+
+    #[test]
+    fn coverage_labels_follow_the_actual_mode_and_requested_scope() {
+        let cases = [
+            (
+                ImageKind::Block,
+                false,
+                false,
+                ContentCoverage::BlockSelectedMergedReferences,
+            ),
+            (
+                ImageKind::Block,
+                false,
+                true,
+                ContentCoverage::BlockEveryStoredPayload,
+            ),
+            (
+                ImageKind::File,
+                false,
+                false,
+                ContentCoverage::FileSelectedTreeReferences,
+            ),
+            (
+                ImageKind::File,
+                false,
+                true,
+                ContentCoverage::FileEveryTreeReferences,
+            ),
+            (
+                ImageKind::Stream,
+                false,
+                false,
+                ContentCoverage::StreamSelectedMemberPayloadsSectionsAndLayout,
+            ),
+            (
+                ImageKind::Stream,
+                false,
+                true,
+                ContentCoverage::StreamEveryMemberPayloadsSectionsAndLayout,
+            ),
+            (
+                ImageKind::Block,
+                true,
+                false,
+                ContentCoverage::WholeDiskRegionsAndLayout,
+            ),
+            (
+                ImageKind::Block,
+                true,
+                true,
+                ContentCoverage::WholeDiskRegionsAndLayout,
+            ),
+        ];
+        for (image_kind, whole_disk, every_member, expected) in cases {
+            assert_eq!(
+                content_coverage(image_kind, whole_disk, every_member),
+                expected
+            );
+        }
+    }
 }

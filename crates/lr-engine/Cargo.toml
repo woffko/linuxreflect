@@ -9,6 +9,7 @@ license.workspace = true
 
 [dependencies]
 fastcdc.workspace = true
+blake3.workspace = true
 libc.workspace = true
 lr-core.workspace = true
 lr-unsafe.workspace = true
