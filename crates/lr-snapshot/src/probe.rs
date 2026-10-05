@@ -20,6 +20,15 @@ pub const PROVIDER_FREEZE: &str = "freeze";
 /// Provider identifier for the live, inconsistent reader.
 pub const PROVIDER_LIVE_NONE: &str = "live-none";
 
+/// Normalize the documented `none` spelling to the provider's stable ID.
+fn provider_id(name: &str) -> &str {
+    if name == "none" {
+        PROVIDER_LIVE_NONE
+    } else {
+        name
+    }
+}
+
 /// What a source will be imaged with.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Plan {
@@ -58,7 +67,11 @@ pub struct Decision {
 /// consistent image and `--allow-inconsistent` was not given.
 pub fn decide(layout: &SourceLayout, opts: &SnapshotOpts) -> Result<Decision> {
     let mut warnings = Vec::new();
-    let forced = opts.provider.as_deref().filter(|name| *name != "auto");
+    let forced = opts
+        .provider
+        .as_deref()
+        .filter(|name| *name != "auto")
+        .map(provider_id);
 
     let btrfs = layout
         .fs

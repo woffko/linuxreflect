@@ -1,7 +1,7 @@
 //! LinuxReflect's Slint GUI (spec §K S15).
 //!
 //! The GUI is a daemon client: the disk map comes from `ListDisks`, the backup
-//! wizard shows `ProbeSource`'s plan (including the consistency level) before
+//! wizard shows `PlanBackup`'s plan for the complete selected request before
 //! starting, the restore wizard shows `PrepareRestore`'s plan and token, and
 //! progress and history come from the job streams. No device is ever opened
 //! here (spec §B).
@@ -10,6 +10,7 @@
 //! for is the footer of the window (see D-090).
 
 mod actions;
+mod backup_feedback;
 mod backup_review;
 mod callbacks;
 pub mod client;

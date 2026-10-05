@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use lr_blocksource::{BlockSource, DirectBlockSource, DirectBlockTarget, UsedChunks, is_all_zero};
 use lr_core::{
-    Consistency, Error, ImageId, ImageKind, Result, SnapshotOpts, Support,
+    Consistency, Error, ImageId, ImageKind, Result, SnapshotOpts, SourceLayout, Support,
     discovery::discover_source,
 };
 use lr_crypto::nonce::NonceSeq;
@@ -137,20 +137,21 @@ fn plan_partition(partition: &lr_core::PartitionLayout) -> PartitionPlan {
     }
 }
 
-/// Back up a whole disk.
+/// Check the read-only preconditions shared by planning and whole-disk execution.
 ///
-/// # Errors
-/// Returns [`Error::Unsupported`] when the source is not a whole disk,
-/// [`Error::NoConsistentMethod`] when a partition cannot be read offline, and
-/// propagates I/O, AEAD and format errors.
-pub fn backup_whole_disk(request: &crate::backup::BackupRequest) -> Result<WholeDiskReport> {
+/// The whole-disk path deliberately uses only the offline provider. In
+/// particular, `allow_inconsistent` never permits a live read of a disk and
+/// its partitions.
+pub(crate) fn preflight(
+    request: &crate::backup::BackupRequest,
+    layout: &SourceLayout,
+) -> Result<()> {
     if request.member_type != crate::backup::MemberType::Full || request.parent.is_some() {
         return Err(Error::unsupported(
             "whole-disk images are full images only; per-region chain support is not implemented yet",
         ));
     }
     validate_chunk_size(request.chunk_size)?;
-    let layout = discover_source(&request.source)?;
     if !layout.is_whole_disk() {
         return Err(Error::unsupported(
             "this source has no partition table; use a block backup instead",
@@ -161,17 +162,41 @@ pub fn backup_whole_disk(request: &crate::backup::BackupRequest) -> Result<Whole
         ..SnapshotOpts::default()
     };
     let provider = offline_provider();
-    if let Support::No(reason) = provider.supports(&layout, &snapshot_opts) {
+    if let Support::No(reason) = provider.supports(layout, &snapshot_opts) {
         return Err(Error::no_consistent_method([
             format!("offline read refused: {reason}"),
             "unmount every partition of the disk, then retry".to_owned(),
             "boot rescue media and run the statically linked CLI (offline)".to_owned(),
         ]));
     }
+    Ok(())
+}
+
+/// Back up a whole disk.
+///
+/// # Errors
+/// Returns [`Error::Unsupported`] when the source is not a whole disk,
+/// [`Error::NoConsistentMethod`] when a partition cannot be read offline, and
+/// propagates I/O, AEAD and format errors.
+pub fn backup_whole_disk(request: &crate::backup::BackupRequest) -> Result<WholeDiskReport> {
+    let layout = discover_source(&request.source)?;
+    backup_whole_disk_with_layout(request, &layout)
+}
+
+pub(crate) fn backup_whole_disk_with_layout(
+    request: &crate::backup::BackupRequest,
+    layout: &SourceLayout,
+) -> Result<WholeDiskReport> {
+    preflight(request, layout)?;
+    let provider = offline_provider();
+    let snapshot_opts = SnapshotOpts {
+        provider: request.snapshot_provider.clone(),
+        ..SnapshotOpts::default()
+    };
     // The disk itself and every partition must be idle, and stay idle: the
     // snapshot holds the provider's exclusive claim on the disk until the
     // whole image is written (A2).
-    let _claim = provider.create(&layout, &snapshot_opts)?;
+    let _claim = provider.create(layout, &snapshot_opts)?;
 
     let mut source = DirectBlockSource::open(&request.source)?;
     let disk_size = source.size_bytes();
@@ -366,7 +391,7 @@ pub fn backup_whole_disk(request: &crate::backup::BackupRequest) -> Result<Whole
             }
             .write(&mut spool, false)?;
 
-            let (regions_of_source, map_backed, incomplete) = region_source_map(&layout, region);
+            let (regions_of_source, map_backed, incomplete) = region_source_map(layout, region);
             map_warnings.extend(incomplete);
             if !map_backed && region.kind == RegionKind::PartitionFs {
                 tracing::warn!(

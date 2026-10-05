@@ -125,8 +125,19 @@ pub fn run_backup(job: BackupJob, context: EngineContext) -> Result<ImageReport>
         Mode::File => Ok(ImageReport::File(lr_engine::file::backup_file(
             &request, &file,
         )?)),
-        _ => lr_engine::backup_image(&request),
+        mode => lr_engine::backup_image_with_mode(&request, mode),
     }
+}
+
+/// Plan a validated job with the engine's execution-matched source decisions.
+///
+/// The plan reads source metadata and content estimates only. It does not open
+/// the destination, acquire a set lock, or create a snapshot.
+///
+/// # Errors
+/// Propagates source, provider, and option validation failures.
+pub fn plan_backup(job: &BackupJob) -> Result<lr_engine::BackupPlan> {
+    lr_engine::plan_backup(&job.request, job.mode, &job.file)
 }
 
 fn or<'a>(value: &'a str, default: &'a str) -> &'a str {
@@ -144,8 +155,10 @@ fn mode_name(mode: Mode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackupSpec, backup_job};
+    use super::{BackupSpec, backup_job, plan_backup, run_backup};
+    use lr_engine::ImageReport;
     use lr_engine::options::Mode;
+    use lr_engine::progress::EngineContext;
 
     /// Every non-default option reaches the job, whichever route builds it
     /// (R31): the CLI's direct route and the daemon call this one function.
@@ -226,5 +239,106 @@ mod tests {
         };
         let error = backup_job(&spec).err().expect("refused");
         assert!(error.to_string().contains("--one-file-system"), "{error}");
+    }
+
+    #[test]
+    fn file_plan_is_read_only_and_matches_the_executed_consistency() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source");
+        std::fs::create_dir(&source).expect("source directory");
+        std::fs::write(source.join("data.txt"), b"planned bytes").expect("source data");
+        let dest = dir.path().join("backups");
+        let spec = BackupSpec {
+            source: source.display().to_string(),
+            dest: dest.display().to_string(),
+            set: "file-plan".to_owned(),
+            mode: "file".to_owned(),
+            snapshot: "none".to_owned(),
+            compress: "none".to_owned(),
+            no_encrypt: true,
+            one_file_system: true,
+            verify_content: true,
+            ..BackupSpec::default()
+        };
+        let job = backup_job(&spec).expect("job");
+        let plan = plan_backup(&job).expect("read-only plan");
+
+        assert_eq!(plan.provider, "file");
+        assert_eq!(plan.image_kind, lr_core::ImageKind::File);
+        assert_eq!(plan.consistency, lr_core::Consistency::PerFile);
+        assert_eq!(plan.estimated_bytes, b"planned bytes".len() as u64);
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("source-side plan"))
+        );
+        assert!(!dest.exists(), "planning must not create the destination");
+
+        let report = run_backup(job, EngineContext::silent()).expect("file backup");
+        let ImageReport::File(report) = report else {
+            panic!("file mode must produce a file report");
+        };
+        assert_eq!(plan.consistency, report.consistency);
+        assert!(dest.is_dir(), "execution creates the destination");
+    }
+
+    #[test]
+    fn file_plan_refuses_an_unavailable_forced_snapshot_provider() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source");
+        std::fs::create_dir(&source).expect("source directory");
+        let job = backup_job(&BackupSpec {
+            source: source.display().to_string(),
+            dest: dir.path().join("backups").display().to_string(),
+            set: "file-plan".to_owned(),
+            mode: "file".to_owned(),
+            snapshot: "lvm".to_owned(),
+            no_encrypt: true,
+            ..BackupSpec::default()
+        })
+        .expect("job");
+
+        let error = plan_backup(&job).expect_err("file mode cannot honor LVM snapshots");
+        assert!(error.to_string().contains("`lvm`"), "{error}");
+    }
+
+    #[test]
+    fn forced_stream_mode_on_a_block_source_fails_before_destination_creation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source.img");
+        let image = std::fs::File::create(&source).expect("source image");
+        image.set_len(4 * 1024 * 1024).expect("image size");
+        drop(image);
+        let dest = dir.path().join("backups");
+        let job = backup_job(&BackupSpec {
+            source: source.display().to_string(),
+            dest: dest.display().to_string(),
+            set: "mode-plan".to_owned(),
+            mode: "stream".to_owned(),
+            no_encrypt: true,
+            ..BackupSpec::default()
+        })
+        .expect("job");
+
+        let plan_error = plan_backup(&job).expect_err("stream requires a Btrfs stream source");
+        assert!(
+            plan_error.to_string().contains("resolves to block mode"),
+            "{plan_error}"
+        );
+        assert!(
+            !dest.exists(),
+            "a refused plan must not create the destination"
+        );
+
+        let run_error = run_backup(job, EngineContext::silent())
+            .expect_err("execution must enforce the same forced mode");
+        assert!(
+            run_error.to_string().contains("resolves to block mode"),
+            "{run_error}"
+        );
+        assert!(
+            !dest.exists(),
+            "a refused execution must not create the destination"
+        );
     }
 }

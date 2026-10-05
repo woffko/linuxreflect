@@ -91,11 +91,38 @@ const SCENES: &[Scene] = &[
         ui.set_destination("/media/backup-drive/LinuxReflect".into());
         ui.set_backup_set("workstation-root".into());
         ui.set_show_source_details(true);
+        ui.set_backup_summary(
+            "Planned method: btrfs · Image kind: Stream\n\
+             Planned consistency: a point-in-time snapshot.\n\
+             The daemon checks the source and safety requirements again when the backup starts."
+                .into(),
+        );
         ui.set_plan(
             "provider: btrfs\nimage kind: stream\nconsistency: PointInTime\n\
              estimated: 212.4 GiB"
                 .into(),
         );
+    }),
+    ("backup-planning-refused", |ui| {
+        ui.set_current_tab(1);
+        ui.set_backup_step(1);
+        ui.set_source("/dev/nvme0n1".into());
+        ui.set_destination("/mnt/network/linuxreflect_backups/gui-test".into());
+        ui.set_backup_set("gui-test".into());
+        ui.set_backup_plan_error(
+            "No consistent imaging method is available for this source with the selected settings. \
+             For an image of the running system disk, boot rescue media and back it up offline. \
+             To test the GUI now, go Back to Source, choose a small local folder, and keep your \
+             network folder as Destination. A second local drive is not required."
+                .into(),
+        );
+        ui.set_backup_plan_error_details(
+            "E_NO_CONSISTENT_METHOD: offline read refused: a partition is mounted or in use; \
+             unmount every partition of the disk, then retry; boot rescue media (offline)"
+                .into(),
+        );
+        ui.set_show_backup_plan_error_details(true);
+        ui.set_status("Backup planning failed. See the message in the wizard.".into());
     }),
     ("backup-running", |ui| {
         ui.set_current_tab(1);

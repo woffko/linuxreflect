@@ -340,6 +340,88 @@ async fn the_static_backend_allows_and_denies_uids() {
 }
 
 #[tokio::test]
+async fn backup_planning_uses_the_spec_and_leaves_the_destination_untouched() {
+    let work = tempfile::tempdir().expect("workdir");
+    let source = work.path().join("source");
+    std::fs::create_dir(&source).expect("source directory");
+    std::fs::write(source.join("data.txt"), b"planned bytes").expect("source data");
+    let identity = work.path().join("identity");
+    std::fs::write(&identity, b"fixture identity").expect("identity fixture");
+    let dest = work.path().join("backups");
+    let spec = BackupSpec {
+        source: source.display().to_string(),
+        dest: dest.display().to_string(),
+        set: "plan-rpc".to_owned(),
+        mode: "file".to_owned(),
+        snapshot: "none".to_owned(),
+        compress: "none".to_owned(),
+        no_encrypt: true,
+        allow_freeze: true,
+        allow_inconsistent: true,
+        one_file_system: true,
+        verify_content: true,
+        identity: identity.display().to_string(),
+        ..BackupSpec::default()
+    };
+
+    let denied_uid = if uid() == 0 { 12345 } else { 0 };
+    let denied_daemon = Daemon::start(&format!("static:{denied_uid}"));
+    let mut denied_client = denied_daemon.client().await;
+    let error = denied_client
+        .plan_backup(spec.clone())
+        .await
+        .expect_err("backup planning needs backup.create authorization");
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    assert!(!dest.exists(), "a denied peer must not start planning");
+    drop(denied_client);
+    drop(denied_daemon);
+
+    let daemon = Daemon::start(&format!("static:{}", uid()));
+    let mut client = daemon.client().await;
+    let plan = client
+        .plan_backup(spec.clone())
+        .await
+        .expect("authenticated plan_backup")
+        .into_inner();
+    assert_eq!(plan.provider, "file");
+    assert_eq!(plan.image_kind, "File");
+    assert_eq!(plan.consistency, "per-file");
+    assert_eq!(plan.estimated_bytes, b"planned bytes".len() as u64);
+    assert!(!dest.exists(), "planning must not create the destination");
+
+    let error = client
+        .plan_backup(BackupSpec {
+            identity: source.display().to_string(),
+            ..spec.clone()
+        })
+        .await
+        .expect_err("a directory cannot be used as a client identity file");
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    assert!(
+        error.message().contains("not a regular file"),
+        "{}",
+        error.message()
+    );
+    assert!(
+        !dest.exists(),
+        "a refused client file must not create the destination"
+    );
+
+    let error = client
+        .plan_backup(BackupSpec {
+            snapshot: "lvm".to_owned(),
+            ..spec
+        })
+        .await
+        .expect_err("forced provider must not be silently ignored");
+    assert!(error.message().contains("`lvm`"), "{}", error.message());
+    assert!(
+        !dest.exists(),
+        "a refused plan must not create the destination"
+    );
+}
+
+#[tokio::test]
 async fn a_backup_runs_over_the_socket_and_reports_progress() {
     let daemon = Daemon::start(&format!("static:{}", uid()));
     let work = tempfile::tempdir().expect("workdir");

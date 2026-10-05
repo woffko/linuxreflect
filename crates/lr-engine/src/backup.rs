@@ -1199,6 +1199,26 @@ pub enum ImageReport {
 /// # Errors
 /// Propagates the errors of the chosen mode.
 pub fn backup_image(request: &BackupRequest) -> Result<ImageReport> {
+    backup_image_with_mode(request, crate::options::Mode::Auto)
+}
+
+/// Back up a source while enforcing an explicitly selected imaging mode.
+///
+/// `Mode::Auto` keeps the source-driven behavior of [`backup_image`]. Forced
+/// Block and Stream modes must match the representation selected from the
+/// discovered source.
+///
+/// # Errors
+/// Propagates source discovery, mode, provider and execution errors.
+pub fn backup_image_with_mode(
+    request: &BackupRequest,
+    mode: crate::options::Mode,
+) -> Result<ImageReport> {
+    if mode == crate::options::Mode::File {
+        return Err(Error::unsupported(
+            "file mode must be executed through the file backup path",
+        ));
+    }
     let layout = discover_source(&request.source)?;
     if layout.device_facts.size_bytes == 0 {
         // A missing device, a detached loop device or an unreadable size would
@@ -1209,11 +1229,13 @@ pub fn backup_image(request: &BackupRequest) -> Result<ImageReport> {
         )));
     }
     if layout.is_whole_disk() {
+        crate::backup_planning::validate_mode_selection(mode, ImageKind::Block, true)?;
         return Ok(ImageReport::WholeDisk(
-            crate::whole_disk::backup_whole_disk(request)?,
+            crate::whole_disk::backup_whole_disk_with_layout(request, &layout)?,
         ));
     }
     let plan = lr_snapshot::probe::probe(&layout, &snapshot_opts(request))?;
+    crate::backup_planning::validate_mode_selection(mode, plan.image_kind, false)?;
     if plan.image_kind == ImageKind::Stream {
         return Ok(ImageReport::Stream(crate::stream::backup_stream(request)?));
     }

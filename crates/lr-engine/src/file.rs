@@ -58,6 +58,12 @@ struct FileSnapshot {
     _guard: Option<lr_snapshot::TreeSnapshot>,
 }
 
+/// The read-only facts needed to create a Btrfs tree snapshot.
+struct FileSnapshotCandidate {
+    source: PathBuf,
+    layout: lr_core::SourceLayout,
+}
+
 /// Resolve the source root, snapshotting a Btrfs directory when asked.
 ///
 /// `--snapshot btrfs` (or `auto` on a Btrfs source) takes a read-only snapshot
@@ -68,35 +74,9 @@ fn snapshot_source(
     request: &BackupRequest,
     options: &FileBackupOptions,
 ) -> Result<Option<FileSnapshot>> {
-    let source = request.source.canonicalize().map_err(Error::Io)?;
-    let Some(mount) = lr_snapshot::btrfs::mount_of_path(&source)? else {
+    let Some(candidate) = file_snapshot_candidate(request)? else {
         return Ok(None);
     };
-    let requested = request.snapshot_provider.as_deref();
-    match requested {
-        Some("none") => return Ok(None),
-        Some("btrfs") | None if mount.fstype == "btrfs" => {}
-        Some("btrfs") => {
-            return Err(Error::unsupported(format!(
-                "{} is on {}, not Btrfs; file mode cannot snapshot it",
-                source.display(),
-                mount.fstype
-            )));
-        }
-        Some(other) if mount.fstype == "btrfs" => {
-            return Err(Error::unsupported(format!(
-                "file mode snapshots a source with `btrfs`, not `{other}`"
-            )));
-        }
-        Some(_) | None => return Ok(None),
-    }
-    if mount.device.is_empty() {
-        return Err(Error::unsupported(format!(
-            "{} has no backing device to snapshot",
-            source.display()
-        )));
-    }
-    let layout = discover_source(Path::new(&mount.device))?;
     let opts = lr_snapshot::TreeSnapshotOpts {
         set_name: request.set_name.clone(),
         image_uuid: *request.image_uuid.inner(),
@@ -107,12 +87,13 @@ fn snapshot_source(
         exclude_nested: request.exclude_nested_subvolumes,
     };
     request.context.phase("snapshot");
-    let snapshot = lr_snapshot::btrfs::provider().create(&layout, &opts)?;
+    let snapshot = lr_snapshot::btrfs::provider().create(&candidate.layout, &opts)?;
     let root = snapshot
         .subvolumes
         .iter()
         .filter_map(|subvol| {
-            source
+            candidate
+                .source
                 .strip_prefix(&subvol.mount_target)
                 .ok()
                 .map(|relative| subvol.snapshot_path.join(relative))
@@ -121,8 +102,8 @@ fn snapshot_source(
         .ok_or_else(|| {
             Error::unsupported(format!(
                 "no snapshot of {} covers {}",
-                mount.device,
-                source.display()
+                candidate.layout.device.display(),
+                candidate.source.display()
             ))
         })?;
     if !options.xattrs {
@@ -134,6 +115,84 @@ fn snapshot_source(
         excluded: snapshot.excluded.clone(),
         _guard: Some(snapshot),
     }))
+}
+
+/// Select and preflight the file-mode snapshot provider without creating it.
+///
+/// Auto uses Btrfs only when the source is on Btrfs. `none` explicitly opts
+/// out; every other forced provider is refused because file mode cannot honor
+/// it.
+fn file_snapshot_candidate(request: &BackupRequest) -> Result<Option<FileSnapshotCandidate>> {
+    let source = request.source.canonicalize().map_err(Error::Io)?;
+    let requested = request.snapshot_provider.as_deref();
+    let mount = lr_snapshot::btrfs::mount_of_path(&source)?;
+    match requested {
+        Some("none") => return Ok(None),
+        Some("btrfs") if mount.as_ref().is_none_or(|mount| mount.fstype != "btrfs") => {
+            return Err(Error::unsupported(format!(
+                "{} is not on a mounted Btrfs filesystem; file mode cannot snapshot it",
+                source.display()
+            )));
+        }
+        Some("btrfs") | None => {}
+        Some(other) => {
+            return Err(Error::unsupported(format!(
+                "file mode cannot use snapshot provider `{other}`; use `btrfs` or `none`"
+            )));
+        }
+    }
+    let Some(mount) = mount.filter(|mount| mount.fstype == "btrfs") else {
+        return Ok(None);
+    };
+    if mount.device.is_empty() {
+        return Err(Error::unsupported(format!(
+            "{} has no backing device to snapshot",
+            source.display()
+        )));
+    }
+    let layout = discover_source(Path::new(&mount.device))?;
+    if let lr_core::Support::No(reason) =
+        lr_snapshot::btrfs::provider().supports(&layout, &crate::backup::snapshot_opts(request))
+    {
+        return Err(Error::unsupported(format!("btrfs provider: {reason}")));
+    }
+    Ok(Some(FileSnapshotCandidate { source, layout }))
+}
+
+/// Plan a directory backup using the same snapshot choice as execution.
+pub(crate) fn plan_file_backup(
+    request: &BackupRequest,
+    options: &FileBackupOptions,
+) -> Result<crate::backup_planning::BackupPlan> {
+    let candidate = if options.source_override.is_none() {
+        file_snapshot_candidate(request)?
+    } else {
+        None
+    };
+    let walk_root = options.source_override.as_ref().unwrap_or(&request.source);
+    let walk = tree::walk(
+        walk_root,
+        &WalkOptions {
+            one_file_system: options.one_file_system,
+            excludes: options.excludes.clone(),
+            xattrs: options.xattrs,
+        },
+    )?;
+    Ok(crate::backup_planning::BackupPlan {
+        provider: if candidate.is_some() {
+            "btrfs".to_owned()
+        } else {
+            "file".to_owned()
+        },
+        image_kind: ImageKind::File,
+        consistency: if candidate.is_some() {
+            Consistency::PointInTime
+        } else {
+            options.consistency
+        },
+        estimated_bytes: walk.total_bytes,
+        warnings: walk.warnings,
+    })
 }
 
 /// How a file backup walks the source.

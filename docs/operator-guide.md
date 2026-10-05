@@ -11,6 +11,7 @@ to (`D-…`) are in [`decisions.md`](decisions.md); the specification is
 - [Components](#components)
 - [Who may do what](#who-may-do-what)
 - [Destinations](#destinations)
+- [Desktop backup review](#desktop-backup-review)
 - [What an image contains](#what-an-image-contains)
 - [Chains: full, incremental, differential](#chains-full-incremental-differential)
 - [Retention](#retention)
@@ -38,7 +39,7 @@ polkit (`/usr/share/polkit-1/actions/org.linuxreflect.policy`):
 | Action | Default for the active session | Covers |
 |---|---|---|
 | `org.linuxreflect.disk.read` | allowed | listing disks, sets and jobs, verifying, cancelling one's own jobs |
-| `org.linuxreflect.backup.create` | administrator, kept | backups, catalog rebuilds, global daemon receipt inspection |
+| `org.linuxreflect.backup.create` | administrator, kept | backup planning and creation, catalog rebuilds, global daemon receipt inspection |
 | `org.linuxreflect.restore.prepare` | administrator, kept | restore plans and tokens |
 | `org.linuxreflect.restore.apply` | administrator, every time | writing a restore target |
 | `org.linuxreflect.snapshot.manage`, `schedule.manage`, `destination.configure`, `export.manage` | administrator, kept | snapshots, timers and retention, named destinations, NBD exports |
@@ -118,6 +119,37 @@ refused wherever that line stands, `@cert-authority` lines trust no plain key
 unusable. A server without the `fsync@openssh.com` extension cannot confirm
 that an image reached its disk; the report then warns "durability
 unconfirmed".
+
+## Desktop backup review
+
+The backup wizard sends its complete selection to the daemon's `PlanBackup`
+method: source, destination, mode, snapshot choice and explicit consent flags.
+The review shows the daemon's predicted provider and consistency, not a snapshot
+already taken. Planning is read-only; destination access, chain resolution and
+source safety are checked again when creating the backup. Changing a setting
+invalidates the review. Rebuild and restart both GUI and daemon when upgrading;
+an older daemon is not used to silently plan with default settings (D-136).
+
+A mounted NFS/SMB folder is a supported destination; a second local drive is
+not required. For a safe GUI check, choose a small local folder through
+**Source → Choose a folder**, keep **Method: file** and **Consistency: auto**,
+and choose the mounted network folder as Destination. Verify the created image
+in the Restore library, then restore into a new empty local directory.
+This exercises file recovery, not whole-disk boot recovery.
+
+Whole-disk imaging remains offline-only, including every partition and active
+swap. A live running system disk without a suitable partition-level snapshot
+cannot be made consistent by choosing a network destination. Boot rescue media
+for an offline whole-disk image; do not freeze the running root filesystem.
+Planning refusals appear in the wizard with expandable technical details.
+The [rendered refusal example](screenshots/backup-planning-refused-1024x768@100-dark.png)
+shows the layout, not acceptance on a physical desktop.
+
+File mode supports Btrfs snapshots or per-file reads (`auto` on non-Btrfs,
+or explicit `none`). Forced LVM, freeze and offline choices are refused rather
+than silently ignored. For partition/block sources, `none` selects `live-none`
+and still requires explicit inconsistent-copy consent; it never permits a live
+whole-disk image.
 
 ## What an image contains
 

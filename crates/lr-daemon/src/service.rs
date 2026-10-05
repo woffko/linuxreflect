@@ -857,6 +857,38 @@ impl LinuxReflect for DaemonService {
         }))
     }
 
+    async fn plan_backup(
+        &self,
+        request: GrpcRequest<BackupSpec>,
+    ) -> std::result::Result<Response<Plan>, Status> {
+        let peer = self.authorize(&request, Action::BackupCreate).await?;
+        let spec = request.get_ref().clone();
+        client_files::check_host_key_policy(spec.insecure_ignore_host_key, self.dev_mode)
+            .map_err(status::status_of)?;
+        let described = spec.clone();
+        let uid = peer.uid;
+        let plan = Self::off_thread(move || {
+            client_files::check(
+                uid,
+                &[
+                    &described.passphrase_file,
+                    &described.identity,
+                    &described.known_hosts,
+                ],
+            )?;
+            let job = lr_request::backup_job(&described)?;
+            lr_request::plan_backup(&job)
+        })
+        .await?;
+        Ok(Response::new(Plan {
+            provider: plan.provider,
+            image_kind: format!("{:?}", plan.image_kind),
+            consistency: plan.consistency.to_string(),
+            estimated_bytes: plan.estimated_bytes,
+            warnings: plan.warnings,
+        }))
+    }
+
     async fn list_sets(
         &self,
         request: GrpcRequest<SetRef>,

@@ -42,7 +42,7 @@ impl BlockSnapshotProvider for LiveNoneProvider {
         if opts
             .provider
             .as_deref()
-            .is_some_and(|name| name != ID && name != "auto")
+            .is_some_and(|name| name != ID && name != "none" && name != "auto")
         {
             return Support::No("another provider was requested".to_owned());
         }
@@ -122,5 +122,29 @@ mod tests {
         assert_eq!(snapshot.consistency, Consistency::None);
         assert_eq!(snapshot.block_path, layout.device);
         snapshot.check_health().expect("no health check");
+    }
+
+    #[test]
+    fn the_none_alias_still_requires_consent() {
+        let layout = mounted();
+        let alias = SnapshotOpts {
+            provider: Some("none".to_owned()),
+            ..SnapshotOpts::default()
+        };
+        let error = crate::probe::decide(&layout, &alias).expect_err("consent is required");
+        assert!(
+            error.to_string().contains("--allow-inconsistent"),
+            "{error}"
+        );
+
+        let consent = SnapshotOpts {
+            allow_inconsistent: true,
+            ..alias.clone()
+        };
+        let decision = crate::probe::decide(&layout, &consent).expect("live reader decision");
+        assert_eq!(decision.provider, super::ID);
+        assert_eq!(decision.consistency, Consistency::None);
+        assert!(LiveNoneProvider.supports(&layout, &consent).is_yes());
+        assert!(crate::probe::confirm(&LiveNoneProvider, &layout, &alias).is_err());
     }
 }

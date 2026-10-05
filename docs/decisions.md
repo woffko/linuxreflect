@@ -1949,3 +1949,38 @@ lock. Historical receipts never reconstruct publisher acknowledgement or current
 image association. In-memory job results disappear on daemon restart; receipts
 do not. Ordinary CLI/GUI verification, fresh restore and retention gates remain
 unchanged. Client controls and GUI history are separate follow-up work.
+
+## D-136 — Review the complete backup request before GUI execution
+
+The additive `PlanBackup(BackupSpec) -> Plan` RPC uses the same validated request
+conversion as `CreateBackup`. It requires `backup.create` authorization and
+the same caller-file and host-key policy checks. Blocking discovery and tree
+walking run off the async service thread. Legacy source-only `ProbeSource`
+remains available; the GUI never falls back to it when an older daemon lacks
+full-request planning.
+
+Planning predicts the source-side provider, image kind and consistency without
+creating snapshots, freezing filesystems, opening a destination for writes,
+acquiring set locks or publishing images. File snapshot selection and whole-disk
+preflight are shared with execution. A preview is not a reservation or restore
+token: creation checks current facts and resolves destination and chain state
+again. Resource estimates and consistency are predictions, not achieved facts.
+
+File mode rejects forced providers it cannot honor instead of silently reading
+per-file: Btrfs is supported on Btrfs, `none` opts out, and auto on other
+filesystems remains per-file. The documented block-provider value `none` names
+`live-none`, still gated by explicit consent. Whole-disk reads remain
+offline-only and cannot be enabled by inconsistent-copy consent.
+
+Forced block/stream modes must match the resolved image representation or are
+refused before writes. The same compatibility check is used for preview and
+execution; auto continues to select the existing engine route.
+
+The GUI binds a successful review to the exact full request and consumes it
+once. Failed or stale planning responses cannot authorize execution. Editing
+settings clears approval and feedback. Source consistency refusals appear in a
+wrapping inline banner with safe offline/folder alternatives; raw diagnostics
+remain expandable. The summary renders the daemon's prediction and warnings,
+not a second provider decision made from dropdown values. NFS/SMB destinations
+continue to use mounted paths; this change does not relax mount guards or
+certify live disk imaging, restore readiness or network outage recovery.

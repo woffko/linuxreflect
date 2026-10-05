@@ -270,7 +270,7 @@ impl Actions {
         });
     }
 
-    /// The backup wizard's plan (`ProbeSource`), consistency included.
+    /// Plan the full selected request, including consistency and destination.
     pub(crate) fn probe_source(&self, ui: slint::Weak<MainWindow>, requested: BackupSpec) {
         if !self.start(&ui, "probe") {
             return;
@@ -280,12 +280,12 @@ impl Actions {
             .lock()
             .expect("backup review lock")
             .begin();
-        if requested.source.trim().is_empty() {
-            self.clone_handle().fail(
-                &ui,
-                "probe",
-                &anyhow::anyhow!("Choose a source before inspection."),
-            );
+        if let Some(ui) = ui.upgrade() {
+            backup_feedback::clear(&ui);
+        }
+        if let Err(error) = backup_review::validate(&requested) {
+            self.clone_handle()
+                .fail_backup_plan(&ui, &requested, &anyhow::anyhow!(error));
             return;
         }
         let source = requested.source.clone();
@@ -295,7 +295,8 @@ impl Actions {
         self.runtime.spawn(async move {
             let outcome = async {
                 let client = Client::connect(&socket).await?;
-                let plan = client.probe(&source).await?;
+                let plan = client.plan_backup(&requested).await?;
+                let summary = result::backup_plan(&plan);
                 let mut text = format!(
                     "source:      {source}\nprovider:    {}\nimage kind:  {}\nconsistency: {}\nestimated:   {} ({})",
                     plan.provider,
@@ -308,30 +309,38 @@ impl Actions {
                     text.push_str("\nwarning:     ");
                     text.push_str(warning);
                 }
-                Ok::<_, anyhow::Error>(text)
+                Ok::<_, anyhow::Error>((text, summary))
             }
             .await;
             match outcome {
-                Ok(text) => {
+                Ok((text, summary)) => {
                     let weak = weak.clone();
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = weak.upgrade() {
+                            if actions.shared.generation.load(Ordering::SeqCst) != actions.generation
+                                || !actions.shared.busy.load(Ordering::SeqCst)
+                            {
+                                return;
+                            }
                             if !actions.shared.backup_review.lock().expect("backup review lock")
                                 .accept(requested, &backup_spec(&ui)) {
                                 ui.set_status("Backup settings changed. Review the new selection.".into());
+                                ui.set_phase("idle".into());
                                 ui.set_busy(false);
                                 actions.shared.busy.store(false, Ordering::SeqCst);
                                 return;
                             }
                             ui.set_plan(text.into());
+                            ui.set_backup_summary(summary.into());
                             ui.set_backup_step(2);
                             ui.set_status("plan ready".into());
+                            ui.set_phase("idle".into());
                             ui.set_busy(false);
                             actions.shared.busy.store(false, Ordering::SeqCst);
                         }
                     });
                 }
-                Err(error) => actions.fail(&weak, "probe", &error),
+                Err(error) => actions.fail_backup_plan(&weak, &requested, &error),
             }
         });
     }
@@ -865,6 +874,45 @@ pub(crate) struct ActionsHandle {
 }
 
 impl ActionsHandle {
+    pub(crate) fn fail_backup_plan(
+        &self,
+        ui: &slint::Weak<MainWindow>,
+        requested: &BackupSpec,
+        error: &anyhow::Error,
+    ) {
+        let feedback = backup_feedback::failure(error);
+        let shared = Arc::clone(&self.shared);
+        let generation = self.generation;
+        let requested = requested.clone();
+        let weak = ui.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                if shared.generation.load(Ordering::SeqCst) != generation
+                    || !shared.busy.load(Ordering::SeqCst)
+                {
+                    return;
+                }
+                shared
+                    .backup_review
+                    .lock()
+                    .expect("backup review lock")
+                    .begin();
+                if requested == backup_spec(&ui) {
+                    *shared.failure.lock().expect("failure lock") = Some(feedback.details.clone());
+                    ui.set_backup_plan_error(feedback.message.into());
+                    ui.set_backup_plan_error_details(feedback.details.into());
+                    ui.set_status("Backup planning failed. See the message in the wizard.".into());
+                    ui.set_phase("failed".into());
+                } else {
+                    ui.set_status("Backup settings changed. Review the new selection.".into());
+                    ui.set_phase("idle".into());
+                }
+                ui.set_busy(false);
+                shared.busy.store(false, Ordering::SeqCst);
+            }
+        });
+    }
+
     pub(crate) fn fail(&self, ui: &slint::Weak<MainWindow>, label: &str, error: &anyhow::Error) {
         let terminal = error.downcast_ref::<client::JobFailure>().is_some();
         let cancelled = error

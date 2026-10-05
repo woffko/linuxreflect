@@ -10,6 +10,7 @@
 
 pub mod backup;
 mod backup_plan;
+mod backup_planning;
 pub mod catalog;
 pub mod chain;
 pub mod file;
@@ -31,9 +32,10 @@ pub mod whole_disk;
 
 pub use backup::{
     BackupReport, BackupRequest, BadSectorPolicy, Compression, ImageReport, backup_block_full,
-    backup_image,
+    backup_image, backup_image_with_mode,
 };
 pub use backup_plan::ManifestEncoding;
+pub use backup_planning::{BackupPlan, plan_backup};
 pub use file::{FileBackupOptions, FileReport, FileRestoreReport, FileRestoreRequest};
 pub use keys::Encryption;
 pub use keystore::{

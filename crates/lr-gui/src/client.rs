@@ -136,6 +136,15 @@ impl Client {
             .into_inner())
     }
 
+    /// Plan the complete request that will be submitted to `CreateBackup`.
+    ///
+    /// # Errors
+    /// Propagates authorization, planning, and unsupported-daemon errors.
+    /// An old daemon must not silently plan with default options instead.
+    pub async fn plan_backup(&self, spec: &BackupSpec) -> anyhow::Result<Plan> {
+        Ok(self.service().plan_backup(spec.clone()).await?.into_inner())
+    }
+
     /// `ListSets`/`ListChains`.
     ///
     /// # Errors

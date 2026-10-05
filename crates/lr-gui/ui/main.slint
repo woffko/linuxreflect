@@ -48,6 +48,23 @@ export component MainWindow inherits Window {
     in-out property <bool> encrypt: false;
     in-out property <string> passphrase-file: "";
     in-out property <string> plan: "(no plan yet)";
+    in-out property <string> backup-summary: "";
+    in-out property <string> backup-plan-error: "";
+    in-out property <string> backup-plan-error-details: "";
+    in-out property <bool> show-backup-plan-error-details: false;
+
+    changed source => { root.backup-inputs-changed(); }
+    changed destination => { root.backup-inputs-changed(); }
+    changed backup-set => { root.backup-inputs-changed(); }
+    changed mode => { root.backup-inputs-changed(); }
+    changed member-type => { root.backup-inputs-changed(); }
+    changed snapshot => { root.backup-inputs-changed(); }
+    changed allow-freeze => { root.backup-inputs-changed(); }
+    changed allow-inconsistent => { root.backup-inputs-changed(); }
+    changed compress => { root.backup-inputs-changed(); }
+    changed bad-sector => { root.backup-inputs-changed(); }
+    changed encrypt => { root.backup-inputs-changed(); }
+    changed passphrase-file => { root.backup-inputs-changed(); }
     in-out property <string> image: "";
     // What the chosen image is, in words (set, kind, date), when known.
     in-out property <string> image-detail: "";
@@ -107,6 +124,7 @@ export component MainWindow inherits Window {
     callback refresh-disks();
     callback refresh-history();
     callback probe-source();
+    callback backup-inputs-changed();
     callback start-backup();
     callback prepare-restore();
     callback restore-inputs-changed();
@@ -314,6 +332,20 @@ export component MainWindow inherits Window {
                                     padding-right: 14px;
                                     alignment: start;
 
+                                    if root.backup-plan-error != "": VerticalLayout {
+                                        spacing: 8px;
+                                        Banner { text: root.backup-plan-error; error: true; }
+                                        CheckBox {
+                                            text: "Technical details";
+                                            checked <=> root.show-backup-plan-error-details;
+                                        }
+                                        if root.show-backup-plan-error-details: Text {
+                                            text: root.backup-plan-error-details;
+                                            color: Theme.muted;
+                                            wrap: word-wrap;
+                                        }
+                                    }
+
                                     if root.backup-step == 0: VerticalLayout {
                                         spacing: 10px;
                                         Banner {
@@ -352,6 +384,11 @@ export component MainWindow inherits Window {
                                     if root.backup-step == 1: VerticalLayout {
                                         spacing: 10px;
                                         Text { text: "Backup folder"; font-weight: 700; color: Theme.text; }
+                                        Text {
+                                            text: "A local folder or a mounted NFS/SMB network folder can be used. Source consistency is checked separately.";
+                                            color: Theme.muted;
+                                            wrap: word-wrap;
+                                        }
                                         HorizontalLayout {
                                             spacing: 8px;
                                             Text {
@@ -480,13 +517,7 @@ export component MainWindow inherits Window {
                                         Text { text: "Save to: " + root.destination; color: Theme.text; wrap: word-wrap; }
                                         Text { text: "Backup name: " + root.backup-set; color: Theme.text; wrap: word-wrap; }
                                         Text { text: "Type: " + root.member-type + " · Compression: " + root.compress + " · Encryption: " + (root.encrypt ? "on" : "off"); color: Theme.text; wrap: word-wrap; }
-                                        Text {
-                                            text: root.snapshot == "freeze" ? "A temporary filesystem freeze was allowed. Applications may pause."
-                                                : root.snapshot == "none" ? "Live copy without a snapshot: the backup may be inconsistent."
-                                                : "The daemon checks the consistency method again when the backup starts.";
-                                            color: root.snapshot == "none" ? Theme.warning : Theme.muted;
-                                            wrap: word-wrap;
-                                        }
+                                        Text { text: root.backup-summary; color: Theme.text; wrap: word-wrap; }
                                         CheckBox { text: "Technical plan"; checked <=> root.show-source-details; }
                                         if root.show-source-details: Text { text: root.plan; color: Theme.text; wrap: word-wrap; }
                                     }

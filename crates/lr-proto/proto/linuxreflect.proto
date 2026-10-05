@@ -514,6 +514,8 @@ service LinuxReflect {
   // A CLI affordance beyond spec §I's list: the full layout of one device.
   rpc DiskMap(SourceRef) returns (DiskList);
   rpc ProbeSource(SourceRef) returns (Plan);
+  // backup.create; read-only source planning with the complete backup spec.
+  rpc PlanBackup(BackupSpec) returns (Plan);
   rpc ListSets(SetRef) returns (SetInfo);
   // Named destinations: reading needs disk.read, changing them
   // destination.configure.

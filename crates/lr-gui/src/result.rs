@@ -15,6 +15,32 @@ fn consistency_description(value: &str) -> &'static str {
     }
 }
 
+/// Describe the daemon's prediction, not an already achieved snapshot.
+pub(crate) fn backup_plan(plan: &lr_proto::v1::Plan) -> String {
+    let consistency = match plan.consistency.as_str() {
+        "point-in-time" => "Planned consistency: a point-in-time snapshot.",
+        "offline" => "Planned consistency: the source must remain offline.",
+        "frozen" => "Planned consistency: filesystem writes will pause for the backup.",
+        "per-file" => {
+            "Planned consistency: files will be copied individually, not as one point-in-time snapshot."
+        }
+        "none" | "none (inconsistent)" => {
+            "Planned consistency: live, inconsistent imaging. Data may change during the backup."
+        }
+        _ => "See the technical plan for the daemon's predicted consistency.",
+    };
+    let mut text = format!(
+        "Planned method: {} · Image kind: {}\n{consistency}\n\
+         The daemon checks the source and safety requirements again when the backup starts.",
+        plan.provider, plan.image_kind,
+    );
+    for warning in &plan.warnings {
+        text.push_str("\nNote: ");
+        text.push_str(warning);
+    }
+    text
+}
+
 /// Explain only facts supplied by PrepareRestore; never expose its token.
 pub(crate) fn restore_plan(plan: &lr_proto::v1::RestorePlanInfo) -> String {
     let action = match plan.image_kind.as_str() {
@@ -90,6 +116,27 @@ pub(crate) fn describe(operation: &str, raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn backup_review_reports_daemon_prediction_and_preserves_warnings() {
+        let plan = lr_proto::v1::Plan {
+            provider: "file".into(),
+            image_kind: "File".into(),
+            consistency: "per-file".into(),
+            warnings: vec!["Source files may change".into()],
+            ..Default::default()
+        };
+        let text = super::backup_plan(&plan);
+        assert!(text.contains("Planned method: file"));
+        assert!(text.contains("not as one point-in-time snapshot"));
+        assert!(text.contains("Source files may change"));
+        assert!(text.contains("checks the source"));
+        let text = super::backup_plan(&lr_proto::v1::Plan {
+            consistency: "future-consistency".into(),
+            ..Default::default()
+        });
+        assert!(!text.contains("point-in-time snapshot"));
+    }
+
     #[test]
     fn restore_review_preserves_warnings_and_never_exposes_authorization() {
         let plan = lr_proto::v1::RestorePlanInfo {

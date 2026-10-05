@@ -102,6 +102,31 @@ pub(crate) fn connect_callbacks(ui: &MainWindow, actions: &Arc<Actions>) {
         });
     }
     {
+        let weak = ui.as_weak();
+        let actions = Arc::clone(actions);
+        ui.on_backup_inputs_changed(move || {
+            actions
+                .shared
+                .backup_review
+                .lock()
+                .expect("backup review lock")
+                .begin();
+            if let Some(ui) = weak.upgrade() {
+                let had_error = !ui.get_backup_plan_error().is_empty();
+                backup_feedback::clear(&ui);
+                if had_error && !ui.get_busy() {
+                    *actions.shared.failure.lock().expect("failure lock") = None;
+                    ui.set_phase("idle".into());
+                    ui.set_status("Backup settings changed. Choose Next to plan again.".into());
+                }
+                if ui.get_backup_step() == 2 {
+                    ui.set_backup_step(1);
+                    ui.set_status("Backup settings changed. Review the new selection.".into());
+                }
+            }
+        });
+    }
+    {
         let ui = ui.as_weak();
         let actions = Arc::clone(actions);
         ui.upgrade().expect("ui").on_probe_source(move || {
