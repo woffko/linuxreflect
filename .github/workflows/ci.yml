@@ -83,8 +83,9 @@ jobs:
     runs-on: ubuntu-24.04
     container:
       image: debian:13-slim
-      # /lib/modules lets modprobe load the runner kernel's modules (nbd).
-      options: --privileged -v /dev:/dev -v /lib/modules:/lib/modules:ro
+      # The runner kernel's modules, so modprobe can load nbd. They are not
+      # mounted at /lib/modules: linux-image-amd64 installs its own there.
+      options: --privileged -v /dev:/dev -v /lib/modules:/host-modules:ro
     steps:
       - uses: actions/checkout@v4
       - name: Install test tooling
@@ -122,6 +123,7 @@ jobs:
           # Only the polkitd user may own polkit's bus name.
           setpriv --reuid=polkitd --regid=polkitd --clear-groups \
             /usr/lib/polkit-1/polkitd --no-debug &
+          [ -e "/lib/modules/$(uname -r)" ] || ln -s "/host-modules/$(uname -r)" "/lib/modules/$(uname -r)"
           modprobe nbd nbds_max=16 || echo "nbd is not available on this runner kernel"
           # The GUI lifecycle test needs a display; the GUI root tests start
           # their own Xvfb. The whole-disk boot tests need a kernel in /boot.
