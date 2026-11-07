@@ -1996,3 +1996,28 @@ every guarded destination on those machines. The parser now keeps a
 non-path root as reported and requires only the mount point to be absolute. A
 non-path root is never `/`, so a required mount with one is still refused as a
 non-root projection.
+
+## D-138 — The specification gains live ext4 images (v2.2)
+
+The specification is frozen except where the maintainer amends it. In
+November 2026 the maintainer asked for live backups of running Debian and
+Ubuntu systems on plain ext4 that restore onto another disk and boot. v2.1 had
+no live block path for them: the freeze provider excludes `/`, `live-none` can
+tear blocks, and the whole-disk route is offline-only (D-136).
+
+v2.2 adds the tracked-freeze provider (spec §E.7, Slice 18): a converging copy
+whose writes are recorded through a private ftrace instance on the block-layer
+bio submission tracepoint, followed by one bounded freeze during which only the
+remaining dirty chunks are read, into memory, before anything is written. The
+image reflects the frozen instant and is reported as `Frozen`, never as a
+snapshot. The alternatives were rejected for risk: `blksnap` and `dattobd` put
+out-of-tree code into the root I/O path and need DKMS builds and MOK
+enrolment under Secure Boot; the managed DM layer changes the boot chain;
+freezing `/` for the whole read stalls the system; `live-none` is not
+consistent. The provider is opt-in until Slice 18's field results decide the
+default (spec §M.4). The implementation plan, with its risks and their
+controls, is `docs/live-backup-plan.md`.
+
+Slice 18 supersedes D-136's "whole-disk reads remain offline-only" for disks
+whose filesystem partitions are all covered by tracked-freeze; every other
+whole-disk source stays offline-only.

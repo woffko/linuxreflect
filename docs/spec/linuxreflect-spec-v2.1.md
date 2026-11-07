@@ -1,6 +1,6 @@
-# LinuxReflect — Technical Specification v2.1
+# LinuxReflect — Technical Specification v2.2
 
-**Status:** implementer-ready draft. Supersedes v2.0. Incorporates external review R1 (developer, Sep 2026) and internal self-review R0. Every change is logged in Appendix A with the review item that triggered it.
+**Status:** implementer-ready draft. v2.2 (November 2026) amends v2.1 with live block images of plain ext4 partitions on Debian and Ubuntu (§E.7, Slice 18); the amendment is logged in Appendix A.2, and the file keeps its v2.1 name so existing links stay valid. v2.1 superseded v2.0. Incorporates external review R1 (developer, Sep 2026) and internal self-review R0. Every change is logged in Appendix A with the review item that triggered it.
 
 **Audience:** an AI coding agent (Codex-style) implementing from this document, plus the human maintainer/reviewer loop. The document is written so that the agent does not have to make architectural decisions; where a decision is deliberately deferred, it is listed in §M.
 
@@ -20,6 +20,8 @@ Linux has no VSS. A live, point-in-time **block** snapshot of a mounted filesyst
 - provides **quiesced** (frozen) or **offline** backups where it does not;
 - always reports the **consistency level actually achieved** (§D.2) instead of silently degrading;
 - never fakes a snapshot.
+
+**v2.2:** Debian and Ubuntu install plain ext4 partitions by default, which left a running system with no live block path. The **tracked-freeze** provider (§E.7) closes that gap without a snapshot layer, a kernel module or a change to the boot chain: it copies the used blocks while the system runs, records every write the block layer issues to the source partitions, re-copies what changed until the remainder is small, and reads that remainder with the filesystems frozen for a bounded moment (seconds at most). The image reflects that one instant and is reported as `Frozen`; it is not a snapshot and is never reported as one. A whole-disk image made this way restores onto another disk and boots like an offline one.
 
 ### A.2 MVP (first deliverable)
 
@@ -48,12 +50,12 @@ Slices 1–11 (§K): `lr-core`, `lr-format`, `lr-crypto`, `lr-fsmap`, `lr-snapsh
 
 | Platform | Notes |
 |---|---|
-| Debian 12+, Ubuntu 22.04+ | Default installs use plain ext4 → Frozen/Offline/None consistency unless LVM was chosen at install. |
+| Debian 12+, Ubuntu 22.04+ | Default installs use plain ext4 → live `Frozen` images, the root filesystem included, through the tracked-freeze provider (§E.7) where its probe passes; otherwise Frozen (non-root)/Offline/None, unless LVM was chosen at install. |
 | Fedora 40+ | Default Btrfs → Stream mode, point-in-time. |
 | RHEL/Alma/Rocky 9 (kernel 5.14 + backports), RHEL 10 | LVM/XFS typical → point-in-time via LVM. No Btrfs. |
 | Arch | Varies. |
 
-There is **no** hard kernel-version check. `lr-core::caps::probe()` detects at runtime: `nbd` module loadable, `ublk` present (`/dev/ublk-control`), `fsfreeze` ioctls, `O_DIRECT` on target, `btrfs send` availability, `lvm2` tools, `polkit` version (pidfd subject support ≥ 121). Missing capabilities disable features with a clear error. The Freeze provider logs a warning on kernels < 5.17 (upstream fix "vfs: make freeze_super abort when sync_filesystem returns error"; backports unknown) — the deadman timer (§E.4) makes it safe regardless.
+There is **no** hard kernel-version check. `lr-core::caps::probe()` detects at runtime: `nbd` module loadable, `ublk` present (`/dev/ublk-control`), `fsfreeze` ioctls, `O_DIRECT` on target, `btrfs send` availability, `lvm2` tools, `polkit` version (pidfd subject support ≥ 121), tracefs with the block-layer write tracepoints and a passing write-tracking self-test (§E.7). Missing capabilities disable features with a clear error. The Freeze provider logs a warning on kernels < 5.17 (upstream fix "vfs: make freeze_super abort when sync_filesystem returns error"; backports unknown) — the deadman timer (§E.4) makes it safe regardless.
 
 ---
 
@@ -200,7 +202,7 @@ Whole-disk images are `Block` with a multi-partition manifest (§G.7).
 | Level | Meaning | Produced by |
 |---|---|---|
 | `PointInTime` | All blocks/tree reflect one instant; filesystem quiesced at that instant | LVM snapshot (origin suspended with lockfs → fs frozen during snapshot creation), Btrfs read-only snapshot |
-| `Frozen` | Filesystem frozen (`FIFREEZE`) for the **whole** read; point-in-time but writers blocked for the duration | Freeze provider (non-root volumes only) |
+| `Frozen` | Filesystem frozen (`FIFREEZE`) and every block reflects the frozen instant: frozen for the **whole** read (writers blocked for the duration), or only for the final read of a write-tracked converging copy (§E.7) | Freeze provider (non-root volumes only); tracked-freeze provider (ext4, root included) |
 | `Offline` | Device not mounted and has no holders during the read | Offline provider, rescue environment |
 | `PerFile` | Each file consistent as read; no cross-file point in time | File mode without tree snapshot |
 | `None` | Live raw read of a mounted device; torn blocks possible | `--allow-inconsistent` only; image flagged |
@@ -228,11 +230,12 @@ Order of evaluation per source (first `Support::Yes` wins unless overridden by `
 1. **Btrfs** filesystem → `TreeSnapshotProvider::btrfs` → image kind `Stream`, `PointInTime`.
 2. **LVM logical volume** (classic or thin) → `BlockSnapshotProvider::lvm` → `Block`, `PointInTime`.
 3. **Device not mounted, no holders** → `offline` → `Block`, `Offline`.
-4. **Mounted plain partition, not root, destination on another filesystem** → `freeze` (opt-in via `--snapshot freeze` or `auto` with `--allow-freeze`) → `Block`, `Frozen`.
-5. **Mounted plain partition (root or otherwise) with `--allow-inconsistent`** → `live-none` → `Block`, `None`.
-6. Otherwise → error `E_NO_CONSISTENT_METHOD` with the concrete options: boot rescue/live media (Offline), use file mode (Slice 12), or `--allow-inconsistent`.
+4. **Mounted ext4 directly on a partition or disk (root included), tracked-freeze probe passes, destination and spool on another filesystem** → `tracked-freeze` (opt-in via `--snapshot tracked-freeze` or `auto` with `--allow-freeze`) → `Block`, `Frozen` (§E.7).
+5. **Mounted plain partition, not root, destination on another filesystem** → `freeze` (opt-in via `--snapshot freeze` or `auto` with `--allow-freeze`) → `Block`, `Frozen`.
+6. **Mounted plain partition (root or otherwise) with `--allow-inconsistent`** → `live-none` → `Block`, `None`.
+7. Otherwise → error `E_NO_CONSISTENT_METHOD` with the concrete options: boot rescue/live media (Offline), tracked-freeze where §E.7 applies, use file mode (Slice 12), or `--allow-inconsistent`.
 
-Whole-disk sources evaluate each partition independently; the run proceeds only if every partition has a method, and reports per-partition levels. Snapshots of different partitions are **not** mutually atomic — documented in output.
+Whole-disk sources evaluate each partition independently; the run proceeds only if every partition has a method, and reports per-partition levels. Snapshots of different partitions are **not** mutually atomic — documented in output. Exception: the tracked-freeze provider freezes every tracked filesystem of one disk together for its final read, so those partitions reflect the same instant; a partition on that disk that cannot be frozen (an ESP) follows the quiet-window rule of §E.7.
 
 ### E.1 Btrfs provider (Stream)
 
@@ -266,7 +269,7 @@ Sequence:
 5. `FITHAW`; `systemctl stop lr-thaw-<job>.timer` (ignore not-found); flush ring buffer to journald.
 6. If the read exceeds `--freeze-timeout`, abort the job first, then thaw → `E_FREEZE_TIMEOUT`.
 
-Consistency: `Frozen`. This is a quiesced backup mode, explicitly **not** equivalent to a snapshot: writers on that filesystem block for the entire duration.
+Consistency: `Frozen`. This is a quiesced backup mode, explicitly **not** equivalent to a snapshot: writers on that filesystem block for the entire duration. (The tracked-freeze provider, §E.7, freezes only for its final read, which is why it may freeze `/`.)
 
 ### E.5 Live-none provider
 
@@ -277,6 +280,49 @@ Reads the mounted device as-is. Requires `--allow-inconsistent`. Manifest flag `
 - `zfs` (TreeSnapshotProvider → Stream via `zfs send -i`).
 - `blksnap` (BlockSnapshotProvider with real CBT), `--features blksnap`, runtime `modprobe` check; unsupported on kernels where the DKMS module fails to build.
 - **Managed DM layer** (`lr-dmwrap`): opt-in installer/initramfs hook that places a `linear` DM device over selected partitions *before* mount, so that a `snapshot-origin` reload becomes possible later. Requires fstab/crypttab/bootloader changes; documented risks; never enabled implicitly.
+
+For plain ext4, v2.2 prefers the tracked-freeze provider (§E.7) to both `blksnap` and the managed DM layer: it needs neither an out-of-tree module (DKMS builds per kernel, MOK enrolment under Secure Boot, third-party code in the root I/O path) nor a boot-chain change. Both stay in the post-MVP backlog.
+
+### E.7 Tracked-freeze provider (Block, ext4, v2.2)
+
+A live, write-tracked, converging copy of ext4 filesystems that sit directly on a partition or a whole disk, the root filesystem included, ending with one short freeze. It uses only interfaces in stock Debian and Ubuntu kernels: tracefs block tracepoints, `FIFREEZE`/`FITHAW` and `O_DIRECT`.
+
+**Scope.** ext4 directly on a partition or disk; nothing (dm, md, LVM, LUKS, loop) between the filesystem and the disk. LVM and Btrfs keep their own providers. Other freezable filesystems (xfs) may join later with their own Slice 18 acceptance. On a whole disk the provider covers every ext4 partition of that disk; swap stores its header only (§G.7); a vfat ESP and other non-freezable or non-filesystem partitions follow the quiet-window rule below.
+
+**Preconditions** (all MUST hold, else `Support::No` with the reason):
+- tracefs is mounted (or mountable) at `/sys/kernel/tracing` and the block-layer bio submission tracepoint (`block:block_bio_queue`) is available; the probe names the tracepoint it uses;
+- the write-tracking **self-test** passes: on a private loop device backed by a file on a tmpfs the provider owns, writes at known offsets of a partition appear in the trace with the expected device and sectors (this validates the kernel's tracepoint, never the source, which is not written);
+- every source filesystem supports `FIFREEZE` and none is already frozen;
+- the destination, the job spool and every file the job writes are on a different filesystem from every source filesystem and not on a device backing one (`st_dev` and holder checks);
+- memory for the final read (`final_max`, below) is available.
+
+**Sequence.**
+1. Arm the external deadman of §E.4 for every source filesystem, timed to the final-freeze budget plus its grace.
+2. Create a private ftrace instance `/sys/kernel/tracing/instances/lr-<job>`, size its per-CPU buffers (default 16 MiB), filter the tracepoint to the source disk's `dev_t`, enable it, and start a consumer that turns every write-class event (write, write with flush or FUA, discard, secure erase, write-zeroes) into dirty sector ranges intersected with the source partitions.
+3. **Barrier:** freeze and immediately thaw each source filesystem once. A freeze completes every write already submitted, so after the barrier no write that predates tracing can still change the disk.
+4. **Pass 1:** take the used-block map (§F), read those chunks with `O_DIRECT` and write them to the image.
+5. **Pass n:** swap out the dirty set accumulated since the previous pass started, re-read those chunks with `O_DIRECT` and append them to the image. Stop when the dirty bytes fit the final budget: at most `final_max` (default 256 MiB) and at most half of what the passes measured can be read in `freeze_max`. A pass that does not shrink the dirty set counts against `max_passes` (default 10); on exhaustion the job aborts with `E_NO_CONVERGENCE` and names the options (a quieter time, rescue media, file mode). It never degrades to `None`.
+6. **Final read:** run the pre-freeze hooks; switch job logging to the in-memory ring buffer; freeze every source filesystem of the disk (root last); drain the consumer until the instance's buffers are empty; read every dirty chunk into memory with `O_DIRECT`; thaw (reverse order); disarm the deadman; flush the logs; run the post-thaw hooks; then append the chunks read under the freeze. Nothing is written to any filesystem while it is frozen; the freeze covers reads only. If the final read exceeds `freeze_max` (default 3 s, hard cap 30 s), thaw first, then abort with `E_FREEZE_TIMEOUT`.
+7. **Integrity checks:** the instance's per-CPU `overrun` and `dropped events` counters MUST be zero for the whole job, else `E_TRACKING_LOST`; the partition table hash (§H.2) and each filesystem's UUID and block count MUST be unchanged since step 2, else `E_SOURCE_CHANGED`. A failed check publishes nothing.
+8. **Teardown (`Drop`):** disable and remove the ftrace instance and disarm the deadman, on success and on every failure.
+
+**Why the result is consistent** (normative argument; tests in Slice 18 MUST exercise it). On-disk content changes only through writes the block layer issues, and the tracepoint fires when each one is submitted. Tracing starts before the barrier, and the barrier completes every earlier write, so every write that can change the disk after the barrier is recorded. The final read happens with the filesystems frozen, which completes all writes in flight and blocks new ones. Every chunk whose content at the frozen instant differs from its last copy was therefore written after that copy began, is in the dirty set, and is read under the freeze. A block allocated after pass 1 was written, so it is dirty; a block freed later holds data nothing references. The image is the filesystem as `FIFREEZE` leaves it: journal flushed, clean, as at the creation of an LVM snapshot. Applications that need their own quiescence use the hooks.
+
+**`O_DIRECT` is mandatory** for every source read: a buffered read of the block device can return page-cache pages that file writes have made stale.
+
+**Quiet-window rule.** A partition that cannot be frozen (a vfat ESP) or holds no filesystem (BIOS boot) is copied in the same passes. It is consistent when its dirty set stays empty from the start of its last read until the thaw; then it is reported with the disk's `Frozen` level. Otherwise the job aborts unless `--allow-inconsistent` was given, in which case that partition alone is reported `None`.
+
+**Hooks.** Executables in `/etc/linuxreflect/hooks/pre-freeze.d/` and `post-thaw.d/` (root-owned, not group- or world-writable) run in name order with a timeout (default 30 s). A failed pre-freeze hook aborts the job before anything is frozen; post-thaw hooks always run after a pre-freeze hook ran.
+
+**Package transactions (Debian, Ubuntu).** While the dpkg lock (`/var/lib/dpkg/lock-frontend` or `/var/lib/dpkg/lock`) is held, the final freeze is postponed and further passes run, up to `max_passes`; then the job aborts with `E_NO_CONVERGENCE` naming the package transaction. The locks are inspected with `F_OFD_GETLK`, never taken. An image taken in the middle of a package transaction could hold a half-installed kernel or initramfs and not boot.
+
+**Sleep, shutdown and leftovers.** The daemon holds a logind inhibitor lock (`sleep:shutdown`, mode `block`) from step 1 until teardown. At start, the daemon removes ftrace instances named `lr-*` that a killed daemon left behind, as it sweeps orphaned snapshots.
+
+**Report.** Per partition: `Frozen` (or `None` under the quiet-window exception), the tracepoint used, the number of passes, the bytes re-copied, and the measured duration of the final freeze.
+
+**Image format.** No change. A chunk may be stored more than once in one image; the manifest names its last copy and earlier records are unreferenced. `verify` checks the records the manifest references, and a future `lrimg repair` (§G.5) MUST NOT assume one record per chunk.
+
+**Restore.** Unchanged (§H): the target is an unmounted disk of at least the source size, and the restored disk boots like one restored from an offline image. A copy restored to a second disk of the same machine carries the source's partition and filesystem UUIDs; the restore plan MUST say so and that the source disk must be detached, or the firmware pointed at the copy, before the copy is booted with both present.
 
 ---
 
@@ -421,11 +467,11 @@ After a whole-disk restore: UEFI — locate the ESP, ensure `\EFI\BOOT\BOOTX64.E
 linuxreflect
   disk list [--json]
   disk map <device> [--json]
-  probe --source <dev|path> [--snapshot auto|btrfs|lvm|freeze|offline|none] [--mode auto|block|stream]
+  probe --source <dev|path> [--snapshot auto|btrfs|lvm|freeze|tracked-freeze|offline|none] [--mode auto|block|stream]
   backup create --source <dev|path>... --dest <uri> --set <name>
                 --type full|incremental|differential [--parent latest|<uuid>]
-                [--mode auto|block|stream] [--snapshot auto|btrfs|lvm|freeze|offline|none]
-                [--allow-freeze] [--freeze-timeout 300s] [--allow-inconsistent]
+                [--mode auto|block|stream] [--snapshot auto|btrfs|lvm|freeze|tracked-freeze|offline|none]
+                [--allow-freeze] [--freeze-timeout 300s] [--freeze-max 3s] [--allow-inconsistent]
                 [--chunk-size 1MiB] [--compress zstd:9] [--no-encrypt|--passphrase-file <p>]
                 [--lvm-cow-size <size>] [--on-bad-sector abort|record] [--dry-run] [--json]
   backup list --dest <uri> [--set <name>] [--json]
@@ -544,6 +590,9 @@ AC: boots on OVMF with Secure Boot enabled and on SeaBIOS; bare-metal restore th
 
 **S17 — Hardening matrix.** ext4/xfs/btrfs/fat32/ntfs(raw) × BIOS/UEFI; `dm-flakey` bad sectors; SMB/NFS/SFTP interruption; multi-TB sparse-disk metadata scaling test (16 TB virtual, RSS bound).
 
+**S18 — Live ext4 images (tracked-freeze, v2.2).** The §E.7 provider for partitions and whole disks, its probe and self-test, hooks, the CLI/config/GUI options (`tracked-freeze`, `--freeze-max`), the report fields and the new errors.
+AC: (a) unit and fixture tests for dirty-range algebra, the tracepoint parser on recorded samples, overrun detection and the convergence budget; (b) root tests on owned loop disks: an ext4 filesystem mounted and under a concurrent writer (random overwrites, appends to a checksummed sequence log with `fsync`, `fstrim`) is imaged with tracked-freeze and restored to another loop disk; `e2fsck -fn` is clean, the restored log is an exact prefix of the written one ending between the freeze's start and end, and every file whose last write completed before the freeze has its final content; (c) negative root tests: a forced overrun (tiny buffer, heavy writer) → `E_TRACKING_LOST` and nothing published; a writer faster than the budget → `E_NO_CONVERGENCE`; a daemon SIGKILLed during the final freeze → the deadman thaws within its grace; a destination on a source filesystem → refused before tracing starts; an exceeded `freeze_max` → thaw, then `E_FREEZE_TIMEOUT`; a partition table changed mid-job → `E_SOURCE_CHANGED`; (d) VM acceptance under qemu/KVM for Debian 12, Debian 13, Ubuntu 22.04 and Ubuntu 24.04 installed on plain ext4 (UEFI with Secure Boot for all, BIOS for one Debian and one Ubuntu): with a write workload running, take a live whole-disk image of the running system disk to a second disk, restore it to a third disk of equal or larger size, and boot only the third disk under the same firmware; it reaches `multi-user.target` with a clean filesystem check and passes the log-prefix check, the report says `Frozen` for root and the ESP met the quiet-window rule, and the measured freeze is within `freeze_max`; (e) on a kernel without the tracepoint or tracefs the probe reports `Support::No` with the reason and `auto` never selects the provider.
+
 **Post-MVP backlog:** ZFS, blksnap provider, managed DM layer, consolidation/synthetic full, `--grow-last`/shrink, LVM/LUKS-aware whole-disk, NTFS/FAT used maps, sub-chunk change detection, `lrimg repair`, passphrase change, PXE, cloud destinations, email.
 
 ---
@@ -554,11 +603,12 @@ AC: boots on OVMF with Secure Boot enabled and on SeaBIOS; bare-metal restore th
 - Sources are opened `O_RDONLY`; snapshots are read-only; nothing in a backup path may write to a source device.
 - Writes to a device happen only in `restore apply` with a valid token, `--confirm`, `auth_admin`, and re-validated target facts.
 - Images are write-once; finalize = fsync + rename; a file without a valid footer is never restorable and never resumed.
-- Snapshot/freeze teardown is guaranteed by `Drop`; the Freeze provider additionally has the out-of-process deadman.
+- Snapshot/freeze teardown is guaranteed by `Drop`; the Freeze and tracked-freeze providers additionally have the out-of-process deadman, and the tracked-freeze provider removes its ftrace instance in `Drop`.
+- Nothing is written to a filesystem while the job holds it frozen; a frozen period covers reads only.
 - The daemon never logs secrets; passphrase files are read with `O_NOFOLLOW`, mode checked (0600), contents zeroized (`zeroize`).
 
 ### L.2 Error contract
-`lr_core::Error` variants: `Io`, `BadSector{offset,len}`, `NoSpace`, `NetworkTimeout`, `SnapshotOverflow`, `FreezeTimeout`, `NoConsistentMethod{options}`, `SetLocked{owner}`, `TargetChanged`, `TargetBusy{holder}`, `Aead`, `Corrupt{what}`, `Unsupported{cap}`. Bad sectors: recorded as state 3 in the manifest (never silently zero-filled) or abort per `--on-bad-sector`. ENOSPC/overflow: abort, delete `.tmp`, release lock, leave prior images intact. Network: bounded retries with backoff, then atomic abort.
+`lr_core::Error` variants: `Io`, `BadSector{offset,len}`, `NoSpace`, `NetworkTimeout`, `SnapshotOverflow`, `FreezeTimeout`, `NoConsistentMethod{options}`, `NoConvergence{dirty_bytes,passes}`, `TrackingLost{reason}`, `SourceChanged{what}`, `SetLocked{owner}`, `TargetChanged`, `TargetBusy{holder}`, `Aead`, `Corrupt{what}`, `Unsupported{cap}`. Bad sectors: recorded as state 3 in the manifest (never silently zero-filled) or abort per `--on-bad-sector`. ENOSPC/overflow: abort, delete `.tmp`, release lock, leave prior images intact. Network: bounded retries with backoff, then atomic abort.
 
 ### L.3 Logging
 `tracing` spans per job/phase; journald in the daemon; ring buffer while frozen; one structured completion record per job with achieved consistency and byte counts.
@@ -575,13 +625,14 @@ All versions in `[workspace.dependencies]` as exact tested versions (`=x.y.z` or
 
 1. **Slint license:** GPLv3 vs Royalty-Free (attribution) vs commercial — a product decision; affects only `lr-gui`.
 2. **Bloom filter size vs RAM on rescue media** for Stream/File dedup (default 64 MiB; rescue images may have 2 GiB RAM).
-3. **Managed DM layer**: whether to ship the opt-in installer hook at all, given fstab/bootloader coupling.
+3. **Managed DM layer**: whether to ship the opt-in installer hook at all, given fstab/bootloader coupling. (v2.2: not needed for plain ext4, §E.7.)
+4. **Tracked-freeze by default**: in v2.2 the provider is opt-in (`--snapshot tracked-freeze`, or `auto` with `--allow-freeze`). Whether plain `auto` selects it is decided from Slice 18 field results.
 
 ## N. Assumptions (override if wrong)
 
 - GUI = Slint; CLI-first MVP; custom `.lrimg` format; NBD as baseline export.
 - Btrfs is handled in Stream mode rather than block mode; ZFS follows the same model later.
-- Raw root partitions have no live block path in v1 (Frozen for non-root, Offline via live/rescue media, `None` opt-in).
+- Raw root partitions had no live block path in v2.1. v2.2 adds the tracked-freeze path for ext4 (§E.7); other filesystems on raw partitions keep Frozen for non-root, Offline via live/rescue media, `None` opt-in.
 - Retention is chain-granular until consolidation exists.
 
 ---
@@ -611,6 +662,12 @@ All versions in `[workspace.dependencies]` as exact tested versions (`=x.y.z` or
 | 19 | Root-daemon cannot post session notifications | R0 | `lr-session` user service |
 | 20 | Schedule grammar undefined; O_DIRECT alignment; FIFREEZE constants; polkit in CI | R0 | §J.4 OnCalendar verbatim; `AlignedBuf`; `lr-unsafe`; `StaticBackend` |
 
+## Appendix A.2 — Amendment log (v2.1 → v2.2)
+
+| # | Finding | Source | Resolution |
+|---|---|---|---|
+| 21 | Debian and Ubuntu default installs (plain ext4) had no live block path: a running system could not be imaged and restored onto another disk without rescue media | Maintainer request, November 2026 | §A.1, §A.4, §D.2, §E steps 4–7, §E.4 note, §E.6 note, §E.7, §J.1, §L.1, §L.2, §K S18, §M.4, §N; decision D-138 |
+
 ## Appendix B — Prior art
 
-Clonezilla/Rescuezilla/partclone (used-block imaging, rescue media), Veeam Agent for Linux (closest commercial equivalent; relies on an out-of-tree module), restic/Borg/kopia (CDC, dedup, encrypted repositories), ReaR (bare-metal layout capture and recreation), Timeshift/Snapper (Btrfs/LVM snapshot orchestration), FSArchiver (filesystem-level images with resize on restore).
+Clonezilla/Rescuezilla/partclone (used-block imaging, rescue media), Veeam Agent for Linux (closest commercial equivalent; relies on an out-of-tree module), the QEMU guest agent's `guest-fsfreeze-freeze` (freezes every mounted filesystem, `/` included, for the moment a hypervisor snapshot takes — the operational precedent for §E.7's short root freeze), QEMU's drive-mirror (converging copy of a disk that is being written), restic/Borg/kopia (CDC, dedup, encrypted repositories), ReaR (bare-metal layout capture and recreation), Timeshift/Snapper (Btrfs/LVM snapshot orchestration), FSArchiver (filesystem-level images with resize on restore).
