@@ -271,9 +271,14 @@ fn parse_mountinfo(text: &str) -> Result<Vec<MountInfo>> {
             .map_err(|_| Error::corrupt("could not parse mount ID in mountinfo"))?;
         let root = PathBuf::from(decode_field(before[3])?);
         let target = PathBuf::from(decode_field(before[4])?);
-        if !root.is_absolute() || !target.is_absolute() {
+        // The mount point is always absolute, but a pseudo filesystem's root
+        // can be a name rather than a path: a bind-mounted namespace file
+        // reads `mnt:[4026532260]` (snapd does this on every Ubuntu desktop).
+        // Such a root is kept as reported. It is never `/`, so a required
+        // mount with it is still refused as a non-root projection.
+        if !target.is_absolute() {
             return Err(Error::corrupt(
-                "mountinfo root and mount point must be absolute paths",
+                "mountinfo mount point must be an absolute path",
             ));
         }
         mounts.push(MountInfo {
@@ -573,6 +578,75 @@ mod tests {
                 36,
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_namespace_file_mount_elsewhere_does_not_break_the_check() {
+        // snapd on Ubuntu bind-mounts mount-namespace files; the kernel reports
+        // their root as a name (`mnt:[...]`), not a path.
+        let policy = RequiredMount {
+            path: "/mnt/backup".into(),
+            source: "nas:/exports/backup".into(),
+            fs_type: "nfs4".into(),
+        };
+        let text = "1 0 8:2 / / rw - ext4 /dev/sda2 rw\n\
+                    1145 1 0:4 mnt:[4026532260] /run/snapd/ns/firefox.mnt rw - nsfs nsfs rw\n\
+                    36 1 0:32 / /mnt/backup rw - nfs4 nas:/exports/backup rw\n";
+        assert!(
+            check_mountinfo(
+                &policy,
+                Path::new("/mnt/backup"),
+                Path::new("/mnt/backup/laptop"),
+                text,
+                36,
+                36,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_namespace_file_mount_is_not_a_required_share() {
+        let policy = RequiredMount {
+            path: "/run/snapd/ns/firefox.mnt".into(),
+            source: "nsfs".into(),
+            fs_type: "nsfs".into(),
+        };
+        let text = "1145 1 0:4 mnt:[4026532260] /run/snapd/ns/firefox.mnt rw - nsfs nsfs rw\n";
+        let error = check_mountinfo(
+            &policy,
+            Path::new("/run/snapd/ns/firefox.mnt"),
+            Path::new("/run/snapd/ns/firefox.mnt"),
+            text,
+            1145,
+            1145,
+        )
+        .expect_err("a namespace file is not a share");
+        assert!(
+            error.to_string().contains("non-root mount projection"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_relative_mount_point_is_still_refused() {
+        let policy = RequiredMount {
+            path: "/mnt/backup".into(),
+            source: "nas:/exports/backup".into(),
+            fs_type: "nfs4".into(),
+        };
+        let text = "36 1 0:32 / mnt/backup rw - nfs4 nas:/exports/backup rw\n";
+        assert!(
+            check_mountinfo(
+                &policy,
+                Path::new("/mnt/backup"),
+                Path::new("/mnt/backup/laptop"),
+                text,
+                36,
+                36,
+            )
+            .is_err()
         );
     }
 

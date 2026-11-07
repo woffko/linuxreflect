@@ -1984,3 +1984,15 @@ remain expandable. The summary renders the daemon's prediction and warnings,
 not a second provider decision made from dropdown values. NFS/SMB destinations
 continue to use mounted paths; this change does not relax mount guards or
 certify live disk imaging, restore readiness or network outage recovery.
+
+## D-137 — A pseudo filesystem's mountinfo root can be a name
+
+`/proc/self/mountinfo` always reports an absolute mount point, but a pseudo
+filesystem's root is whatever its dentry name operation returns: a
+bind-mounted namespace file reads `mnt:[4026532260]`. snapd creates such
+mounts on every Ubuntu desktop (`/run/snapd/ns/*.mnt`), so the D-126/D-128
+parser, which refused the whole table when any root was not absolute, refused
+every guarded destination on those machines. The parser now keeps a
+non-path root as reported and requires only the mount point to be absolute. A
+non-path root is never `/`, so a required mount with one is still refused as a
+non-root projection.
