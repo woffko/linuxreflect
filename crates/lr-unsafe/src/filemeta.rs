@@ -263,9 +263,12 @@ pub fn filesystem_type(fd: &impl AsRawFd) -> io::Result<i64> {
     if unsafe { libc::fstatfs(fd.as_raw_fd(), &mut stat) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    // The field is 32 or 64 bits depending on the Linux target architecture.
-    #[allow(clippy::useless_conversion)]
-    let kind = i64::from(stat.f_type);
+    // The field's type depends on the target and the C library: `i64` with
+    // glibc on x86_64, `u64` with musl (the static rescue CLI), 32 bits on
+    // some architectures. Filesystem magics are 32-bit values, so each fits.
+    #[allow(clippy::useless_conversion, clippy::unnecessary_fallible_conversions)]
+    let kind = i64::try_from(stat.f_type)
+        .map_err(|_| io::Error::other("statfs filesystem type out of range"))?;
     Ok(kind)
 }
 
