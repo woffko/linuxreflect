@@ -98,7 +98,7 @@ jobs:
             xvfb xauth xdotool weston linux-image-amd64 \
             libx11-6 libx11-xcb1 libxcursor1 libxrandr2 libxi6 libxkbcommon0 \
             libxkbcommon-x11-0 libwayland-client0 libfontconfig1 fonts-dejavu-core \
-            rsync openssh-server openssh-client nbd-client kmod procps \
+            rsync acl openssh-server openssh-client nbd-client kmod procps \
             dbus-daemon python3 python3-dbus python3-gi polkitd
       - name: Install Rust
         run: |
@@ -125,6 +125,9 @@ jobs:
             /usr/lib/polkit-1/polkitd --no-debug &
           [ -e "/lib/modules/$(uname -r)" ] || ln -s "/host-modules/$(uname -r)" "/lib/modules/$(uname -r)"
           modprobe nbd nbds_max=16 || echo "nbd is not available on this runner kernel"
+          # Root tests run the workspace's own binaries (the daemon, the
+          # session helper), which `cargo test` alone does not build.
+          cargo build --workspace
           # The GUI lifecycle test needs a display; the GUI root tests start
           # their own Xvfb. The whole-disk boot tests need a kernel in /boot.
           xvfb-run -a cargo test --workspace --no-fail-fast -- --ignored --nocapture --test-threads=1
