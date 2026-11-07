@@ -25,8 +25,8 @@ by Cargo).
 | serde | 1.0.229 | Locked | lr-core, lr-format, lr-store, lr-proto, lr-cli |
 | serde_json | 1.0.151 | Locked | lr-core, lr-store, lr-cli |
 | toml | 1.1.6 | Locked | lr-engine config and job files (S14) |
-| tokio | 1.53.1 | Locked | lr-store, lr-daemon |
-| zstd | 0.14.0 | Locked | lr-format (S4) |
+| tokio | 1.53.3 | Locked | lr-store, lr-daemon |
+| zstd | 0.14.3 | Locked | lr-format (S4) |
 | aes-gcm | 0.11.1 | Locked, KAT-verified | lr-crypto (S3) |
 | chacha20poly1305 | 0.11.0 | Locked, KAT-verified | lr-crypto (S3) |
 | argon2 | 0.6.0 | Locked, KAT-verified | lr-crypto (S3) |
