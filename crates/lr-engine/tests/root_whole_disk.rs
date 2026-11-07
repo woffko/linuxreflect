@@ -29,6 +29,9 @@ const BOOT_TIMEOUT: Duration = Duration::from_secs(90);
 
 const OVMF_CODE: &str = "/usr/share/OVMF/OVMF_CODE_4M.fd";
 const OVMF_VARS: &str = "/usr/share/OVMF/OVMF_VARS_4M.fd";
+/// GRUB's platform files; `grub-install` alone cannot install without them.
+const GRUB_BIOS_PLATFORM: &str = "/usr/lib/grub/i386-pc";
+const GRUB_EFI_PLATFORM: &str = "/usr/lib/grub/x86_64-efi";
 
 fn root_tests_enabled() -> bool {
     if std::env::var("LR_ROOT_TESTS").as_deref() != Ok("1") {
@@ -146,11 +149,17 @@ fn build_bootable_disk(disk: &LoopDisk, work: &Path) -> bool {
         "mkfs.vfat",
         "mkfs.ext4",
         "grub-install",
+        "grub-mkstandalone",
         "cpio",
         "gzip",
     ] {
         if !have(tool) {
             lr_testkit::unavailable!(return false; "{tool} missing - the boot test");
+        }
+    }
+    for platform in [GRUB_BIOS_PLATFORM, GRUB_EFI_PLATFORM] {
+        if !Path::new(platform).is_dir() {
+            lr_testkit::unavailable!(return false; "{platform} missing - the boot test");
         }
     }
     let label = disk.label();
@@ -581,6 +590,11 @@ fn an_mbr_disk_round_trips_and_boots() {
     }
     if !have("qemu-system-x86_64") || !have("sfdisk") {
         lr_testkit::unavailable!("qemu or sfdisk missing");
+    }
+    if !have("grub-install") || !Path::new(GRUB_BIOS_PLATFORM).is_dir() {
+        lr_testkit::unavailable!(
+            "grub-install or {GRUB_BIOS_PLATFORM} missing - the MBR boot test"
+        );
     }
     let work = tempfile::tempdir().expect("workdir");
     let Some(source) = LoopDisk::attach(work.path(), "mbr-src.img", SRC_SIZE) else {

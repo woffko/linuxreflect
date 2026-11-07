@@ -33,6 +33,9 @@ pub const RESCUE_MARKER: &str = "LINUXREFLECT-RESCUE-READY";
 /// and the TUI and stays well inside the loader's working range.
 pub const MAX_RESCUE_CLI_BYTES: u64 = 24 * 1024 * 1024;
 
+/// The busybox binary copied into the initramfs.
+const BUSYBOX: &str = "/bin/busybox";
+
 /// What to build.
 #[derive(Debug, Clone)]
 pub struct MediaRequest {
@@ -93,14 +96,12 @@ pub struct MediaReport {
     pub warnings: Vec<String>,
 }
 
-/// Build the rescue image.
-///
-/// # Errors
-/// Returns [`Error::Unsupported`] naming any missing tool or failing command,
-/// so a build failure says exactly what to install.
-pub fn build_media(request: &MediaRequest) -> Result<MediaReport> {
-    let mut steps = Vec::new();
-    let mut warnings = Vec::new();
+/// The first host prerequisite that `request` needs and this machine lacks:
+/// a tool, a GRUB platform directory, busybox, the kernel, or the signed
+/// shim and GRUB for Secure Boot. `None` means [`build_media`] can start;
+/// the build itself can still fail for other reasons.
+#[must_use]
+pub fn missing_prerequisite(request: &MediaRequest) -> Option<String> {
     let mut tools = vec![
         "sgdisk",
         "losetup",
@@ -110,33 +111,57 @@ pub fn build_media(request: &MediaRequest) -> Result<MediaReport> {
         "cpio",
         "gzip",
     ];
+    let mut directories = Vec::new();
     if request.bios {
         tools.push("grub-install");
+        directories.push("/usr/lib/grub/i386-pc");
     }
     if request.uefi && !request.secure_boot {
         tools.push("grub-mkstandalone");
+        directories.push("/usr/lib/grub/x86_64-efi");
     }
-    for tool in tools {
-        if !have(tool) {
-            return Err(Error::unsupported(format!(
-                "{tool} is missing; install it before building the rescue media"
-            )));
-        }
+    if let Some(tool) = tools.into_iter().find(|tool| !have(tool)) {
+        return Some(format!(
+            "{tool} is missing; install it before building the rescue media"
+        ));
+    }
+    if let Some(directory) = directories
+        .into_iter()
+        .find(|directory| !Path::new(directory).is_dir())
+    {
+        return Some(format!(
+            "{directory} is missing; install the GRUB platform files (grub-pc-bin or \
+             grub-efi-amd64-bin)"
+        ));
+    }
+    if !Path::new(BUSYBOX).exists() {
+        return Some("busybox is missing".to_owned());
     }
     if !request.kernel.exists() {
-        return Err(Error::unsupported(format!(
-            "{} does not exist",
-            request.kernel.display()
-        )));
+        return Some(format!("{} does not exist", request.kernel.display()));
     }
     let signed = Path::new(crate::SHIM_SIGNED).exists() && Path::new(crate::GRUB_SIGNED).exists();
     if request.uefi && request.secure_boot && !signed {
-        return Err(Error::unsupported(format!(
+        return Some(format!(
             "Secure Boot needs the signed shim ({}) and GRUB ({}); install shim-signed and \
              grub-efi-amd64-signed, or build with secure_boot = false",
             crate::SHIM_SIGNED,
             crate::GRUB_SIGNED
-        )));
+        ));
+    }
+    None
+}
+
+/// Build the rescue image.
+///
+/// # Errors
+/// Returns [`Error::Unsupported`] naming any missing tool or failing command,
+/// so a build failure says exactly what to install.
+pub fn build_media(request: &MediaRequest) -> Result<MediaReport> {
+    let mut steps = Vec::new();
+    let mut warnings = Vec::new();
+    if let Some(reason) = missing_prerequisite(request) {
+        return Err(Error::unsupported(reason));
     }
     if request.uefi && !request.secure_boot {
         warnings.push(
@@ -400,7 +425,7 @@ fn build_initramfs(request: &MediaRequest) -> Result<PathBuf> {
     ] {
         std::fs::create_dir_all(tree.join(dir)).map_err(Error::Io)?;
     }
-    let busybox = Path::new("/bin/busybox");
+    let busybox = Path::new(BUSYBOX);
     if !busybox.exists() {
         return Err(Error::unsupported("busybox is missing"));
     }

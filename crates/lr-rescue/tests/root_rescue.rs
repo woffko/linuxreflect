@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use lr_rescue::media::{MediaRequest, RESCUE_MARKER, build_media};
+use lr_rescue::media::{MediaRequest, RESCUE_MARKER, build_media, missing_prerequisite};
 use lr_rescue::{
     BootRepairOptions, FilesystemSpec, Firmware, apply_boot_repair, plan_boot_repair,
     plan_layout_recreation,
@@ -91,6 +91,24 @@ fn rescue_cli() -> Option<PathBuf> {
     None
 }
 
+/// qemu's hardware-virtualisation arguments when KVM really works here.
+///
+/// `/dev/kvm` can exist while the kernel offers no KVM (nested virtualisation
+/// switched off in a VM); `-enable-kvm` then makes qemu exit at once, so the
+/// node must open. Without KVM the boots run under TCG: slower, same checks.
+fn kvm_args() -> &'static [&'static str] {
+    let usable = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+        .is_ok();
+    if usable {
+        &["-enable-kvm", "-cpu", "host"]
+    } else {
+        &[]
+    }
+}
+
 /// Boot `disk` and return the serial log.
 fn boot(disk: &Path, uefi: bool, secure_boot: bool, work: &Path, label: &str) -> String {
     let serial = work.join(format!("serial-{label}.log"));
@@ -98,9 +116,7 @@ fn boot(disk: &Path, uefi: bool, secure_boot: bool, work: &Path, label: &str) ->
     let mut command = Command::new("qemu-system-x86_64");
     // Hardware virtualisation makes the boots take a second instead of
     // minutes; without it the harness's own CPU load can starve the VM.
-    if Path::new("/dev/kvm").exists() {
-        command.args(["-enable-kvm", "-cpu", "host"]);
-    }
+    command.args(kvm_args());
     command
         .args(["-m", "1024", "-smp", "2", "-display", "none", "-no-reboot"])
         .arg("-serial")
@@ -138,12 +154,16 @@ fn boot(disk: &Path, uefi: bool, secure_boot: bool, work: &Path, label: &str) ->
         .expect("start qemu");
     let deadline = Instant::now() + Duration::from_secs(300);
     loop {
+        // The media boot with `rescue.auto=1`: the init announces the ready
+        // marker, then the self check, then powers off. Stopping at the ready
+        // marker raced the self check, which a slow (TCG) VM lost; wait for
+        // the self check, the power-off or a panic instead.
         if let Ok(text) = std::fs::read_to_string(&serial)
-            && (text.contains(RESCUE_MARKER) || text.contains("Kernel panic"))
+            && (text.contains("LINUXREFLECT-RESCUE-SELFTEST-OK") || text.contains("Kernel panic"))
         {
             break;
         }
-        if Instant::now() > deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) || Instant::now() > deadline {
             break;
         }
         std::thread::sleep(Duration::from_millis(500));
@@ -193,6 +213,9 @@ fn the_rescue_media_boots_on_seabios_and_with_secure_boot() {
     let mut request = MediaRequest::new(&signed, &kernel);
     request.cli = rescue_cli();
     request.size_mib = 256;
+    if let Some(reason) = missing_prerequisite(&request) {
+        lr_testkit::unavailable!("{reason}");
+    }
     let report = build_media(&request).expect("build the rescue medium");
     assert!(report.initramfs_bytes > 0);
     assert!(!report.esp_files.is_empty(), "{report:?}");
@@ -221,6 +244,9 @@ fn the_rescue_media_boots_on_seabios_and_with_secure_boot() {
     let mut request = MediaRequest::new(&unsigned, &kernel);
     request.secure_boot = false;
     request.bios = false;
+    if let Some(reason) = missing_prerequisite(&request) {
+        lr_testkit::unavailable!("{reason}");
+    }
     let _ = build_media(&request).expect("build the unsigned medium");
     let refused = boot(&unsigned, true, true, &work, "unsigned");
     assert!(
@@ -261,8 +287,11 @@ fn a_restored_esp_boots_again_after_boot_repair() {
     request.cli = rescue_cli();
     request.size_mib = 256;
     request.bios = false;
-    if build_media(&request).is_err() {
-        lr_testkit::fixture_failed!("could not build the fixture medium");
+    if let Some(reason) = missing_prerequisite(&request) {
+        lr_testkit::unavailable!("{reason}");
+    }
+    if let Err(error) = build_media(&request) {
+        lr_testkit::fixture_failed!("could not build the fixture medium: {error}");
     }
 
     // Destroy the fallback loader: this is the state a restore that only wrote
@@ -638,6 +667,9 @@ fn a_bare_metal_restore_from_the_medium_boots() {
     let mut request = MediaRequest::new(&source, &kernel);
     request.cli = Some(cli.clone());
     request.size_mib = 256;
+    if let Some(reason) = missing_prerequisite(&request) {
+        lr_testkit::unavailable!("{reason}");
+    }
     if let Err(error) = build_media(&request) {
         lr_testkit::fixture_failed!("could not build the source machine: {error}");
     }
@@ -716,20 +748,9 @@ fn a_bare_metal_restore_from_the_medium_boots() {
 
     let serial = work.path().join("autorun.log");
     let status = Command::new("timeout")
-        .args([
-            "420",
-            "qemu-system-x86_64",
-            "-enable-kvm",
-            "-cpu",
-            "host",
-            "-m",
-            "1024",
-            "-smp",
-            "2",
-            "-display",
-            "none",
-            "-no-reboot",
-        ])
+        .args(["420", "qemu-system-x86_64"])
+        .args(kvm_args())
+        .args(["-m", "1024", "-smp", "2", "-display", "none", "-no-reboot"])
         .arg("-serial")
         .arg(format!("file:{}", serial.display()))
         .args([

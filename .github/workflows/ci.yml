@@ -31,7 +31,6 @@ jobs:
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: cargo build -p lr-cli --target x86_64-unknown-linux-musl
 
-
   test:
     runs-on: ubuntu-24.04
     steps:
@@ -73,12 +72,19 @@ jobs:
   # unreliably even in privileged containers, and the tests call `losetup`,
   # `partprobe`, `lvm` and `fsfreeze`. Run them on main and on demand, or point
   # them at the dedicated test host described in AGENTS.md.
+  #
+  # This container is a partial root lane, not full acceptance: it has no
+  # systemd, no GRUB boot chain and no NFS/SMB servers, so the scenarios that
+  # need them are recorded as unavailable (LR_ALLOW_UNAVAILABLE=1) and listed in
+  # the job summary. A failed test or a failed fixture still fails the job. The
+  # complete root evidence is `cargo xtask root` on a full host (AGENTS.md).
   root-tests:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     container:
       image: debian:13-slim
-      options: --privileged -v /dev:/dev
+      # /lib/modules lets modprobe load the runner kernel's modules (nbd).
+      options: --privileged -v /dev:/dev -v /lib/modules:/lib/modules:ro
     steps:
       - uses: actions/checkout@v4
       - name: Install test tooling
@@ -86,11 +92,13 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             build-essential ca-certificates curl git protobuf-compiler musl-tools pkg-config libfontconfig-dev \
-            util-linux fdisk e2fsprogs xfsprogs lvm2 gdisk btrfs-progs dosfstools \
+            util-linux fdisk e2fsprogs xfsprogs lvm2 thin-provisioning-tools gdisk btrfs-progs dosfstools \
             qemu-system-x86 ovmf \
             xvfb xauth xdotool weston linux-image-amd64 \
             libx11-6 libx11-xcb1 libxcursor1 libxrandr2 libxi6 libxkbcommon0 \
-            libxkbcommon-x11-0 libwayland-client0 libfontconfig1 fonts-dejavu-core
+            libxkbcommon-x11-0 libwayland-client0 libfontconfig1 fonts-dejavu-core \
+            rsync openssh-server openssh-client nbd-client kmod procps \
+            dbus-daemon python3 python3-dbus python3-gi polkitd
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -100,8 +108,38 @@ jobs:
       - name: Root acceptance tests
         env:
           LR_ROOT_TESTS: "1"
+          LR_ALLOW_UNAVAILABLE: "1"
+          # No udev here: LVM and device-mapper create their own device nodes.
+          DM_DISABLE_UDEV: "1"
         run: |
           . "$HOME/.cargo/env"
+          export LR_UNAVAILABLE_LOG="$PWD/target/lr-unavailable-root.log"
+          mkdir -p target && : > "$LR_UNAVAILABLE_LOG"
+          # No systemd: start the system bus and polkit for the polkit test,
+          # and load nbd for the NBD export tests when the runner kernel has it.
+          mkdir -p /run/dbus
+          dbus-daemon --system --fork
+          # Only the polkitd user may own polkit's bus name.
+          setpriv --reuid=polkitd --regid=polkitd --clear-groups \
+            /usr/lib/polkit-1/polkitd --no-debug &
+          modprobe nbd nbds_max=16 || echo "nbd is not available on this runner kernel"
           # The GUI lifecycle test needs a display; the GUI root tests start
           # their own Xvfb. The whole-disk boot tests need a kernel in /boot.
           xvfb-run -a cargo test --workspace --no-fail-fast -- --ignored --nocapture --test-threads=1
+      - name: Unavailable scenarios
+        if: always()
+        run: |
+          log=target/lr-unavailable-root.log
+          {
+            echo "### Root lane: unavailable scenarios"
+            echo
+            echo "This hosted container is a partial root lane. These scenarios did not run here;"
+            echo "they are covered by \`cargo xtask root\` on a full host."
+            echo
+            if [ -s "$log" ]; then
+              sort -u "$log" | sed 's/\t/: /; s/^/- /'
+            else
+              echo "None."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          sort -u "$log" 2>/dev/null || true
