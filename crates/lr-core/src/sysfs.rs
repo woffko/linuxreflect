@@ -200,10 +200,42 @@ pub fn logical_block_size(device: &Path) -> io::Result<u32> {
 /// # Errors
 /// Returns [`io::ErrorKind::InvalidInput`] when the path has no file name.
 pub fn device_name(device: &Path) -> io::Result<String> {
+    if let Some(name) = kernel_name_by_number(device) {
+        return Ok(name);
+    }
     device
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "device path has no name"))
+}
+
+/// The kernel's name for a block device node, found through its device number.
+///
+/// A node's own name can differ from the kernel's: without udev,
+/// `/dev/mapper/<vg>-<lv>` is a real node of the device sysfs calls `dm-N`,
+/// so the node's file name finds nothing in `/sys/class/block`.
+fn kernel_name_by_number(device: &Path) -> Option<String> {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+    let metadata = std::fs::metadata(device).ok()?;
+    if !metadata.file_type().is_block_device() {
+        return None;
+    }
+    let (major, minor) = split_dev(metadata.rdev());
+    name_for_number(&sysfs_root(), major, minor)
+}
+
+/// Split a Linux `dev_t` into major and minor numbers, as glibc and musl do.
+fn split_dev(dev: u64) -> (u64, u64) {
+    let major = ((dev >> 32) & 0xffff_f000) | ((dev >> 8) & 0x0000_0fff);
+    let minor = ((dev >> 12) & 0xffff_ff00) | (dev & 0x0000_00ff);
+    (major, minor)
+}
+
+/// The device `/sys/dev/block/<major>:<minor>` links to, by name.
+fn name_for_number(root: &Path, major: u64, minor: u64) -> Option<String> {
+    let link = std::fs::read_link(root.join("dev/block").join(format!("{major}:{minor}"))).ok()?;
+    link.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
 }
 
 fn read_dir_names(dir: &Path) -> Vec<String> {
@@ -309,8 +341,44 @@ pub fn merge_mountpoints(a: Vec<PathBuf>, b: Vec<PathBuf>) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_mountpoints, parse_mountinfo};
+    use super::{merge_mountpoints, name_for_number, parse_mountinfo, split_dev};
     use std::path::PathBuf;
+
+    #[test]
+    fn device_numbers_split_like_the_c_library() {
+        // makedev(8, 1), makedev(259, 3), makedev(4095, 1048575) and
+        // makedev(0x12345, 0x6789a), which uses the high bits of both numbers.
+        assert_eq!(split_dev(0x801), (8, 1));
+        assert_eq!(split_dev(0x1_0303), (259, 3));
+        assert_eq!(split_dev(0xffff_ffff), (4095, 1_048_575));
+        assert_eq!(split_dev(0x0001_2000_6783_459a), (0x12345, 0x6789a));
+    }
+
+    #[test]
+    fn a_device_number_names_the_kernel_device() {
+        let root = tempfile::tempdir().expect("sysfs root");
+        let block = root.path().join("dev/block");
+        std::fs::create_dir_all(&block).expect("dev/block");
+        std::os::unix::fs::symlink("../../devices/virtual/block/dm-0", block.join("253:0"))
+            .expect("link");
+        assert_eq!(
+            name_for_number(root.path(), 253, 0).as_deref(),
+            Some("dm-0")
+        );
+        assert_eq!(name_for_number(root.path(), 253, 1), None);
+    }
+
+    #[test]
+    fn a_path_that_is_not_a_block_device_keeps_its_file_name() {
+        let dir = tempfile::tempdir().expect("dir");
+        let file = dir.path().join("disk.img");
+        std::fs::write(&file, b"").expect("file");
+        assert_eq!(super::device_name(&file).expect("name"), "disk.img");
+        assert_eq!(
+            super::device_name(std::path::Path::new("/dev/does-not-exist-sdq")).expect("name"),
+            "does-not-exist-sdq"
+        );
+    }
 
     const MOUNTINFO: &str = "\
 20 28 0:19 / / rw,relatime shared:1 - ext4 /dev/sdd rw

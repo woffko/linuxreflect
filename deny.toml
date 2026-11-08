@@ -23,6 +23,20 @@ ignore = [
     # vulnerability and no safe upgrade; winit is what Slint's Linux backend is
     # built on (spec §B, §M.1 chose Slint). Revisit when winit drops ab_glyph.
     { id = "RUSTSEC-2026-0192", reason = "unmaintained-only advisory from the GUI's mandated windowing stack (winit -> sctk-adwaita -> ab_glyph)" },
+    # RUSTSEC-2026-0370/0371/0372 (`zvariant`, `zbus_names`, `zvariant_derive`
+    # unmaintained): upstream merged these crates into zbus 6.0 and stopped
+    # publishing them separately. They are unmaintained-only advisories with no
+    # reported vulnerability. zbus_polkit 5.1.0 (the pinned fix for
+    # RUSTSEC-2026-0278) and Slint 1.18's winit backend both require zbus 5, so
+    # there is no safe upgrade yet. Revisit when both support zbus 6.
+    { id = "RUSTSEC-2026-0370", reason = "unmaintained-only: zvariant merged into zbus 6; zbus_polkit 5.1 and Slint 1.18 require zbus 5" },
+    { id = "RUSTSEC-2026-0371", reason = "unmaintained-only: zbus_names merged into zbus 6; zbus_polkit 5.1 and Slint 1.18 require zbus 5" },
+    { id = "RUSTSEC-2026-0372", reason = "unmaintained-only: zvariant_derive merged into zbus 6; zbus_polkit 5.1 and Slint 1.18 require zbus 5" },
+    # RUSTSEC-2026-0441 (`pin-utils` unmaintained, repository archived) reaches
+    # the graph only through Slint 1.18's `spin_on` (slint-build, slint-macros),
+    # at build time and in the GUI's macro expansion. Unmaintained-only, no
+    # reported vulnerability, no safe upgrade. Revisit with the next Slint.
+    { id = "RUSTSEC-2026-0441", reason = "unmaintained-only advisory reached only through Slint 1.18 (spin_on)" },
     # RUSTSEC-2026-0278 (zbus_polkit PID-reuse bypass, CVSS 7.3) is fixed in
     # 5.1.0, which is the pinned version. Nothing else is ignored on purpose:
     # if any other advisory appears the build must fail.

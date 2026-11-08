@@ -233,3 +233,49 @@ fn real_loop_gpt_partitions_and_filesystems_are_discovered() {
     assert!(layout.fs.is_none(), "no filesystem on the whole device");
     assert!(Path::new(&loop_dev.partition_path(2)).exists());
 }
+
+/// Without udev, a node's name need not be the kernel's: `/dev/mapper/<vg>-<lv>`
+/// is then a real node of the device sysfs calls `dm-N`. Discovery must find
+/// the device through its number, not through the node's name.
+#[test]
+#[ignore = "requires root and a loop device"]
+fn a_device_node_with_another_name_is_found_through_its_number() {
+    use std::os::unix::fs::MetadataExt;
+    if !root_tests_enabled() {
+        return;
+    }
+    let Some(loop_dev) = Loop::attach(64 * 1024 * 1024) else {
+        return;
+    };
+    let rdev = std::fs::metadata(&loop_dev.device)
+        .expect("stat the loop device")
+        .rdev();
+    let major = ((rdev >> 32) & 0xffff_f000) | ((rdev >> 8) & 0x0000_0fff);
+    let minor = ((rdev >> 12) & 0xffff_ff00) | (rdev & 0x0000_00ff);
+    let nodes = tempfile::tempdir().expect("node dir");
+    let alias = nodes.path().join("vg0-root");
+    if !run(
+        "mknod",
+        &[
+            &alias.display().to_string(),
+            "b",
+            &major.to_string(),
+            &minor.to_string(),
+        ],
+    ) {
+        lr_testkit::fixture_failed!("mknod {} failed", alias.display());
+    }
+    let kernel_name = loop_dev
+        .device
+        .file_name()
+        .expect("loop name")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        lr_core::sysfs::device_name(&alias).expect("device name"),
+        kernel_name
+    );
+    let layout = lr_core::discover_source(&alias).expect("discover through the alias");
+    assert_eq!(layout.device_facts.name, kernel_name);
+    assert_eq!(layout.device_facts.size_bytes, 64 * 1024 * 1024);
+}

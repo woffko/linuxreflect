@@ -273,6 +273,20 @@ fn the_session_helper_posts_a_notification() {
             lr_testkit::unavailable!("{tool} missing");
         }
     }
+    // The mock service needs python3-dbus and python3-gi; without them it
+    // would exit at import and the test would look like a product failure.
+    let modules = Command::new("python3")
+        .args([
+            "-c",
+            "import dbus, dbus.mainloop.glib; from gi.repository import GLib",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !modules {
+        lr_testkit::unavailable!("python3-dbus or python3-gi missing");
+    }
     let session = Path::new(CLI)
         .parent()
         .expect("cli parent")

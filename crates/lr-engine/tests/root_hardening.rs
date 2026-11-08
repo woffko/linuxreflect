@@ -1253,7 +1253,14 @@ fn boot_disk(disk: &Path, uefi: bool, work: &Path, label: &str) -> String {
     let serial = work.join(format!("serial-{label}.log"));
     let _ = std::fs::remove_file(&serial);
     let mut command = Command::new("qemu-system-x86_64");
-    if Path::new("/dev/kvm").exists() {
+    // `/dev/kvm` can exist while the kernel offers no KVM (nested
+    // virtualisation off); only a node that opens means `-enable-kvm` works.
+    if std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+        .is_ok()
+    {
         command.args(["-enable-kvm", "-cpu", "host"]);
     }
     command
@@ -1317,6 +1324,11 @@ fn every_bootable_root_boots_under_bios_and_uefi_after_a_restore() {
     }
     if !Path::new("/usr/share/OVMF/OVMF_CODE_4M.fd").exists() {
         lr_testkit::unavailable!("OVMF missing - the boot matrix");
+    }
+    for platform in ["/usr/lib/grub/i386-pc", "/usr/lib/grub/x86_64-efi"] {
+        if !Path::new(platform).is_dir() {
+            lr_testkit::unavailable!("{platform} missing - the boot matrix");
+        }
     }
     // The newest kernel the machine has, with the matching modules.
     let mut kernels: Vec<PathBuf> = std::fs::read_dir("/boot")

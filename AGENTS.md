@@ -5,7 +5,10 @@
 LinuxReflect is a Rust implementation of the technical specification at
 `docs/spec/linuxreflect-spec-v2.1.md`. The specification is frozen: implement it,
 do not redesign it. Where the specification is silent, record the decision in
-`docs/decisions.md` and keep it minimal.
+`docs/decisions.md` and keep it minimal. Only the maintainer amends it: v2.2
+(November 2026, D-138; the file keeps its v2.1 name) adds live ext4 images
+through the tracked-freeze provider (§E.7, Slice 18). Slice 18 is planned in
+`docs/live-backup-plan.md` and not implemented yet.
 
 The MVP is slices S1–S11 (spec §K). Slices are landed one pull request each.
 Current state: S1 (workspace, `lr-core`, `lr-unsafe`, capability probe,
