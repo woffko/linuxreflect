@@ -557,6 +557,228 @@ fn a_source_that_keeps_changing_fails_without_publishing() {
     );
 }
 
+/// An executable hook script with `mode`.
+fn hook(dir: &Path, name: &str, mode: u32, body: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("hook");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("mode");
+}
+
+/// A hooks directory with empty, root-only stage directories.
+fn hooks_dir(work: &Path, name: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let root = work.join(name);
+    let pre = root.join("pre-freeze.d");
+    let post = root.join("post-thaw.d");
+    for dir in [&root, &pre, &post] {
+        std::fs::create_dir_all(dir).expect("hooks dir");
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    }
+    (root, pre, post)
+}
+
+/// Spec §E.7 hooks. Pre-freeze hooks run in name order before the final
+/// freeze, so what they write is in the image; post-thaw hooks run after the
+/// thaw, so what they write reaches the source but not the image. Hooks see
+/// a clean environment, `run-parts` leftovers and files without the execute
+/// bit do not run, and a failed post-thaw hook is a warning. A failed
+/// pre-freeze hook stops the job and publishes nothing, while the post-thaw
+/// hooks still run; an unsafe hook refuses the job before tracing starts.
+#[test]
+#[ignore = "requires root, loop devices, tracefs and fsfreeze"]
+fn hooks_run_around_the_final_freeze() {
+    if !root_tests_enabled() || !prerequisites() {
+        return;
+    }
+    let Some(source) = Source::create() else {
+        return;
+    };
+    let work = tempfile::tempdir().expect("work");
+    let log = work.path().join("hooks.log");
+    let env_dump = work.path().join("hook-env.txt");
+    let (root, pre, post) = hooks_dir(work.path(), "hooks");
+    let (log_s, env_s) = (log.display(), env_dump.display());
+    hook(&pre, "20-second", 0o755, &format!("echo pre-20 >> {log_s}"));
+    hook(
+        &pre,
+        "10-first",
+        0o755,
+        &format!(
+            "echo \"pre-10 $LINUXREFLECT_STAGE\" >> {log_s}; env > {env_s}\n\
+             for fs in $LINUXREFLECT_FILESYSTEMS; do echo flushed > \"$fs/before-freeze\"; done"
+        ),
+    );
+    hook(&pre, "README", 0o644, &format!("echo readme >> {log_s}"));
+    hook(
+        &pre,
+        "10-first.dpkg-old",
+        0o755,
+        &format!("echo old >> {log_s}"),
+    );
+    hook(
+        &post,
+        "30-resume",
+        0o755,
+        &format!(
+            "echo \"post $LINUXREFLECT_STAGE\" >> {log_s}\n\
+             for fs in $LINUXREFLECT_FILESYSTEMS; do echo resumed > \"$fs/after-thaw\"; done"
+        ),
+    );
+    hook(
+        &post,
+        "40-complains",
+        0o755,
+        "echo 'resume failed' >&2; exit 1",
+    );
+
+    let dest = work.path().join("backups");
+    let mut hooked = request(&source.partition(), &dest);
+    hooked.hooks_dir = Some(root);
+    let report = backup_image(&hooked).expect("a backup with hooks");
+    let ImageReport::Block(report) = &report else {
+        panic!("expected a block image");
+    };
+    assert_eq!(report.consistency, lr_core::Consistency::Frozen);
+    let ran = std::fs::read_to_string(&log).expect("hook log");
+    assert_eq!(
+        ran.lines().collect::<Vec<_>>(),
+        ["pre-10 pre-freeze", "pre-20", "post post-thaw"],
+        "hooks ran out of order or ran what they should not"
+    );
+    let env = std::fs::read_to_string(&env_dump).expect("hook environment");
+    assert!(
+        env.contains(&format!(
+            "LINUXREFLECT_FILESYSTEMS={}",
+            source.mountpoint().display()
+        )),
+        "{env}"
+    );
+    assert!(
+        !env.contains("LR_ROOT_TESTS"),
+        "the job's environment leaked: {env}"
+    );
+    let complaints: Vec<&String> = report
+        .warnings
+        .iter()
+        .filter(|warning| warning.contains("post-thaw hook"))
+        .collect();
+    assert_eq!(complaints.len(), 1, "{:?}", report.warnings);
+    assert!(
+        complaints[0].contains("40-complains") && complaints[0].contains("resume failed"),
+        "{}",
+        complaints[0]
+    );
+    assert!(
+        source.mountpoint().join("after-thaw").exists(),
+        "the post-thaw hook could not write to the thawed source"
+    );
+
+    // The image holds the pre-freeze write and not the post-thaw one.
+    let target = work.path().join("restored.img");
+    std::fs::File::create(&target)
+        .and_then(|f| f.set_len(source.partition_bytes()))
+        .expect("target");
+    let plan = prepare_restore(&PrepareRequest::from_path(
+        &report.image_path,
+        &target,
+        Encryption::NoEncrypt,
+    ))
+    .expect("prepare");
+    apply_restore(&ApplyRequest {
+        token: plan.token,
+        confirm: true,
+        accept_inconsistent: false,
+        encryption: Encryption::NoEncrypt,
+        context: lr_engine::progress::EngineContext::silent(),
+    })
+    .expect("apply");
+    let check = work.path().join("check");
+    std::fs::create_dir(&check).expect("check dir");
+    assert!(run(
+        "mount",
+        &[
+            "-o",
+            "ro,loop",
+            &target.display().to_string(),
+            &check.display().to_string()
+        ]
+    ));
+    let before = std::fs::read_to_string(check.join("before-freeze"));
+    let after = check.join("after-thaw").exists();
+    let _ = run("umount", &[&check.display().to_string()]);
+    assert_eq!(
+        before.ok().as_deref(),
+        Some("flushed\n"),
+        "the pre-freeze write is missing"
+    );
+    assert!(!after, "a write made after the thaw is in the image");
+
+    // A failing pre-freeze hook stops the job; the post-thaw hooks still run.
+    let failed_log = work.path().join("failed.log");
+    let (root, pre, post) = hooks_dir(work.path(), "failing-hooks");
+    hook(
+        &pre,
+        "10-pause",
+        0o755,
+        "echo 'service refused to pause' >&2; exit 4",
+    );
+    hook(
+        &post,
+        "10-resume",
+        0o755,
+        &format!("echo resumed >> {}", failed_log.display()),
+    );
+    let failed_dest = work.path().join("failed-backups");
+    let mut failing = request(&source.partition(), &failed_dest);
+    failing.hooks_dir = Some(root);
+    let error = backup_image(&failing).expect_err("a failed pre-freeze hook must stop the job");
+    assert!(
+        matches!(error, lr_core::Error::HookFailed { .. }),
+        "expected E_HOOK_FAILED, got {error}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("10-pause")
+            && message.contains("exit status: 4")
+            && message.contains("service refused to pause"),
+        "{message}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&failed_log).ok().as_deref(),
+        Some("resumed\n"),
+        "the post-thaw hooks did not run after the failure"
+    );
+    assert!(
+        images_under(&failed_dest).is_empty(),
+        "an image was published"
+    );
+    assert_eq!(trace_leftovers(), 0, "a trace instance was left behind");
+    assert!(
+        writable_within(&source.mountpoint(), Duration::from_secs(5)),
+        "the source stayed frozen"
+    );
+
+    // A hook anyone may change is refused before anything is traced.
+    let (root, pre, _post) = hooks_dir(work.path(), "open-hooks");
+    hook(&pre, "10-open", 0o777, "true");
+    let open_dest = work.path().join("open-backups");
+    let mut open = request(&source.partition(), &open_dest);
+    open.hooks_dir = Some(root);
+    let error = backup_image(&open).expect_err("a world-writable hook must be refused");
+    assert!(
+        error
+            .to_string()
+            .contains("writable by its group or by others"),
+        "{error}"
+    );
+    assert!(
+        images_under(&open_dest).is_empty(),
+        "an image was published"
+    );
+    assert_eq!(trace_leftovers(), 0, "a trace instance was left behind");
+}
+
 /// Child process for [`a_sigkill_during_the_final_freeze_is_thawed_by_the_deadman`].
 #[test]
 #[ignore = "internal helper for the tracked-freeze deadman test"]

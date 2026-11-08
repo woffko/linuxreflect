@@ -11,6 +11,7 @@
 
 pub mod btrfs;
 pub mod freeze;
+pub mod hooks;
 pub mod live_none;
 pub mod lvm;
 pub mod offline;

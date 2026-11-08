@@ -9,7 +9,7 @@
 pub mod direct;
 pub mod plan;
 
-pub use direct::{DirectBlockSource, DirectBlockTarget, IoMode, MIN_ALIGNMENT};
+pub use direct::{DirectBlockSource, DirectBlockTarget, IoMode, MIN_ALIGNMENT, ReadStats};
 pub use plan::{ChunkPlan, UsedChunks, is_all_zero};
 
 use lr_core::{Error, Result};

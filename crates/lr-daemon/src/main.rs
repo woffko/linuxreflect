@@ -149,7 +149,12 @@ fn init_logging() {
     } else {
         let _ = tracing_subscriber::registry()
             .with(filter)
-            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stderr)
+                    // journald gets plain text; colours only on a terminal.
+                    .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr())),
+            )
             .try_init();
     }
 }
@@ -174,6 +179,14 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // the one already on disk) is what makes a standalone CLI run's tokens
     // verify against the daemon's.
     let _ = lr_engine::restore::token_secret();
+    // Trace instances a killed tracked-freeze job left behind (spec §E.7),
+    // before any job of this daemon exists. Instances whose owner still runs
+    // (a CLI job next to the daemon) are left alone.
+    if let Some(tracefs) = lr_snapshot::tracking::tracefs_root() {
+        for leftover in lr_snapshot::tracking::sweep(&tracefs) {
+            tracing::info!(instance = %leftover.display(), "removed a leftover trace instance");
+        }
+    }
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {

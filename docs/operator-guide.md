@@ -233,9 +233,41 @@ instead of storing a torn copy; run it again.
 **What it does not guarantee.** Application consistency. A database or any
 other program that keeps state in memory, or spread over several files, is
 imaged the way a sudden power cut would leave it at that instant: whatever it
-has written and synced is there, nothing else. The pre-freeze and post-thaw
-hooks of spec §E.7 are not implemented yet. Stop such services, or use their
-own dump tools, before the backup.
+has written and synced is there, nothing else. Hooks give such a program its
+own pause.
+
+**Hooks.** Executables in `/etc/linuxreflect/hooks/pre-freeze.d/` run in name
+order just before the final freeze, and those in `post-thaw.d/` right after
+the thaw. What a pre-freeze hook writes (a database flush, a dump) is in the
+image; what a post-thaw hook writes is not. A hook can flush a database, so
+the copy needs less recovery, or pause a service that a post-thaw hook
+resumes:
+
+```sh
+#!/bin/sh
+# /etc/linuxreflect/hooks/pre-freeze.d/10-postgres   (root:root, 0755)
+exec runuser -u postgres -- psql -q -c CHECKPOINT
+```
+
+- The hooks directory, each `.d` directory and each hook must be owned by
+  root and not writable by its group or by others, and a hook must be a
+  regular file (not a symlink). Anything else refuses the job before it
+  starts.
+- As with `run-parts`, only names made of letters, digits, `_` and `-` run, so
+  `.dpkg-old` leftovers and `README` files do not. A file without its owner's
+  execute bit is skipped.
+- A hook runs as root with `/` as its working directory, no standard input,
+  and an empty environment except `PATH`, `LINUXREFLECT_STAGE` (`pre-freeze`
+  or `post-thaw`) and `LINUXREFLECT_FILESYSTEMS` (the mount points the freeze
+  covers, one per line, `/` last). Each hook has 30 seconds.
+- A pre-freeze hook that fails or runs out of time stops the job with
+  `E_HOOK_FAILED` before anything is frozen, and nothing is published. Once
+  the pre-freeze hooks have begun, the post-thaw hooks always run, so a
+  paused service is resumed even when the backup fails. A failed post-thaw
+  hook is a warning in the report: the image was already read.
+- Hooks run only around the final freeze. The short barrier freeze at the
+  start does not run them, and neither does the brief freeze that may be
+  needed to map a busy filesystem.
 
 **Requirements.** They are checked before tracing starts, and the job is
 refused with the reason when one is missing:
@@ -257,8 +289,10 @@ refused with the reason when one is missing:
   fails with `E_FREEZE_TIMEOUT`. `--freeze-timeout` belongs to the plain
   freeze provider and does not apply here.
 - The copy takes another pass until what is left can be read in half of
-  `--freeze-max` at the speed the last pass reached, up to 256 MiB. Ten passes
-  that do not shrink what is left end the job with `E_NO_CONVERGENCE`.
+  `--freeze-max` at the read speed the last pass measured (its reads alone,
+  not the writing to the destination, which the final read does not do), up
+  to 256 MiB. Ten passes that do not shrink what is left end the job with
+  `E_NO_CONVERGENCE`.
 - While a package transaction holds dpkg's lock, the final freeze is put off,
   because an image taken halfway through an upgrade may not boot. Each wait
   counts as such a pass.
@@ -272,15 +306,18 @@ refused with the reason when one is missing:
 | `E_TRACKING_LOST` | The kernel dropped trace events, or the self test failed, so a write may have gone unrecorded | Run it at a quieter time; on a failed self test, use rescue media |
 | `E_FREEZE_TIMEOUT` | The final read took longer than `--freeze-max` | Run it at a quieter time, or allow a longer freeze |
 | `E_SOURCE_CHANGED` | The partition table, a filesystem's UUID or size, or a partition that cannot be frozen changed during the job | Finish the change, then back up again |
+| `E_HOOK_FAILED` | A pre-freeze hook failed or ran out of time; the message names it and quotes the end of its error output | Fix the hook or the service it pauses |
 
 **If the process dies during the freeze.** A frozen filesystem stays frozen
 after the process that froze it dies. A separate watchdog thaws it after
 `--freeze-max` plus `--deadman-grace` (default 30 s). Should a filesystem
 ever stay frozen anyway, `fsfreeze --unfreeze <mountpoint>` from a root shell
 thaws it; reading files works while it is frozen, so the shell itself can
-still start. A killed process can also leave its trace instance behind;
-`rmdir /sys/kernel/tracing/instances/lr-*` removes it. The daemon does not
-sweep these at start-up yet.
+still start. A killed process can also leave its trace instance behind (a
+ring buffer of 16 MiB per CPU that keeps recording). The daemon removes these
+when it starts, and so does every tracked-freeze job before it starts its
+own. Either way, only instances whose process is gone are removed, never a
+running job's.
 
 **Restoring a live image** works like restoring any whole-disk image
 ([Restoring](#restoring)), and the restored disk boots like one imaged
@@ -297,8 +334,8 @@ write load, restored to another disk, and booted from that disk alone
 
 **Not done yet:** incremental and differential members (a tracked copy is
 always a full image; other types are refused), the backup wizard and
-`PlanBackup` predictions, hooks, the `--allow-inconsistent` exception for a
-busy ESP, and xfs. **Untested so far:** jobs run through the daemon (the
+`PlanBackup` predictions, the `--allow-inconsistent` exception for a busy
+ESP, and xfs. **Untested so far:** jobs run through the daemon (the
 acceptance runs used the CLI without one), real hardware at full speed, and a
 desktop session during the backup.
 

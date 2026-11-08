@@ -629,6 +629,13 @@ fn tracefs_error(path: &Path, error: &io::Error) -> Error {
 
 /// Remove the provider's instances that a killed process left behind; they
 /// are named with [`INSTANCE_PREFIX`]. Returns the removed directories.
+///
+/// An instance may belong to a job that is still running, in this process
+/// or another (a CLI next to the daemon), and turning its tracing off would
+/// silently lose writes. So the sweep never writes to an instance: it leaves
+/// every instance whose owner (the process id in its name) is alive or
+/// unknown, and removes the others with one `rmdir`, which the kernel refuses
+/// while a reader still holds the instance's pipe open.
 pub fn sweep(tracefs: &Path) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(tracefs.join("instances")) else {
         return Vec::new();
@@ -636,20 +643,28 @@ pub fn sweep(tracefs: &Path) -> Vec<PathBuf> {
     let mut removed = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
-        if !name.to_string_lossy().starts_with(INSTANCE_PREFIX) {
+        let Some(owner) = name.to_str().and_then(instance_owner) else {
+            continue;
+        };
+        if Path::new("/proc").join(owner.to_string()).exists() {
             continue;
         }
         let dir = entry.path();
-        let _ = fs::write(dir.join("tracing_on"), "0");
-        for event in [TRACEPOINT, COMPLETION_TRACEPOINT] {
-            let _ = fs::write(dir.join("events").join(event).join("enable"), "0");
-        }
-        remove_instance_dir(&dir);
-        if !dir.exists() {
+        if fs::remove_dir(&dir).is_ok() {
             removed.push(dir);
         }
     }
     removed
+}
+
+/// The process that created an instance: the first all-digit field of its
+/// name after [`INSTANCE_PREFIX`] (`lr-tf-<pid>-<n>`, `lr-self-test-<pid>`).
+fn instance_owner(name: &str) -> Option<u32> {
+    name.strip_prefix(INSTANCE_PREFIX)?
+        .split('-')
+        .find(|field| !field.is_empty() && field.bytes().all(|byte| byte.is_ascii_digit()))?
+        .parse()
+        .ok()
 }
 
 /// The tracefs mount point: `LR_TRACEFS_ROOT` for tests, else
@@ -1067,6 +1082,16 @@ impl Drop for SelfTestLoop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_instance_names_the_process_that_owns_it() {
+        assert_eq!(instance_owner("lr-tf-4242-0"), Some(4242));
+        assert_eq!(instance_owner("lr-self-test-17"), Some(17));
+        assert_eq!(instance_owner("lr-leftover"), None);
+        assert_eq!(instance_owner("lr-tf--3"), Some(3));
+        assert_eq!(instance_owner("not-ours-99"), None);
+        assert_eq!(instance_owner("lr-tf-99999999999999-0"), None);
+    }
 
     const FORMAT: &str = include_str!(
         "../tests/fixtures/trace/block_bio_queue-6.18.58.1-microsoft-standard-WSL2.format"

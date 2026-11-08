@@ -121,6 +121,9 @@ pub struct BackupRequest {
     pub deadman_grace_secs: Option<u64>,
     /// Tracked-freeze budgets (spec §E.7).
     pub tracked_tuning: lr_core::TrackedTuning,
+    /// Tracked-freeze hooks directory; `None` is `/etc/linuxreflect/hooks`.
+    /// For tests and embedders: the CLI and the daemon never set it.
+    pub hooks_dir: Option<PathBuf>,
     /// Chain member type (spec §J.1 `--type`).
     pub member_type: MemberType,
     /// `--parent latest|<uuid>`; required in spirit for incrementals.
@@ -179,6 +182,7 @@ impl BackupRequest {
             lvm_cow_size: None,
             deadman_grace_secs: None,
             tracked_tuning: lr_core::TrackedTuning::default(),
+            hooks_dir: None,
             member_type: MemberType::Full,
             parent: None,
             break_stale_lock: false,
@@ -520,6 +524,7 @@ pub fn backup_block_with(
     let mut nonce_seq = NonceSeq::new();
     let mut spool_file = crate::spool::scratch_file(&spool_dir)?;
     let mut tracked_summary = None;
+    let mut hook_warnings = Vec::new();
     let counts = {
         let mut spool = BufWriter::new(&mut spool_file);
         let header = BlockManifestHeader {
@@ -545,7 +550,7 @@ pub fn backup_block_with(
             None => {
                 header.write(&mut spool, false)?;
                 let entries_start = spool.stream_position().map_err(Error::Io)?;
-                let pass_started = std::time::Instant::now();
+                let reads_before = source.read_stats();
                 let mut counts = write_full_entries(
                     &mut image_writer,
                     options,
@@ -563,6 +568,7 @@ pub fn backup_block_with(
                 patch_entry_count(&mut spool, header_offset, chunk_count)?;
                 if let Some(tracked) = snapshot.tracked_mut() {
                     reporter.phase("converge");
+                    let first_pass = source.read_stats().since(reads_before);
                     tracked_summary = Some(converge_tracked(
                         tracked,
                         &mut image_writer,
@@ -576,8 +582,9 @@ pub fn backup_block_with(
                         &mut counts,
                         request,
                         device_size,
-                        (imaged_bytes, pass_started.elapsed()),
+                        first_pass,
                     )?);
+                    hook_warnings.extend_from_slice(tracked.warnings());
                 }
                 counts
             }
@@ -755,6 +762,7 @@ pub fn backup_block_with(
             .into_iter()
             .chain(catalog_warning)
             .chain(map_warning)
+            .chain(hook_warnings)
             .collect(),
         image_path: local_image_path(&set_root, &image_name),
         image_uri: request.image_uri(&image_name),
@@ -1165,14 +1173,15 @@ fn converge_tracked(
     counts: &mut Counts,
     request: &BackupRequest,
     device_size: u64,
-    first_pass: (u64, std::time::Duration),
+    first_pass: lr_blocksource::ReadStats,
 ) -> Result<lr_snapshot::TrackedSummary> {
     spool.flush().map_err(Error::Io)?;
     let chunk_size = u64::from(request.chunk_size);
-    let (mut bytes, mut elapsed) = first_pass;
-    while let Some(regions) = tracked.next_pass(bytes, elapsed)? {
-        let started = std::time::Instant::now();
-        bytes = 0;
+    // The rate is the reads' own (spec §E.7 step 5): the final read only
+    // reads, while a pass also compresses, encrypts and writes.
+    let mut pass = first_pass;
+    while let Some(regions) = tracked.next_pass(pass.bytes, pass.time)? {
+        let reads_before = source.read_stats();
         // One region: the partition itself.
         for index in regions.into_iter().flat_map(|region| region.chunks) {
             let plan = chunk_plan_at(index, chunk_size, device_size);
@@ -1201,9 +1210,8 @@ fn converge_tracked(
                 &full_entry(state),
                 counts,
             )?;
-            bytes += u64::from(plan.len);
         }
-        elapsed = started.elapsed();
+        pass = source.read_stats().since(reads_before);
     }
 
     // The final read happens with the filesystems frozen: buffers are
@@ -1391,6 +1399,7 @@ pub(crate) fn snapshot_opts(request: &BackupRequest) -> SnapshotOpts {
         lvm_cow_size: request.lvm_cow_size.clone(),
         deadman_grace_secs: request.deadman_grace_secs,
         tracked: request.tracked_tuning,
+        hooks_dir: request.hooks_dir.clone(),
         // The freeze provider proves the destination is on another
         // filesystem. The parsed destination decides: the CLI and the daemon
         // pass even a local path as `dest`, and only SFTP is remote (R27).

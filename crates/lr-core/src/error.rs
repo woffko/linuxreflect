@@ -60,6 +60,16 @@ pub enum Error {
         passes: u32,
     },
 
+    /// A pre-freeze hook failed, so the job stopped before its final freeze
+    /// (spec §E.7). Nothing is published.
+    #[error("the pre-freeze hook {hook} {reason}; the backup stopped before the final freeze")]
+    HookFailed {
+        /// The hook's path.
+        hook: String,
+        /// How it failed.
+        reason: String,
+    },
+
     /// The source's partition or filesystem changed shape during a
     /// tracked-freeze copy (spec §E.7). Nothing is published.
     #[error("the source changed during the backup: {what}")]

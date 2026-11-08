@@ -1,10 +1,13 @@
 #!/bin/sh
 # Slice 18 acceptance, first boot (spec v2.2 §K S18 AC (d)): image this running
 # system's disk live with tracked-freeze onto /dev/vdb, restore it onto
-# /dev/vdc, and report everything over the serial console. /dev/vda is the
-# running system, /dev/vdb and /dev/vdc are blank disks of this VM.
+# /dev/vdc, and report everything over the serial ports. /dev/vda is the
+# running system, /dev/vdb and /dev/vdc are blank disks of this VM. Progress
+# goes to the console (ttyS0); the results go to the second port (ttyS1),
+# where no kernel or systemd message can interleave with them.
 set -u
 SERIAL=/dev/ttyS0
+RESULT=/dev/ttyS1
 say() { echo "LR-STEP $*" > "$SERIAL"; }
 now() { python3 -c 'import time; print(time.monotonic())'; }
 SEED=/mnt/seed
@@ -28,7 +31,7 @@ sleep 5
 say "backup"
 now > /run/lr-backup.start
 /usr/local/sbin/linuxreflect backup create --source /dev/vda --dest /mnt/dest --set system \
-    --snapshot tracked-freeze --no-encrypt --compress none --json \
+    --snapshot tracked-freeze --no-encrypt --compress none --json -v \
     > /run/lr-backup.json 2> /run/lr-backup.err
 echo $? > /run/lr-backup.rc
 now > /run/lr-backup.end
@@ -51,11 +54,10 @@ fi
 say "report"
 {
     echo "LR-RESULT-BEGIN"
-    tar -C /run -cf - lr-writer.timeline lr-backup.start lr-backup.end lr-backup.rc \
-        lr-backup.json lr-backup.err lr-prepare.json lr-prepare.err lr-apply.json \
-        lr-apply.err lr-apply.rc 2> /dev/null | gzip | base64 -w0
-    echo
+    tar -C /run -cf - lr-backup.start lr-backup.end lr-backup.rc lr-backup.json \
+        lr-backup.err lr-prepare.json lr-prepare.err lr-apply.json lr-apply.err \
+        lr-apply.rc lr-writer.timeline 2> /dev/null | gzip | base64 -w 76
     echo "LR-RESULT-END"
-} > "$SERIAL"
+} > "$RESULT"
 sync
 poweroff

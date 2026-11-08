@@ -17,6 +17,6 @@
     fi
     /usr/local/sbin/lr-chain-check /var/lib/lr-workload/chain.log
     echo "LR-RESTORED-BOOT-END"
-} > /dev/ttyS0 2>&1
+} > /dev/ttyS1 2>&1
 sync
 systemctl poweroff

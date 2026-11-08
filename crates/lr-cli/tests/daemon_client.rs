@@ -173,15 +173,16 @@ fn the_cli_round_trips_through_the_daemon() {
         "--json",
     ]);
     assert!(created.status.success(), "stderr: {}", stderr(&created));
+    // With --json the report is all of standard output, as on the
+    // in-process route; the progress goes to standard error.
+    let progress = stderr(&created);
+    assert!(
+        progress.contains("phase:"),
+        "progress is printed: {progress}"
+    );
     let report = stdout(&created);
-    assert!(report.contains("phase:"), "progress is printed: {report}");
-    // The report is the last line; the phase lines precede it.
-    let json = report
-        .lines()
-        .rev()
-        .find(|line| line.trim_start().starts_with('{'))
-        .expect("the report line");
-    let value: serde_json::Value = serde_json::from_str(json).expect("report json");
+    let value: serde_json::Value =
+        serde_json::from_str(report.trim()).expect("standard output is the report alone");
     let image_uri = value
         .get("image_uri")
         .and_then(|uri| uri.as_str())

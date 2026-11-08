@@ -500,6 +500,9 @@ pub struct TrackedCopy {
     log: FreezeLog,
     summary: TrackedSummary,
     convergence: Convergence,
+    hooks: crate::hooks::Hooks,
+    /// Warnings for the report (failed post-thaw hooks).
+    warnings: Vec<String>,
     inhibitor: Option<Child>,
 }
 
@@ -594,6 +597,13 @@ impl TrackedCopy {
             return Err(refused(&reason));
         }
         let freeze_max = freeze_max(opts)?;
+        // Hooks run as root: unsafe ones refuse the job before tracing starts.
+        let hooks = crate::hooks::Hooks::load(
+            opts.hooks_dir
+                .as_deref()
+                .unwrap_or(Path::new(crate::hooks::DEFAULT_HOOKS_DIR)),
+            crate::hooks::DEFAULT_HOOK_TIMEOUT,
+        )?;
         let holds_dpkg = std::fs::metadata(DPKG_DIR).is_ok_and(|dpkg| {
             mountpoints.iter().any(|mountpoint| {
                 std::fs::metadata(mountpoint).is_ok_and(|metadata| metadata.dev() == dpkg.dev())
@@ -630,6 +640,11 @@ impl TrackedCopy {
                 sectors: spec.sectors,
             });
             facts.push(RegionFacts::read(spec)?);
+        }
+        // A killed job's instance keeps tracing into its buffers; remove those
+        // whose owner is gone (spec §E.7; the daemon also sweeps at start).
+        for leftover in tracking::sweep(&tracefs) {
+            tracing::info!(instance = %leftover.display(), "removed a leftover trace instance");
         }
         let name = format!(
             "{}tf-{}-{}",
@@ -671,6 +686,8 @@ impl TrackedCopy {
             log: FreezeLog::default(),
             summary: TrackedSummary::default(),
             convergence: Convergence::default(),
+            hooks,
+            warnings: Vec::new(),
             inhibitor: None,
         };
         copy.summary.frozen_filesystems = u32::try_from(copy.mountpoints.len()).unwrap_or(u32::MAX);
@@ -779,10 +796,20 @@ impl TrackedCopy {
         let count: u64 = chunks.iter().map(|r| r.chunks.len() as u64).sum();
         let dirty_bytes = count * self.engine_chunk_bytes;
         let packages = self.package_transaction_running();
-        match self
-            .convergence
-            .after_pass(&self.limits, dirty_bytes, bytes, elapsed, packages)
-        {
+        let verdict =
+            self.convergence
+                .after_pass(&self.limits, dirty_bytes, bytes, elapsed, packages);
+        tracing::info!(
+            pass = self.summary.passes,
+            dirty_bytes,
+            read_bytes = bytes,
+            read_ms = elapsed.as_millis() as u64,
+            packages,
+            stalled = self.convergence.stalled_passes,
+            ?verdict,
+            "tracked-freeze pass"
+        );
+        match verdict {
             Verdict::Final => return Ok(None),
             Verdict::GiveUp => {
                 return Err(Error::NoConvergence {
@@ -800,11 +827,32 @@ impl TrackedCopy {
         Ok(Some(chunks))
     }
 
-    /// The final read: freeze every tracked filesystem, gather the last
-    /// writes, let `read` read the given engine chunks (into memory, nothing
-    /// may be written), check the quiet window, and thaw. A freeze longer
-    /// than `freeze_max` fails the copy after the thaw.
+    /// The final read (spec §E.7 step 6): the pre-freeze hooks, the frozen
+    /// read, then the post-thaw hooks. Once the pre-freeze hooks began, the
+    /// post-thaw hooks run whatever happened; a failed pre-freeze hook ends
+    /// the copy before anything is frozen, and a failed post-thaw hook is a
+    /// warning ([`Self::warnings`]).
     pub fn final_read<T>(&mut self, read: impl FnOnce(&[RegionChunks]) -> Result<T>) -> Result<T> {
+        let outcome = self
+            .hooks
+            .pre_freeze(&self.mountpoints)
+            .and_then(|()| self.frozen_read(read));
+        let failed = self.hooks.post_thaw(&self.mountpoints);
+        self.warnings.extend(failed);
+        outcome
+    }
+
+    /// Warnings for the backup report.
+    #[must_use]
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    /// Freeze every tracked filesystem, gather the last writes, let `read`
+    /// read the given engine chunks (into memory, nothing may be written),
+    /// check the quiet window, and thaw. A freeze longer than `freeze_max`
+    /// fails the copy after the thaw.
+    fn frozen_read<T>(&mut self, read: impl FnOnce(&[RegionChunks]) -> Result<T>) -> Result<T> {
         debug_assert!(self.engine_chunk_bytes != 0, "bind() first");
         let final_max = self.limits.final_max_bytes;
         let chunk_bytes = self.engine_chunk_bytes;

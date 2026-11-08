@@ -100,10 +100,14 @@ def firmware_args(firmware: str, run: Path, label: str) -> list[str]:
 
 
 def boot(drives: list[str], firmware: str, run: Path, label: str, timeout: int,
-         accel: list[str]) -> tuple[str, float]:
+         accel: list[str]) -> tuple[str, str, float]:
+    """Boot, and return the console, the result port (the guest's ttyS1,
+    which only the guest scripts write) and the seconds it took."""
     serial = run / f"serial-{label}.log"
+    result = run / f"result-{label}.log"
     command = ["qemu-system-x86_64", *accel, "-m", "3072", "-smp", "8",
                "-display", "none", "-no-reboot", "-serial", f"file:{serial}",
+               "-serial", f"file:{result}",
                "-nic", "user,model=virtio-net-pci,restrict=on",
                *firmware_args(firmware, run, label)]
     for drive in drives:
@@ -116,7 +120,8 @@ def boot(drives: list[str], firmware: str, run: Path, label: str, timeout: int,
         qemu.kill()
         qemu.wait()
     text = serial.read_text(errors="replace") if serial.exists() else ""
-    return text, round(time.monotonic() - started, 1)
+    results = result.read_text(errors="replace") if result.exists() else ""
+    return text, results, round(time.monotonic() - started, 1)
 
 
 def between(text: str, begin: str, end: str) -> str | None:
@@ -125,14 +130,15 @@ def between(text: str, begin: str, end: str) -> str | None:
     return text.split(begin, 1)[1].split(end, 1)[0].strip()
 
 
-def first_boot_results(text: str) -> dict:
+def first_boot_results(text: str, console: str) -> dict:
     body = between(text, "LR-RESULT-BEGIN", "LR-RESULT-END")
     if body is None:
         return {"error": "no result from the first boot",
-                "steps": [line for line in text.splitlines() if "LR-STEP" in line][-5:],
-                "serial_tail": text[-4000:]}
+                "steps": [line for line in console.splitlines() if "LR-STEP" in line][-5:],
+                "serial_tail": console[-4000:]}
     files = {}
-    with tarfile.open(fileobj=io.BytesIO(base64.b64decode(body)), mode="r:gz") as archive:
+    payload = base64.b64decode("".join(body.split()), validate=True)
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
         for member in archive.getmembers():
             handle = archive.extractfile(member)
             if handle:
@@ -156,6 +162,10 @@ def judge(files: dict, restored: str | None) -> dict:
         for region in report.get("regions", [])
     ]
     verdict["backup_error"] = files.get("lr-backup.err", "")[-1500:] if backup_rc != "0" else ""
+    # The pass log (`-v`): dirty bytes, read rate and verdict per pass.
+    verdict["passes"] = [line[line.find("tracked-freeze pass"):].strip()
+                         for line in files.get("lr-backup.err", "").splitlines()
+                         if "tracked-freeze pass" in line][-30:]
     verdict["apply_error"] = files.get("lr-apply.err", "")[-1500:] if apply_rc != "0" else ""
     if restored is None:
         verdict["restored_boot"] = "no report from the restored disk"
@@ -226,21 +236,22 @@ def main() -> int:
                 handle.truncate(8 * 1024 ** 3)
             seed = seed_disk(run, label, args.cli)
             print(f"[{label}] first boot: live image and restore ({accel[1]})", flush=True)
-            first, first_seconds = boot(
+            first, first_results, first_seconds = boot(
                 [f"file={system},format=qcow2,if=virtio",
                  f"file={dest},format=qcow2,if=virtio",
                  f"file={target},format=raw,if=virtio",
                  f"file={seed},format=raw,if=virtio,readonly=on"],
                 firmware, run, "first", args.timeout, accel)
-            files = first_boot_results(first)
+            files = first_boot_results(first_results, first)
             restored = None
             second_seconds = 0.0
             if "error" not in files and files.get("lr-apply.rc", "").strip() == "0":
                 print(f"[{label}] second boot: the restored disk alone", flush=True)
-                second, second_seconds = boot(
+                second, second_results, second_seconds = boot(
                     [f"file={target},format=raw,if=virtio"],
                     firmware, run, "restored", args.timeout, accel)
-                restored = between(second, "LR-RESTORED-BOOT-BEGIN", "LR-RESTORED-BOOT-END")
+                restored = between(second_results, "LR-RESTORED-BOOT-BEGIN",
+                                   "LR-RESTORED-BOOT-END")
                 if restored is None:
                     files["restored_serial_tail"] = second[-4000:]
             verdict = judge(files, restored) if "error" not in files else {
@@ -251,6 +262,7 @@ def main() -> int:
             (args.out / f"{label}.json").write_text(json.dumps(verdict, indent=2))
             if args.keep or not verdict["passed"]:
                 (args.out / f"{label}-first.serial").write_text(first[-200000:])
+                (args.out / f"{label}-first.result").write_text(first_results[-400000:])
             print(f"[{label}] {'PASSED' if verdict['passed'] else 'FAILED'}: "
                   f"{json.dumps({k: verdict.get(k) for k in ('tracked', 'restored', 'log_window')})}",
                   flush=True)

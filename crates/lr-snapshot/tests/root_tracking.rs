@@ -262,19 +262,33 @@ fn the_sweep_removes_a_leftover_instance() {
     let Some(tracefs) = tracefs() else {
         return;
     };
-    let leftover = tracefs
-        .join("instances")
-        .join(format!("lr-leftover-{}", std::process::id()));
+    // An instance whose process is gone is removed; one whose process is
+    // alive (here: this one) is left alone, and so are names we did not make.
+    let mut gone = std::process::Command::new("true").spawn().expect("spawn");
+    let dead = gone.id();
+    gone.wait().expect("wait");
+    let instances = tracefs.join("instances");
+    let leftover = instances.join(format!("lr-leftover-{dead}"));
     std::fs::create_dir(&leftover).expect("create a leftover instance");
-    let foreign = tracefs
-        .join("instances")
-        .join(format!("not-ours-{}", std::process::id()));
+    let live = instances.join(format!("lr-live-{}", std::process::id()));
+    std::fs::create_dir(&live).expect("create a live instance");
+    std::fs::write(live.join("tracing_on"), "1").expect("tracing on");
+    let foreign = instances.join(format!("not-ours-{dead}"));
     std::fs::create_dir(&foreign).expect("create a foreign instance");
     let removed = tracking::sweep(&tracefs);
+    let live_survived = live.exists();
+    let live_tracing = std::fs::read_to_string(live.join("tracing_on")).unwrap_or_default();
     let foreign_survived = foreign.exists();
+    let _ = std::fs::remove_dir(&live);
     let _ = std::fs::remove_dir(&foreign);
     assert!(removed.contains(&leftover), "{removed:?}");
     assert!(!leftover.exists());
+    assert!(live_survived, "the sweep removed a running job's instance");
+    assert_eq!(
+        live_tracing.trim(),
+        "1",
+        "the sweep touched a running job's tracing"
+    );
     assert!(
         foreign_survived,
         "the sweep removed an instance that is not ours"

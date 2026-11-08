@@ -94,6 +94,10 @@ pub struct SnapshotOpts {
     /// Tracked-freeze budgets (spec §E.7); unset fields keep the defaults.
     #[serde(default)]
     pub tracked: TrackedTuning,
+    /// Tracked-freeze hooks directory; `None` is `/etc/linuxreflect/hooks`.
+    /// Set by tests and embedders only: never taken from a request.
+    #[serde(skip)]
+    pub hooks_dir: Option<std::path::PathBuf>,
 }
 
 /// Tunable budgets of the tracked-freeze provider (spec §E.7).

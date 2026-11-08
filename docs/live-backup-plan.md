@@ -16,8 +16,10 @@ GUI), the operator guide describes tracked-freeze, and `--freeze-max` is its
 own option (it had been taken from the freeze provider's `--freeze-timeout`,
 whose 300 s default stretched the final-freeze budget to the 30 s cap); only
 passes that do not shrink the dirty set count against `max_passes`, as §E.7
-says. Still open: incremental members, hooks, the daemon's start-up sweep of
-leftover trace instances, the rest of phase 4 (`PlanBackup`, the wizard, the
+says; the pre-freeze and post-thaw hooks run (D-140); the daemon and every
+tracked job sweep leftover trace instances of dead processes; and the
+convergence budget uses the reads' own rate. Still open: incremental
+members, the rest of phase 4 (`PlanBackup`, the wizard, the
 GUI acceptance) and phase 5. It implements spec v2.2 §E.7 and Slice 18
 (decision D-138).
 

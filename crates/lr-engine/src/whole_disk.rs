@@ -375,7 +375,7 @@ pub(crate) fn backup_whole_disk_with_layout(
     };
     // Where each tracked region's entries start in the spool, and its place.
     let mut tracked_regions: Vec<TrackedRegionSpool> = Vec::new();
-    let pass_started = std::time::Instant::now();
+    let reads_before = source.read_stats();
 
     let destination = request.open_destination()?;
     let set = destination.open_set(&request.set_id)?;
@@ -412,6 +412,7 @@ pub(crate) fn backup_whole_disk_with_layout(
     reporter.phase("regions");
     let mut spool_file = crate::spool::scratch_file(&spool_dir)?;
     let mut tracked_summary = None;
+    let mut hook_warnings = Vec::new();
     // Filesystems whose map came back incomplete (D-124).
     let mut map_warnings: Vec<String> = Vec::new();
     // Phase A: chunk records plus the spooled manifest.
@@ -572,6 +573,7 @@ pub(crate) fn backup_whole_disk_with_layout(
         }
         if let Some(copy) = tracked.as_mut() {
             reporter.phase("converge");
+            let first_pass = source.read_stats().since(reads_before);
             let summary = converge_disk(
                 copy,
                 &mut image_writer,
@@ -584,7 +586,7 @@ pub(crate) fn backup_whole_disk_with_layout(
                 &tracked_regions,
                 &mut reports,
                 request,
-                pass_started.elapsed(),
+                first_pass,
             )?;
             // The disk's partition table must be what the image describes.
             if read_pt_raw(&request.source, lbs, disk_header.pt_type)? != disk_header.pt_raw {
@@ -593,6 +595,7 @@ pub(crate) fn backup_whole_disk_with_layout(
                 });
             }
             tracked_summary = Some(summary);
+            hook_warnings.extend_from_slice(copy.warnings());
         }
         spool.flush().map_err(Error::Io)?;
     }
@@ -658,6 +661,7 @@ pub(crate) fn backup_whole_disk_with_layout(
             .warning("the image")
             .into_iter()
             .chain(map_warnings)
+            .chain(hook_warnings)
             .collect(),
         image_path: crate::backup::local_image_path(&set_root, &image_name),
         image_uuid: request.image_uuid,
@@ -732,14 +736,15 @@ fn converge_disk(
     regions: &[TrackedRegionSpool],
     reports: &mut [RegionReport],
     request: &crate::backup::BackupRequest,
-    first_pass: std::time::Duration,
+    first_pass: lr_blocksource::ReadStats,
 ) -> Result<lr_snapshot::TrackedSummary> {
     use crate::backup::{chunk_plan_at, full_entry, store_bytes};
     use lr_format::ChunkState;
     spool.flush().map_err(Error::Io)?;
     let chunk_size = u64::from(request.chunk_size);
-    let mut bytes: u64 = reports.iter().map(|report| report.size_bytes).sum();
-    let mut elapsed = first_pass;
+    // The rate is the reads' own (spec §E.7 step 5): the final read only
+    // reads, while a pass also compresses, encrypts and writes.
+    let mut pass = first_pass;
     let absolute = |region: &TrackedRegionSpool, index: u64| {
         let plan = chunk_plan_at(index, chunk_size, region.size_bytes);
         lr_blocksource::ChunkPlan {
@@ -748,9 +753,8 @@ fn converge_disk(
             len: plan.len,
         }
     };
-    while let Some(dirty) = copy.next_pass(bytes, elapsed)? {
-        let started = std::time::Instant::now();
-        bytes = 0;
+    while let Some(dirty) = copy.next_pass(pass.bytes, pass.time)? {
+        let reads_before = source.read_stats();
         for group in dirty {
             let region = &regions[group.region];
             for index in group.chunks {
@@ -780,10 +784,9 @@ fn converge_disk(
                     &full_entry(state),
                     &mut reports[region.report],
                 )?;
-                bytes += u64::from(plan.len);
             }
         }
-        elapsed = started.elapsed();
+        pass = source.read_stats().since(reads_before);
     }
 
     // The final read: buffers first, then nothing is logged or written
