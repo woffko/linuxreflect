@@ -112,7 +112,7 @@ impl BlockSnapshotProvider for TrackedFreezeProvider {
             &name,
             vec![region],
             TRACK_CHUNK_BYTES,
-            DEFAULT_BUFFER_KB,
+            opts.tracked.buffer_kb.unwrap_or(DEFAULT_BUFFER_KB),
         )?;
         let pending = tracker.empty_map();
         let log = FreezeLog::default();
@@ -133,8 +133,11 @@ impl BlockSnapshotProvider for TrackedFreezeProvider {
             start,
             limits: Limits {
                 freeze_max,
-                final_max_bytes: DEFAULT_FINAL_MAX_BYTES,
-                max_passes: DEFAULT_MAX_PASSES,
+                final_max_bytes: opts
+                    .tracked
+                    .final_max_bytes
+                    .unwrap_or(DEFAULT_FINAL_MAX_BYTES),
+                max_passes: opts.tracked.max_passes.unwrap_or(DEFAULT_MAX_PASSES).max(1),
                 grace,
             },
             engine_chunk_bytes: 0,
@@ -363,6 +366,28 @@ impl TrackedCopy {
         Ok(())
     }
 
+    /// Stop or resume the tracking reader, so the kernel loses events (tests).
+    #[cfg(feature = "fault-injection")]
+    pub fn pause_reader(&self, paused: bool) {
+        self.tracker.pause_reader(paused);
+    }
+
+    /// The used-block map of the live filesystem (spec §E.7 step 4), taken
+    /// after the barrier. `dumpe2fs` reading a changing filesystem can see a
+    /// bitmap and its checksum from different moments and refuse, so it is
+    /// retried, and the last attempt runs with the filesystem frozen, where
+    /// the metadata is consistent.
+    pub fn used_map(&mut self) -> Result<lr_fsmap::ExtentMap> {
+        for _ in 0..3 {
+            if let Ok(map) = lr_fsmap::live_used_extents(&self.source) {
+                return Ok(map);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let source = self.source.clone();
+        self.frozen_with(|_| lr_fsmap::live_used_extents(&source))
+    }
+
     /// Engine chunks still pending; the final read reads at least these.
     pub fn pending_count(&self) -> usize {
         self.pending_engine_chunks().len()
@@ -474,7 +499,9 @@ impl TrackedCopy {
     }
 
     fn frozen_with<T>(&mut self, inside: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
-        let after = HARD_FREEZE_MAX.max(self.limits.freeze_max) + self.limits.grace;
+        // The deadman can only fire after `freeze_max`, and a freeze that long
+        // fails the copy anyway, so an early thaw can never be published.
+        let after = self.limits.freeze_max + self.limits.grace;
         let mut set = FrozenSet::default();
         for mountpoint in &self.mountpoints {
             let deadman = Deadman::arm(mountpoint, after, &self.log)?;

@@ -6,6 +6,13 @@
 //! the sum of the ranges against the superblock total and refuses to return a
 //! map when they disagree: an incomplete used-block map would silently produce
 //! an image that cannot be restored.
+//!
+//! A mounted filesystem that is being written is different: its superblock
+//! total is a lagging summary of per-CPU counters. [`live_used_extents`] maps
+//! such a filesystem for the tracked-freeze provider (spec §E.7) without that
+//! cross-check, because there the map only decides what the first pass reads:
+//! a block it misses was allocated after the barrier, so it was written after
+//! tracking started and is copied as a dirty chunk.
 
 use std::io::BufRead;
 use std::path::Path;
@@ -104,6 +111,21 @@ impl Ext4Dump {
 /// their group or outside the filesystem, or when the sum of the free ranges
 /// does not equal the superblock's free-block total.
 pub fn parse_dumpe2fs(reader: &mut dyn BufRead) -> Result<Ext4Dump> {
+    parse(reader, true)
+}
+
+/// The used-block map of a mounted, changing ext4 filesystem for a tracked
+/// copy (see the module documentation): every check of [`parse_dumpe2fs`]
+/// except the one against the superblock's free total.
+///
+/// # Errors
+/// As [`UsedBlockProvider::used_extents`].
+pub fn live_used_extents(dev: &Path) -> Result<ExtentMap> {
+    let dump = tool::with_tool_output("dumpe2fs", &[], dev, |reader| parse(reader, false))?;
+    dump.used_map()
+}
+
+fn parse(reader: &mut dyn BufRead, check_total: bool) -> Result<Ext4Dump> {
     let mut block_size: Option<u64> = None;
     let mut block_count: Option<u64> = None;
     let mut first_block: Option<u64> = None;
@@ -189,7 +211,7 @@ pub fn parse_dumpe2fs(reader: &mut dyn BufRead) -> Result<Ext4Dump> {
     free = normalize(free)?;
 
     let free_from_lists: u64 = free.iter().map(|(start, end)| end - start + 1).sum();
-    if free_from_lists != facts.free_blocks_total {
+    if check_total && free_from_lists != facts.free_blocks_total {
         return Err(Error::corrupt(format!(
             "dumpe2fs: free lists sum to {free_from_lists} blocks but the superblock reports {}",
             facts.free_blocks_total
@@ -259,7 +281,7 @@ fn parse_block_ranges(list: &str) -> Result<Vec<(u64, u64)>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Ext4Provider, parse_dumpe2fs};
+    use super::{Ext4Provider, parse, parse_dumpe2fs};
     use crate::UsedBlockProvider;
     use std::io::BufReader;
 
@@ -333,6 +355,24 @@ mod tests {
         );
         let mut reader = BufReader::new(text.as_bytes());
         assert!(parse_dumpe2fs(&mut reader).is_err());
+    }
+
+    #[test]
+    fn a_live_map_tolerates_a_lagging_total_but_nothing_else() {
+        let lagging = FRESH.replace(
+            "Free blocks:              57268\n",
+            "Free blocks:              57264\n",
+        );
+        let mut reader = BufReader::new(lagging.as_bytes());
+        assert!(parse(&mut reader, true).is_err());
+        let mut reader = BufReader::new(lagging.as_bytes());
+        let live = parse(&mut reader, false).expect("a live map");
+        let mut reader = BufReader::new(FRESH.as_bytes());
+        assert_eq!(live.free, parse_dumpe2fs(&mut reader).expect("strict").free);
+        let overlapping =
+            lagging.replace("  Free blocks: 4139-32767\n", "  Free blocks: 4139-50000\n");
+        let mut reader = BufReader::new(overlapping.as_bytes());
+        assert!(parse(&mut reader, false).is_err(), "other checks stay");
     }
 
     #[test]

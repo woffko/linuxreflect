@@ -34,7 +34,8 @@ tempfile.workspace = true
 lr-testkit.workspace = true
 libc.workspace = true
 lr-fsmap.workspace = true
-lr-snapshot.workspace = true
+# Test builds only: a paused tracking reader for tests/root_tracked.rs.
+lr-snapshot = { workspace = true, features = ["fault-injection"] }
 lr-core.workspace = true
 lr-blocksource.workspace = true
 # Test builds only: `fault+<kind>:` destinations for tests/fault_injection.rs.

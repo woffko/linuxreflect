@@ -119,6 +119,8 @@ pub struct BackupRequest {
     pub lvm_cow_size: Option<String>,
     /// Extra grace before the freeze deadman fires (default 30 s).
     pub deadman_grace_secs: Option<u64>,
+    /// Tracked-freeze budgets (spec §E.7).
+    pub tracked_tuning: lr_core::TrackedTuning,
     /// Chain member type (spec §J.1 `--type`).
     pub member_type: MemberType,
     /// `--parent latest|<uuid>`; required in spirit for incrementals.
@@ -176,6 +178,7 @@ impl BackupRequest {
             allow_inconsistent: false,
             lvm_cow_size: None,
             deadman_grace_secs: None,
+            tracked_tuning: lr_core::TrackedTuning::default(),
             member_type: MemberType::Full,
             parent: None,
             break_stale_lock: false,
@@ -394,7 +397,10 @@ pub fn backup_block_with(
         .as_ref()
         .map(|facts| facts.fs_type.clone())
         .unwrap_or_else(|| lr_fsmap::RAW_FS_TYPE.to_owned());
-    let map = provider_for(&fs_type).used_extents(&snapshot.block_path)?;
+    let map = match snapshot.tracked_mut() {
+        Some(tracked) => tracked.used_map()?,
+        None => provider_for(&fs_type).used_extents(&snapshot.block_path)?,
+    };
 
     // 3. Open the source for aligned reads.
     let mut source = DirectBlockSource::open(&snapshot.block_path)?;
@@ -1375,6 +1381,7 @@ pub(crate) fn snapshot_opts(request: &BackupRequest) -> SnapshotOpts {
         allow_inconsistent: request.allow_inconsistent,
         lvm_cow_size: request.lvm_cow_size.clone(),
         deadman_grace_secs: request.deadman_grace_secs,
+        tracked: request.tracked_tuning,
         // The freeze provider proves the destination is on another
         // filesystem. The parsed destination decides: the CLI and the daemon
         // pass even a local path as `dest`, and only SFTP is remote (R27).

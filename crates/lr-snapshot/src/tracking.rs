@@ -586,6 +586,8 @@ struct State {
     marker: u64,
     malformed: u64,
     stop: bool,
+    /// Test builds only can set it: the reader stops reading the pipe.
+    paused: bool,
     reader_error: Option<String>,
 }
 
@@ -639,6 +641,7 @@ impl Tracker {
                 marker: 0,
                 malformed: 0,
                 stop: false,
+                paused: false,
                 reader_error: None,
             }),
             changed: Condvar::new(),
@@ -698,6 +701,12 @@ impl Tracker {
         self.shared.lock().map.empty_like()
     }
 
+    /// Stop or resume reading the pipe, so the ring buffer overflows (tests).
+    #[cfg(feature = "fault-injection")]
+    pub fn pause_reader(&self, paused: bool) {
+        self.shared.lock().paused = paused;
+    }
+
     /// Every loss so far; the copy is trustworthy only when it is clean.
     pub fn integrity(&self) -> Result<Losses> {
         let mut losses = self.instance.losses()?;
@@ -708,7 +717,11 @@ impl Tracker {
 
 impl Drop for Tracker {
     fn drop(&mut self) {
-        self.shared.lock().stop = true;
+        {
+            let mut state = self.shared.lock();
+            state.stop = true;
+            state.paused = false;
+        }
         // Wake the reader with a marker while tracing is still on. If the
         // marker cannot be written the reader may never wake: leave it
         // detached rather than hang (the instance is then left for `sweep`).
@@ -748,6 +761,11 @@ fn consume(pipe: File, shared: &Shared) {
         }
         if state.stop {
             return;
+        }
+        while state.paused && !state.stop {
+            drop(state);
+            std::thread::sleep(Duration::from_millis(20));
+            state = shared.lock();
         }
     }
 }

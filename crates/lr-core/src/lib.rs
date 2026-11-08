@@ -91,6 +91,20 @@ pub struct SnapshotOpts {
     pub destination: Option<std::path::PathBuf>,
     /// `true` when the image is written to another host (SFTP).
     pub destination_remote: bool,
+    /// Tracked-freeze budgets (spec §E.7); unset fields keep the defaults.
+    #[serde(default)]
+    pub tracked: TrackedTuning,
+}
+
+/// Tunable budgets of the tracked-freeze provider (spec §E.7).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TrackedTuning {
+    /// Most bytes the final freeze may read (`final_max`, default 256 MiB).
+    pub final_max_bytes: Option<u64>,
+    /// Passes before the copy gives up (`max_passes`, default 10).
+    pub max_passes: Option<u32>,
+    /// Per-CPU ring buffer of the trace instance in KiB (default 16384).
+    pub buffer_kb: Option<u32>,
 }
 
 /// Result of a provider support query.

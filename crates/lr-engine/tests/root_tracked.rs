@@ -184,7 +184,7 @@ impl Drop for Source {
 /// 4 KiB overwrites whose blocks describe themselves, and file churn.
 struct Writer {
     stop: Arc<AtomicBool>,
-    handle: JoinHandle<Vec<(u64, Instant, Instant)>>,
+    handle: Option<JoinHandle<Vec<(u64, Instant, Instant)>>>,
 }
 
 fn link(previous: u64, seq: u64) -> u64 {
@@ -260,12 +260,29 @@ impl Writer {
             }
             records
         });
-        Self { stop, handle }
+        Self {
+            stop,
+            handle: Some(handle),
+        }
     }
 
-    fn stop(self) -> Vec<(u64, Instant, Instant)> {
+    fn stop(mut self) -> Vec<(u64, Instant, Instant)> {
         self.stop.store(true, Ordering::Relaxed);
-        self.handle.join().expect("writer thread")
+        self.handle
+            .take()
+            .expect("writer thread")
+            .join()
+            .expect("writer thread")
+    }
+}
+
+impl Drop for Writer {
+    // A failing test must not unmount the source under a running writer.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -458,4 +475,229 @@ fn an_incremental_is_refused_in_this_release() {
     incremental.parent = Some("latest".to_owned());
     let error = backup_image(&incremental).expect_err("an incremental must be refused");
     assert!(error.to_string().contains("full images"), "{error}");
+}
+
+fn images_under(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(images_under(&path));
+        } else if path.extension().is_some_and(|ext| ext == "lrimg") {
+            found.push(path);
+        }
+    }
+    found
+}
+
+fn trace_leftovers() -> usize {
+    let tracefs = lr_snapshot::tracking::tracefs_root().expect("tracefs");
+    std::fs::read_dir(tracefs.join("instances"))
+        .expect("instances")
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("lr-tf-"))
+        .count()
+}
+
+/// Whether a write to `mountpoint` completes within `limit`. The probe is a
+/// separate process that is never waited on past the deadline: a write to a
+/// frozen filesystem sleeps uninterruptibly, so `timeout` cannot end it (a
+/// probe left behind finishes once the filesystem thaws).
+#[allow(clippy::zombie_processes)] // A frozen probe is left to finish after the thaw.
+fn writable_within(mountpoint: &Path, limit: Duration) -> bool {
+    let mut probe = Command::new("touch")
+        .arg(mountpoint.join("writable"))
+        .spawn()
+        .expect("spawn touch");
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline {
+        if let Ok(Some(status)) = probe.try_wait() {
+            return status.success();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+#[test]
+#[ignore = "requires root, loop devices, tracefs and fsfreeze"]
+fn a_source_that_keeps_changing_fails_without_publishing() {
+    if !root_tests_enabled() || !prerequisites() {
+        return;
+    }
+    let Some(source) = Source::create() else {
+        return;
+    };
+    let work = tempfile::tempdir().expect("work");
+    let dest = work.path().join("backups");
+    let writer = Writer::start(&source.mountpoint().join("work"));
+    std::thread::sleep(Duration::from_millis(300));
+    // One pass, and at most one chunk under the freeze: the writer dirties more.
+    let mut tight = request(&source.partition(), &dest);
+    tight.tracked_tuning = lr_core::TrackedTuning {
+        final_max_bytes: Some(u64::from(CHUNK_SIZE)),
+        max_passes: Some(1),
+        buffer_kb: None,
+    };
+    let outcome = backup_image(&tight);
+    drop(writer.stop());
+    let error = outcome.expect_err("a source that keeps changing must fail");
+    assert!(
+        matches!(error, lr_core::Error::NoConvergence { .. }),
+        "expected E_NO_CONVERGENCE, got {error}"
+    );
+    assert!(images_under(&dest).is_empty(), "an image was published");
+    assert_eq!(trace_leftovers(), 0, "a trace instance was left behind");
+    assert!(
+        writable_within(&source.mountpoint(), Duration::from_secs(5)),
+        "the source stayed frozen"
+    );
+}
+
+/// Child process for [`a_sigkill_during_the_final_freeze_is_thawed_by_the_deadman`].
+#[test]
+#[ignore = "internal helper for the tracked-freeze deadman test"]
+fn tracked_freeze_child_helper() {
+    let Ok(device) = std::env::var("LR_TRACKED_DEVICE") else {
+        return;
+    };
+    let destination = PathBuf::from(std::env::var("LR_TRACKED_DEST").expect("destination"));
+    let ready = std::env::var("LR_TRACKED_READY").expect("ready file");
+    let layout = lr_core::discover_source(Path::new(&device)).expect("discover");
+    let options = lr_core::SnapshotOpts {
+        provider: Some("tracked-freeze".to_owned()),
+        freeze_timeout_secs: Some(1),
+        deadman_grace_secs: Some(2),
+        destination: Some(destination),
+        ..lr_core::SnapshotOpts::default()
+    };
+    use lr_snapshot::BlockSnapshotProvider as _;
+    let mut snapshot = lr_snapshot::tracked_freeze::provider()
+        .create(&layout, &options)
+        .expect("child tracked copy");
+    let tracked = snapshot.tracked_mut().expect("tracked");
+    tracked.bind(u64::from(CHUNK_SIZE)).expect("bind");
+    // Freeze for the final read and never come back: only the deadman thaws.
+    let _ = tracked.final_read(|_| -> lr_core::Result<()> {
+        std::fs::write(&ready, b"frozen").expect("signal readiness");
+        std::thread::sleep(Duration::from_secs(600));
+        Ok(())
+    });
+}
+
+#[test]
+#[ignore = "requires root, loop devices, tracefs and fsfreeze"]
+fn a_sigkill_during_the_final_freeze_is_thawed_by_the_deadman() {
+    if !root_tests_enabled() || !prerequisites() {
+        return;
+    }
+    let Some(source) = Source::create() else {
+        return;
+    };
+    let work = tempfile::tempdir().expect("work");
+    let ready = work.path().join("tracked-child.ready");
+    let mut child = Command::new(std::env::current_exe().expect("current exe"))
+        .args([
+            "--exact",
+            "tracked_freeze_child_helper",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("LR_TRACKED_DEVICE", source.partition())
+        .env("LR_TRACKED_DEST", work.path())
+        .env("LR_TRACKED_READY", &ready)
+        .spawn()
+        .expect("spawn the child");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline && !ready.exists() {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if !ready.exists() {
+        let _ = child.kill();
+        let _ = child.wait();
+        lr_testkit::fixture_failed!("the child never froze the source");
+    }
+    // Frozen now: a write must block.
+    assert!(
+        !writable_within(&source.mountpoint(), Duration::from_millis(300)),
+        "the source was not frozen"
+    );
+    // kill -9 with no chance to thaw: only the external deadman can help (the
+    // kernel keeps a filesystem frozen after the process that froze it dies).
+    let killed = Instant::now();
+    child.kill().expect("kill -9 the child");
+    let _ = child.wait();
+    assert!(
+        !writable_within(&source.mountpoint(), Duration::from_millis(200)),
+        "the kill itself thawed the source; the deadman was not what thawed it"
+    );
+    // freeze_max 1 s + grace 2 s after the freeze began.
+    assert!(
+        writable_within(&source.mountpoint(), Duration::from_secs(30)),
+        "the deadman must thaw the source after the job was killed"
+    );
+    println!("thawed {:?} after the kill", killed.elapsed());
+    // The killed job's instance is left for the start-up sweep.
+    let tracefs = lr_snapshot::tracking::tracefs_root().expect("tracefs");
+    let swept = lr_snapshot::tracking::sweep(&tracefs);
+    assert!(
+        swept.iter().any(|dir| dir
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("lr-tf-"))),
+        "the sweep found no leftover instance: {swept:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires root, loop devices, tracefs and fsfreeze"]
+fn lost_events_fail_the_copy() {
+    if !root_tests_enabled() || !prerequisites() {
+        return;
+    }
+    let Some(source) = Source::create() else {
+        return;
+    };
+    let work = tempfile::tempdir().expect("work");
+    let layout = lr_core::discover_source(Path::new(&source.partition())).expect("discover");
+    let options = lr_core::SnapshotOpts {
+        provider: Some("tracked-freeze".to_owned()),
+        destination: Some(work.path().to_path_buf()),
+        tracked: lr_core::TrackedTuning {
+            buffer_kb: Some(4),
+            ..lr_core::TrackedTuning::default()
+        },
+        ..lr_core::SnapshotOpts::default()
+    };
+    use lr_snapshot::BlockSnapshotProvider as _;
+    let mut snapshot = lr_snapshot::tracked_freeze::provider()
+        .create(&layout, &options)
+        .expect("tracked copy");
+    let tracked = snapshot.tracked_mut().expect("tracked");
+    tracked.bind(u64::from(CHUNK_SIZE)).expect("bind");
+    // Starve the reader while the source is written: a 4 KiB ring buffer
+    // per CPU overflows, and those writes are never seen.
+    tracked.pause_reader(true);
+    let dir = source.mountpoint().join("burst");
+    std::fs::create_dir(&dir).expect("burst dir");
+    for index in 0..300 {
+        let path = dir.join(format!("{index}.bin"));
+        let mut file = std::fs::File::create(&path).expect("create");
+        file.write_all(&[index as u8; 16 * 1024]).expect("write");
+        file.sync_all().expect("fsync");
+    }
+    tracked.pause_reader(false);
+    tracked
+        .final_read(|_| -> lr_core::Result<()> { Ok(()) })
+        .expect("final read");
+    let error = tracked
+        .finish()
+        .expect_err("lost events must fail the copy");
+    assert!(
+        matches!(error, lr_core::Error::TrackingLost { .. }),
+        "expected E_TRACKING_LOST, got {error}"
+    );
+    println!("{error}");
 }
