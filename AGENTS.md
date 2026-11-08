@@ -13,8 +13,12 @@ through the tracked-freeze provider (§E.7, Slice 18), planned in
 disk (root, `/boot`, ESP) live into a full image with `--snapshot
 tracked-freeze` (root tests `lr-engine/tests/root_tracked.rs`; VM acceptance
 `tools/vm/live_restore_matrix.py`, results in `docs/live-backup-acceptance.md`:
-six distribution and firmware runs imaged live, restored and booted).
-Incremental members and the daemon/GUI wiring are not done yet.
+six distribution and firmware runs imaged live, restored and booted, re-run
+on `1986503` with the 3 s `--freeze-max` default). Phase 4 added the restore
+plan's shared-UUID warning (D-139), `--freeze-max`, the pre-freeze/post-thaw
+hooks (D-140), a sweep of dead jobs' trace instances, a read-only convergence
+rate and a root test of a live job through the daemon. Incremental members,
+`PlanBackup` and the GUI wizard are not done yet.
 
 The MVP is slices S1–S11 (spec §K). Slices are landed one pull request each.
 Current state: S1 (workspace, `lr-core`, `lr-unsafe`, capability probe,

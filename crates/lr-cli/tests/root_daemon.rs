@@ -708,7 +708,15 @@ fn a_mounted_ext4_is_imaged_live_through_the_daemon() {
             lr_testkit::unavailable!("{tool} missing");
         }
     }
-    if !Path::new("/sys/kernel/tracing/events/block/block_bio_queue").is_dir() {
+    // Where the provider looks for tracefs (lr_snapshot::tracking::tracefs_root).
+    if !["/sys/kernel/tracing", "/sys/kernel/debug/tracing"]
+        .iter()
+        .any(|root| {
+            Path::new(root)
+                .join("events/block/block_bio_queue")
+                .is_dir()
+        })
+    {
         lr_testkit::unavailable!("tracefs or the block_bio_queue tracepoint is unavailable");
     }
     let Some(source) = LoopDisk::ext4(256) else {

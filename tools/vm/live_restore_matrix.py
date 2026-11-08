@@ -113,12 +113,15 @@ def boot(drives: list[str], firmware: str, run: Path, label: str, timeout: int,
     for drive in drives:
         command += ["-drive", drive]
     started = time.monotonic()
-    qemu = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    try:
-        qemu.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        qemu.kill()
-        qemu.wait()
+    errors = run / f"qemu-{label}.err"
+    with open(errors, "wb") as stderr:
+        qemu = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=stderr)
+        try:
+            qemu.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            qemu.kill()
+            qemu.wait()
+    boot.last_exit = (qemu.returncode, errors.read_text(errors="replace")[-2000:])
     text = serial.read_text(errors="replace") if serial.exists() else ""
     results = result.read_text(errors="replace") if result.exists() else ""
     return text, results, round(time.monotonic() - started, 1)
@@ -255,7 +258,7 @@ def main() -> int:
                 if restored is None:
                     files["restored_serial_tail"] = second[-4000:]
             verdict = judge(files, restored) if "error" not in files else {
-                "passed": False, **files}
+                "passed": False, **files, "qemu_exit": boot.last_exit}
             verdict.update(distribution=distribution, firmware=firmware,
                            first_boot_seconds=first_seconds,
                            restored_boot_seconds=second_seconds)

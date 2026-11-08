@@ -220,7 +220,7 @@ disk together, reads the remaining changed blocks into memory, thaws, and only
 then writes them to the image. Programs that write to those filesystems wait
 only during this final freeze. The report gives its length (`tracked`,
 `final_freeze_ms`), the passes and the re-copied chunks. In the acceptance
-runs it lasted 0.6–1.4 s under full emulation and about 0.2 s on loop disks.
+runs it lasted 0.6–1.3 s under full emulation and about 0.2 s on loop disks.
 
 **What it guarantees.** Every ext4 filesystem in the image is as the freeze
 left it: journal flushed, clean, and at the same instant for every filesystem
@@ -335,9 +335,9 @@ write load, restored to another disk, and booted from that disk alone
 **Not done yet:** incremental and differential members (a tracked copy is
 always a full image; other types are refused), the backup wizard and
 `PlanBackup` predictions, the `--allow-inconsistent` exception for a busy
-ESP, and xfs. **Untested so far:** jobs run through the daemon (the
-acceptance runs used the CLI without one), real hardware at full speed, and a
-desktop session during the backup.
+ESP, and xfs. **Untested so far:** real hardware at full speed and a desktop
+session during the backup. Jobs through the daemon are covered by a root test
+on loop disks, not by the VM acceptance, which runs the CLI without a daemon.
 
 ## Chains: full, incremental, differential
 

@@ -10,7 +10,8 @@ submission and on completion, dpkg's lock postpones the final freeze and a
 logind inhibitor blocks sleep, and the VM acceptance passed on Debian 12,
 Debian 13, Ubuntu 22.04 and Ubuntu 24.04, UEFI with Secure Boot and BIOS
 (`docs/live-backup-acceptance.md`: each running system imaged live, restored
-onto another disk, and booted from it alone). Phase 4 has begun: the
+onto another disk, and booted from it alone; re-run on `1986503` with the 3 s
+budget). Phase 4 has begun: the
 restore plan names an attached disk that shares the copy's UUIDs (CLI and
 GUI), the operator guide describes tracked-freeze, and `--freeze-max` is its
 own option (it had been taken from the freeze provider's `--freeze-timeout`,
