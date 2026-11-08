@@ -15,6 +15,7 @@ pub mod live_none;
 pub mod lvm;
 pub mod offline;
 pub mod probe;
+pub mod tracking;
 
 pub use btrfs::{BtrfsProvider, PathMount, TreeSnapshot, TreeSnapshotOpts};
 pub use freeze::FreezeProvider;

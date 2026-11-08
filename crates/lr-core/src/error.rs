@@ -39,6 +39,14 @@ pub enum Error {
     #[error("freeze timeout")]
     FreezeTimeout,
 
+    /// Write tracking lost or could not interpret an event, so a
+    /// tracked-freeze copy cannot be trusted (spec §E.7); nothing is published.
+    #[error("write tracking lost events: {reason}")]
+    TrackingLost {
+        /// What was lost or misread.
+        reason: String,
+    },
+
     /// An incremental Btrfs send needs a parent snapshot that no longer exists
     /// (spec §E.1: the incremental is refused and a new full is required).
     #[error(
