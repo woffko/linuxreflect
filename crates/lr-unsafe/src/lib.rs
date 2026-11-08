@@ -150,6 +150,31 @@ pub fn fs_freeze_supported(dir: &OwnedFd) -> bool {
     }
 }
 
+/// Whether a lock held through another open file description conflicts with
+/// a write lock over the whole of `path` (`F_OFD_GETLK`). POSIX record locks
+/// and OFD locks both count. The file is opened read-only and no lock is
+/// taken: this only looks (dpkg's `lock-frontend`, spec §E.7).
+pub fn write_lock_conflicts(path: &std::path::Path) -> io::Result<bool> {
+    let file = File::open(path)?;
+    // SAFETY: `flock` is a plain C struct of integers, for which all-zero is
+    // a valid value; every field the kernel reads is set below.
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = libc::F_WRLCK as _;
+    lock.l_whence = libc::SEEK_SET as _;
+    lock.l_start = 0;
+    lock.l_len = 0;
+    lock.l_pid = 0;
+    // SAFETY: the descriptor stays open for the call, and `lock` is a valid,
+    // writable `flock` the kernel fills in; `F_OFD_GETLK` requires `l_pid`
+    // to be 0, which it is. A failure is returned as an error, nothing else
+    // is touched.
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_GETLK, &mut lock) };
+    if rc < 0 {
+        return Err(last_os_error());
+    }
+    Ok(lock.l_type != libc::F_UNLCK as _)
+}
+
 /// Open a directory read-only for freeze probing.
 pub fn open_dir_readonly(path: &std::path::Path) -> io::Result<OwnedFd> {
     let file = File::open(path)?;
@@ -453,6 +478,32 @@ pub fn adopt_fd(fd: std::os::fd::RawFd) -> io::Result<OwnedFd> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_held_write_lock_is_seen_and_an_unlocked_file_is_not() {
+        use std::os::fd::AsRawFd as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lock-frontend");
+        std::fs::write(&path, b"").expect("lock file");
+        assert!(!super::write_lock_conflicts(&path).expect("query"));
+        // An OFD lock belongs to its open file description, so a second
+        // description in this same process sees it as a conflict.
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open");
+        // SAFETY: a zeroed `flock` is valid; the fields used are set.
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        lock.l_type = libc::F_WRLCK as _;
+        lock.l_whence = libc::SEEK_SET as _;
+        // SAFETY: the descriptor is open and `lock` is valid for the call.
+        let rc = unsafe { libc::fcntl(holder.as_raw_fd(), libc::F_OFD_SETLK, &lock) };
+        assert_eq!(rc, 0, "take the lock");
+        assert!(super::write_lock_conflicts(&path).expect("query"));
+        drop(holder);
+        assert!(!super::write_lock_conflicts(&path).expect("query"));
+    }
+
     #[test]
     fn rename_noreplace_never_replaces() {
         let dir = tempfile::tempdir().expect("tempdir");

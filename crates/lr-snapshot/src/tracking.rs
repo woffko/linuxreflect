@@ -25,8 +25,12 @@ use std::time::{Duration, Instant};
 
 use lr_core::{Error, Result};
 
-/// The tracepoint the provider records, relative to `events/`.
+/// The bio submission tracepoint, relative to `events/`.
 pub const TRACEPOINT: &str = "block/block_bio_queue";
+/// The request completion tracepoint, relative to `events/`. A chunk is
+/// dirtied when a write to it is submitted and again when it completes, so a
+/// read that overlapped a write still in flight is always repeated.
+pub const COMPLETION_TRACEPOINT: &str = "block/block_rq_complete";
 /// The size of a sector in tracepoint events.
 pub const SECTOR_BYTES: u64 = 512;
 /// The prefix of every ftrace instance the provider creates.
@@ -35,6 +39,9 @@ pub const INSTANCE_PREFIX: &str = "lr-";
 /// The textual layout this parser understands (`print fmt` of the event).
 const PRINT_FORMAT: &str = "print fmt: \"%d,%d %s %llu + %u [%s]\"";
 const EVENT_TAG: &str = "block_bio_queue: ";
+/// The completion layout's common prefix (6.x kernels append ioprio fields).
+const COMPLETE_PRINT_PREFIX: &str = "print fmt: \"%d,%d %s (%s) %llu + %u";
+const COMPLETE_TAG: &str = "block_rq_complete: ";
 const MARKER_TAG: &str = "tracing_mark_write: LR-DRAIN-";
 
 /// A device number as the kernel reports it.
@@ -114,6 +121,10 @@ pub fn parse_line(line: &str) -> Line {
     if let Some(at) = line.find(EVENT_TAG) {
         return parse_event(&line[at + EVENT_TAG.len()..]).map_or(Line::Malformed, Line::Bio);
     }
+    if let Some(at) = line.find(COMPLETE_TAG) {
+        return parse_completion(&line[at + COMPLETE_TAG.len()..])
+            .map_or(Line::Malformed, Line::Bio);
+    }
     if let Some(at) = line.find(MARKER_TAG) {
         let digits = line[at + MARKER_TAG.len()..].trim_end();
         return digits.parse().map_or(Line::Other, Line::Marker);
@@ -142,6 +153,61 @@ fn parse_event(rest: &str) -> Option<BioEvent> {
         sector: sector.parse().ok()?,
         sectors,
     })
+}
+
+fn parse_completion(rest: &str) -> Option<BioEvent> {
+    // "<major>,<minor> <rwbs> (<cmd>) <sector> + <sectors> ..." where the
+    // command, empty for ordinary I/O, is skipped up to its closing bracket.
+    let (dev, rest) = rest.split_once(' ')?;
+    let (rwbs, rest) = rest.split_once(' ')?;
+    let rest = rest.strip_prefix('(')?;
+    let (_command, rest) = rest.split_once(") ")?;
+    let mut fields = rest.split_ascii_whitespace();
+    let sector = fields.next()?;
+    if fields.next()? != "+" {
+        return None;
+    }
+    let sectors: u64 = fields.next()?.parse().ok()?;
+    let (major, minor) = dev.split_once(',')?;
+    Some(BioEvent {
+        dev: DevNumber {
+            major: major.parse().ok()?,
+            minor: minor.parse().ok()?,
+        },
+        kind: classify(rwbs, sectors),
+        // A flush completes at sector -1 with no length; it carries no data.
+        sector: if sectors == 0 {
+            0
+        } else {
+            sector.parse().ok()?
+        },
+        sectors,
+    })
+}
+
+/// Check that the completion tracepoint's `format` file has the layout
+/// [`parse_line`] understands; refuse it otherwise.
+pub fn check_completion_format(format: &str) -> std::result::Result<(), String> {
+    for field in [
+        "field:dev_t dev;",
+        "field:sector_t sector;",
+        "field:unsigned int nr_sector;",
+        "field:char rwbs[",
+    ] {
+        if !format.contains(field) {
+            return Err(format!("the completion tracepoint has no `{field}` field"));
+        }
+    }
+    let Some(print) = format.lines().find(|line| line.starts_with("print fmt:")) else {
+        return Err("the completion tracepoint has no print format".to_owned());
+    };
+    if !print.starts_with(COMPLETE_PRINT_PREFIX) {
+        return Err(format!("unrecognised completion print format: {print}"));
+    }
+    if !print.contains("(REC->dev) >> 20") {
+        return Err("device numbers are not printed with 20 minor bits".to_owned());
+    }
+    Ok(())
 }
 
 /// Check that the tracepoint's `format` file has the layout [`parse_line`]
@@ -434,6 +500,18 @@ impl TraceInstance {
                 ))
             })?;
         check_format(&format).map_err(Error::unsupported)?;
+        let completion = fs::read_to_string(
+            tracefs
+                .join("events")
+                .join(COMPLETION_TRACEPOINT)
+                .join("format"),
+        )
+        .map_err(|error| {
+            Error::unsupported(format!(
+                "the {COMPLETION_TRACEPOINT} tracepoint is unavailable: {error}"
+            ))
+        })?;
+        check_completion_format(&completion).map_err(Error::unsupported)?;
 
         let dir = tracefs.join("instances").join(name);
         fs::create_dir(&dir).map_err(|error| {
@@ -451,8 +529,10 @@ impl TraceInstance {
             .join(" || ");
         instance.write("tracing_on", "0")?;
         instance.write("buffer_size_kb", &buffer_kb.to_string())?;
-        instance.write(&format!("events/{TRACEPOINT}/filter"), &filter)?;
-        instance.write(&format!("events/{TRACEPOINT}/enable"), "1")?;
+        for event in [TRACEPOINT, COMPLETION_TRACEPOINT] {
+            instance.write(&format!("events/{event}/filter"), &filter)?;
+            instance.write(&format!("events/{event}/enable"), "1")?;
+        }
         instance.write("tracing_on", "1")?;
         Ok(instance)
     }
@@ -524,7 +604,9 @@ fn add_stats(text: &str, losses: &mut Losses) {
 impl Drop for TraceInstance {
     fn drop(&mut self) {
         let _ = self.write("tracing_on", "0");
-        let _ = self.write(&format!("events/{TRACEPOINT}/enable"), "0");
+        for event in [TRACEPOINT, COMPLETION_TRACEPOINT] {
+            let _ = self.write(&format!("events/{event}/enable"), "0");
+        }
         remove_instance_dir(&self.dir);
     }
 }
@@ -559,7 +641,9 @@ pub fn sweep(tracefs: &Path) -> Vec<PathBuf> {
         }
         let dir = entry.path();
         let _ = fs::write(dir.join("tracing_on"), "0");
-        let _ = fs::write(dir.join("events").join(TRACEPOINT).join("enable"), "0");
+        for event in [TRACEPOINT, COMPLETION_TRACEPOINT] {
+            let _ = fs::write(dir.join("events").join(event).join("enable"), "0");
+        }
         remove_instance_dir(&dir);
         if !dir.exists() {
             removed.push(dir);
@@ -990,7 +1074,72 @@ mod tests {
     const PIPE: &str = include_str!(
         "../tests/fixtures/trace/block_bio_queue-6.18.58.1-microsoft-standard-WSL2.pipe"
     );
+    const EVENTS: &str =
+        include_str!("../tests/fixtures/trace/block-events-6.18.58.1-microsoft-standard-WSL2.pipe");
+    const COMPLETE_6_18: &str = include_str!(
+        "../tests/fixtures/trace/block_rq_complete-6.18.58.1-microsoft-standard-WSL2.format"
+    );
+    const COMPLETE_6_8: &str =
+        include_str!("../tests/fixtures/trace/block_rq_complete-6.8.0-138-generic.format");
     const LOOP: DevNumber = DevNumber { major: 7, minor: 0 };
+
+    #[test]
+    fn completion_formats_of_both_kernel_generations_are_accepted() {
+        assert_eq!(check_completion_format(COMPLETE_6_18), Ok(()));
+        assert_eq!(check_completion_format(COMPLETE_6_8), Ok(()));
+        let reordered = COMPLETE_6_8.replace("%s (%s) %llu", "%s %llu (%s)");
+        assert!(check_completion_format(&reordered).is_err());
+    }
+
+    #[test]
+    fn completions_dirty_the_same_ranges_as_submissions() {
+        // The capture: the same writes, discard and write-zeroes as the
+        // queue-only fixture, now with their completions.
+        let mut queued = Vec::new();
+        let mut completed = Vec::new();
+        for line in EVENTS.lines() {
+            let Line::Bio(event) = parse_line(line) else {
+                assert_ne!(parse_line(line), Line::Malformed, "{line}");
+                continue;
+            };
+            if event.kind != BioKind::Dirtying {
+                continue;
+            }
+            if line.contains("block_rq_complete") {
+                completed.push((event.sector, event.sectors));
+            } else {
+                queued.push((event.sector, event.sectors));
+            }
+        }
+        let expected = vec![
+            (67584 + 2048, 8),
+            (67584 + 8192, 128),
+            (67584 + 16384, 2048),
+            (67584 + 24576, 2048),
+        ];
+        assert_eq!(queued, expected);
+        assert_eq!(completed, expected);
+    }
+
+    #[test]
+    fn a_flush_completion_carries_no_data() {
+        let flush = "ksoftirqd/1-181 [001] ..s.. 1.0: block_rq_complete: 7,0 FF () \
+                     18446744073709551615 + 0 none,0,0 [0]";
+        let Line::Bio(event) = parse_line(flush) else {
+            panic!("not parsed");
+        };
+        assert_eq!(event.kind, BioKind::NoData);
+        let old = "kworker-1 [002] ..s.. 1.0: block_rq_complete: 8,0 WS () 2048 + 8 [0]";
+        assert_eq!(
+            parse_line(old),
+            Line::Bio(BioEvent {
+                dev: DevNumber { major: 8, minor: 0 },
+                kind: BioKind::Dirtying,
+                sector: 2048,
+                sectors: 8,
+            })
+        );
+    }
     const LOOP_P2: DevNumber = DevNumber {
         major: 259,
         minor: 3,

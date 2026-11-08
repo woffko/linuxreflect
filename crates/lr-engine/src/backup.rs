@@ -398,7 +398,7 @@ pub fn backup_block_with(
         .map(|facts| facts.fs_type.clone())
         .unwrap_or_else(|| lr_fsmap::RAW_FS_TYPE.to_owned());
     let map = match snapshot.tracked_mut() {
-        Some(tracked) => tracked.used_map()?,
+        Some(tracked) => tracked.used_map(0)?,
         None => provider_for(&fs_type).used_extents(&snapshot.block_path)?,
     };
 
@@ -994,7 +994,7 @@ struct Counts {
 }
 
 /// What the source holds in one chunk, relative to its parent state.
-enum SourceState {
+pub(crate) enum SourceState {
     /// Identical to the parent; nothing needs storing.
     Unchanged,
     Stored(BlockEntry),
@@ -1056,7 +1056,7 @@ fn store_chunk(
 }
 
 /// Store chunk bytes that were read already, unless they equal `parent`.
-fn store_bytes(
+pub(crate) fn store_bytes(
     writer: &mut ImageWriter<impl Write + Seek>,
     options: ChunkOptions,
     writer_keys: &WriterKeys,
@@ -1091,7 +1091,11 @@ fn store_bytes(
 }
 
 /// The plan for chunk `index` of a source of `device_size` bytes.
-fn chunk_plan_at(index: u64, chunk_size: u64, device_size: u64) -> lr_blocksource::ChunkPlan {
+pub(crate) fn chunk_plan_at(
+    index: u64,
+    chunk_size: u64,
+    device_size: u64,
+) -> lr_blocksource::ChunkPlan {
     let offset = index * chunk_size;
     lr_blocksource::ChunkPlan {
         index,
@@ -1135,7 +1139,7 @@ fn patch_entry(
 }
 
 /// The entry a chunk's source state becomes in a full manifest.
-fn full_entry(state: SourceState) -> BlockEntry {
+pub(crate) fn full_entry(state: SourceState) -> BlockEntry {
     match state {
         SourceState::Stored(entry) | SourceState::BadSector(entry) => entry,
         SourceState::Zero => BlockEntry::zero(),
@@ -1166,10 +1170,11 @@ fn converge_tracked(
     spool.flush().map_err(Error::Io)?;
     let chunk_size = u64::from(request.chunk_size);
     let (mut bytes, mut elapsed) = first_pass;
-    while let Some(chunks) = tracked.next_pass(bytes, elapsed)? {
+    while let Some(regions) = tracked.next_pass(bytes, elapsed)? {
         let started = std::time::Instant::now();
         bytes = 0;
-        for index in chunks {
+        // One region: the partition itself.
+        for index in regions.into_iter().flat_map(|region| region.chunks) {
             let plan = chunk_plan_at(index, chunk_size, device_size);
             let state = match read_chunk(source, &plan, buffer) {
                 Ok(read) => store_bytes(
@@ -1212,7 +1217,11 @@ fn converge_tracked(
                 .map_err(Error::Io)?,
         );
     }
-    let read_back = tracked.final_read(|chunks| {
+    let read_back = tracked.final_read(|regions| {
+        let chunks: Vec<u64> = regions
+            .iter()
+            .flat_map(|region| region.chunks.iter().copied())
+            .collect();
         let mut done = Vec::with_capacity(chunks.len());
         for (slot, &index) in chunks.iter().enumerate() {
             if slot == pool.len() {

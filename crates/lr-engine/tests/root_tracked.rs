@@ -701,3 +701,381 @@ fn lost_events_fail_the_copy() {
     );
     println!("{error}");
 }
+
+/// A GPT loop disk like a small installed system: an ESP (vfat, mounted)
+/// and an ext4 "root" (mounted, written to).
+struct SystemDisk {
+    dir: tempfile::TempDir,
+    device: String,
+}
+
+impl SystemDisk {
+    fn create() -> Option<Self> {
+        if !have("mkfs.vfat") || !have("fsck.vfat") {
+            lr_testkit::unavailable!(return None; "dosfstools missing");
+        }
+        let dir = tempfile::tempdir().expect("dir");
+        let image = dir.path().join("disk.img");
+        std::fs::File::create(&image)
+            .and_then(|f| f.set_len(DISK_BYTES))
+            .expect("image");
+        let mut sfdisk = Command::new("sfdisk")
+            .arg("--quiet")
+            .arg(&image)
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("sfdisk");
+        sfdisk
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(
+                b"label: gpt\nstart=2048, size=64MiB, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B\n\
+                  type=0FC63DAF-8483-4772-8E79-3D69D8477DE4\n",
+            )
+            .expect("layout");
+        if !sfdisk.wait().expect("sfdisk").success() {
+            lr_testkit::fixture_failed!("sfdisk failed");
+        }
+        let output = Command::new("losetup")
+            .args(["--find", "--show", "--partscan"])
+            .arg(&image)
+            .output()
+            .expect("losetup");
+        if !output.status.success() {
+            lr_testkit::fixture_failed!("losetup failed");
+        }
+        let disk = Self {
+            dir,
+            device: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        };
+        let _ = run("blockdev", &["--rereadpt", &disk.device]);
+        for _ in 0..100 {
+            if Path::new(&disk.partition(2)).exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if !run("mkfs.vfat", &["-F", "32", &disk.partition(1)])
+            || !run("mkfs.ext4", &["-q", "-F", &disk.partition(2)])
+        {
+            lr_testkit::fixture_failed!("mkfs failed");
+        }
+        std::fs::create_dir_all(disk.root()).expect("root mountpoint");
+        if !run(
+            "mount",
+            &[&disk.partition(2), &disk.root().display().to_string()],
+        ) {
+            lr_testkit::fixture_failed!("mount root failed");
+        }
+        std::fs::create_dir_all(disk.esp()).expect("esp mountpoint");
+        if !run(
+            "mount",
+            &[&disk.partition(1), &disk.esp().display().to_string()],
+        ) {
+            lr_testkit::fixture_failed!("mount esp failed");
+        }
+        std::fs::create_dir_all(disk.esp().join("EFI/BOOT")).expect("efi dir");
+        std::fs::write(
+            disk.esp().join("EFI/BOOT/BOOTX64.EFI"),
+            vec![0x4d; 300 * 1024],
+        )
+        .expect("loader");
+        let _ = run("sync", &[]);
+        Some(disk)
+    }
+
+    fn partition(&self, index: u32) -> String {
+        format!("{}p{index}", self.device)
+    }
+
+    fn root(&self) -> PathBuf {
+        self.dir.path().join("root")
+    }
+
+    fn esp(&self) -> PathBuf {
+        self.dir.path().join("root-esp")
+    }
+}
+
+impl Drop for SystemDisk {
+    fn drop(&mut self) {
+        let _ = run("umount", &[&self.esp().display().to_string()]);
+        let _ = run("umount", &[&self.root().display().to_string()]);
+        let _ = run("losetup", &["--detach", &self.device]);
+    }
+}
+
+fn whole_disk_request(disk: &str, dest: &Path) -> BackupRequest {
+    request(disk, dest)
+}
+
+/// `sfdisk -d` without the device names, for comparing two disks' layouts.
+fn layout_of(device: &str) -> String {
+    let output = Command::new("sfdisk")
+        .arg("-d")
+        .arg(device)
+        .output()
+        .expect("sfdisk -d");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.starts_with("device:") && !line.starts_with("last-lba:"))
+        .map(|line| {
+            line.split_once(':')
+                .map_or(line, |(_, rest)| rest)
+                .trim()
+                .to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+#[ignore = "requires root, loop devices, tracefs and fsfreeze"]
+fn a_busy_system_disk_is_imaged_live_and_restores_clean() {
+    if !root_tests_enabled() || !prerequisites() {
+        return;
+    }
+    let Some(disk) = SystemDisk::create() else {
+        return;
+    };
+    let work = tempfile::tempdir().expect("work");
+    let dest = work.path().join("backups");
+    let writer = Writer::start(&disk.root().join("work"));
+    std::thread::sleep(Duration::from_millis(500));
+    let backup_started = Instant::now();
+    let report = backup_image(&whole_disk_request(&disk.device, &dest)).expect("live whole disk");
+    let backup_ended = Instant::now();
+    std::thread::sleep(Duration::from_millis(300));
+    let records = writer.stop();
+
+    let ImageReport::WholeDisk(report) = &report else {
+        panic!("expected a whole-disk image");
+    };
+    let tracked = report.tracked.expect("a tracked summary");
+    println!("{tracked:?}");
+    assert_eq!(tracked.frozen_filesystems, 1, "only the ext4 is frozen");
+    for region in &report.regions {
+        assert_eq!(
+            region.consistency,
+            lr_core::Consistency::Frozen,
+            "{region:?}"
+        );
+    }
+
+    // Restore onto a second loop disk of the same size.
+    let target_image = work.path().join("target.img");
+    std::fs::File::create(&target_image)
+        .and_then(|f| f.set_len(DISK_BYTES))
+        .expect("target");
+    let plan = prepare_restore(&PrepareRequest::from_path(
+        &report.image_path,
+        &target_image,
+        Encryption::NoEncrypt,
+    ))
+    .expect("prepare");
+    apply_restore(&ApplyRequest {
+        token: plan.token,
+        confirm: true,
+        accept_inconsistent: false,
+        encryption: Encryption::NoEncrypt,
+        context: lr_engine::progress::EngineContext::silent(),
+    })
+    .expect("apply");
+    let output = Command::new("losetup")
+        .args(["--find", "--show", "--partscan", "--read-only"])
+        .arg(&target_image)
+        .output()
+        .expect("losetup target");
+    let target = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let _ = run("blockdev", &["--rereadpt", &target]);
+    for _ in 0..100 {
+        if Path::new(&format!("{target}p2")).exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let detach = || {
+        let _ = run("losetup", &["--detach", &target]);
+    };
+
+    assert_eq!(
+        layout_of(&target),
+        layout_of(&disk.device),
+        "the partition table differs"
+    );
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(format!("{target}p2"))
+        .output()
+        .expect("e2fsck");
+    // A mounted vfat keeps its dirty flag in the primary boot sector only, so
+    // fsck.vfat always reports a mounted copy; compare with the source instead
+    // (the source ESP is idle in this test).
+    let esp_same = Command::new("cmp")
+        .arg(disk.partition(1))
+        .arg(format!("{target}p1"))
+        .status()
+        .expect("cmp")
+        .success();
+    let header = Command::new("dumpe2fs")
+        .arg("-h")
+        .arg(format!("{target}p2"))
+        .output()
+        .expect("dumpe2fs");
+    let check = work.path().join("check");
+    std::fs::create_dir(&check).expect("check dir");
+    let mounted = run(
+        "mount",
+        &[
+            "-o",
+            "ro",
+            &format!("{target}p2"),
+            &check.display().to_string(),
+        ],
+    );
+    let log = std::fs::read_to_string(check.join("work/chain.log")).unwrap_or_default();
+    let _ = run("umount", &[&check.display().to_string()]);
+    detach();
+
+    assert!(
+        fsck.status.success(),
+        "e2fsck:\n{}",
+        String::from_utf8_lossy(&fsck.stdout)
+    );
+    assert!(esp_same, "the restored ESP differs from the source ESP");
+    assert!(
+        !String::from_utf8_lossy(&header.stdout).contains("needs_recovery"),
+        "the root copy still needs journal recovery"
+    );
+    assert!(mounted, "the restored root does not mount");
+    let mut previous = 0u64;
+    let mut count = 0u64;
+    for line in log.lines() {
+        let (seq, hash) = line.split_once(' ').expect("record");
+        assert_eq!(seq.parse::<u64>().expect("seq"), count);
+        previous = link(previous, count);
+        assert_eq!(hash, format!("{previous:016x}"), "broken chain at {count}");
+        count += 1;
+    }
+    let synced_before = records
+        .iter()
+        .filter(|(_, _, s)| *s < backup_started)
+        .count() as u64;
+    let begun_before_end = records.iter().filter(|(_, b, _)| *b < backup_ended).count() as u64;
+    assert!(
+        (synced_before..=begun_before_end).contains(&count),
+        "{count} records; expected between {synced_before} and {begun_before_end}"
+    );
+}
+
+#[test]
+#[ignore = "requires root, loop devices, tracefs and fsfreeze"]
+fn a_busy_esp_is_copied_consistently_or_refused() {
+    if !root_tests_enabled() || !prerequisites() {
+        return;
+    }
+    let Some(disk) = SystemDisk::create() else {
+        return;
+    };
+    let work = tempfile::tempdir().expect("work");
+    let dest = work.path().join("backups");
+    // Something keeps rewriting a file on the ESP, which cannot be frozen.
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    let esp = disk.esp();
+    let hammer = std::thread::spawn(move || {
+        let mut round = 1u64;
+        while !flag.load(Ordering::Relaxed) {
+            let mut file = std::fs::File::create(esp.join("grubenv")).expect("esp file");
+            file.write_all(&round.to_le_bytes().repeat(512))
+                .expect("esp write");
+            file.sync_all().expect("esp fsync");
+            round += 1;
+        }
+    });
+    let outcome = backup_image(&whole_disk_request(&disk.device, &dest));
+    stop.store(true, Ordering::Relaxed);
+    hammer.join().expect("hammer");
+    match outcome {
+        // Refused: the quiet window failed, or the copy could not converge;
+        // nothing may be published.
+        Err(error) => {
+            assert!(
+                matches!(
+                    error,
+                    lr_core::Error::SourceChanged { .. } | lr_core::Error::NoConvergence { .. }
+                ),
+                "unexpected failure: {error}"
+            );
+            println!("refused: {error}");
+            assert!(images_under(&dest).is_empty(), "an image was published");
+        }
+        // Accepted: then the ESP in the image must hold one whole version of
+        // the file, never a mix of two.
+        Ok(ImageReport::WholeDisk(report)) => {
+            let target_image = work.path().join("target.img");
+            std::fs::File::create(&target_image)
+                .and_then(|f| f.set_len(DISK_BYTES))
+                .expect("target");
+            let plan = prepare_restore(&PrepareRequest::from_path(
+                &report.image_path,
+                &target_image,
+                Encryption::NoEncrypt,
+            ))
+            .expect("prepare");
+            apply_restore(&ApplyRequest {
+                token: plan.token,
+                confirm: true,
+                accept_inconsistent: false,
+                encryption: Encryption::NoEncrypt,
+                context: lr_engine::progress::EngineContext::silent(),
+            })
+            .expect("apply");
+            let output = Command::new("losetup")
+                .args(["--find", "--show", "--partscan", "--read-only"])
+                .arg(&target_image)
+                .output()
+                .expect("losetup target");
+            let target = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            let _ = run("blockdev", &["--rereadpt", &target]);
+            for _ in 0..100 {
+                if Path::new(&format!("{target}p1")).exists() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let check = work.path().join("esp-check");
+            std::fs::create_dir(&check).expect("check dir");
+            let mounted = run(
+                "mount",
+                &[
+                    "-o",
+                    "ro",
+                    &format!("{target}p1"),
+                    &check.display().to_string(),
+                ],
+            );
+            let grubenv = std::fs::read(check.join("grubenv")).unwrap_or_default();
+            let loader = std::fs::read(check.join("EFI/BOOT/BOOTX64.EFI")).unwrap_or_default();
+            let _ = run("umount", &[&check.display().to_string()]);
+            let _ = run("losetup", &["--detach", &target]);
+            assert!(mounted, "the restored ESP does not mount");
+            assert_eq!(loader, vec![0x4d; 300 * 1024], "the loader is damaged");
+            assert_eq!(
+                grubenv.len(),
+                4096,
+                "the file is torn: {} bytes",
+                grubenv.len()
+            );
+            let first = &grubenv[..8];
+            assert!(
+                grubenv.chunks_exact(8).all(|word| word == first),
+                "the file mixes two versions"
+            );
+            println!("accepted: one whole version, {:?}", report.tracked);
+        }
+        Ok(other) => panic!("expected a whole-disk image, got {other:?}"),
+    }
+    assert_eq!(trace_leftovers(), 0, "a trace instance was left behind");
+}

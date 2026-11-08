@@ -3,10 +3,12 @@
 Status, 2026-11-08: phase 0 is done (`docs/live-backup-spike.md`: the
 mechanism holds on kernels 5.15 to 6.18), phase 1 is done
 (`lr_snapshot::tracking`), and phase 2 is done except incremental members
-(refused for now): the provider copies a single mounted, non-root ext4
-partition into a full image when `--snapshot tracked-freeze` is given, and
-the root tests cover the live round trip, non-convergence, lost events, a
-SIGKILL during the final freeze and a destination on the source. It implements spec v2.2 §E.7 and
+(refused for now), and phase 3 is in progress: whole disks with the root
+filesystem, a vfat ESP and other unfrozen regions under the quiet-window
+rule are copied live with `--snapshot tracked-freeze`, writes are tracked on
+submission and on completion, dpkg's lock postpones the final freeze and a
+logind inhibitor blocks sleep. The phase 3 VM acceptance (a running system
+imaged, restored to another disk and booted) is still open. It implements spec v2.2 §E.7 and
 Slice 18 (decision D-138).
 
 ## Goal

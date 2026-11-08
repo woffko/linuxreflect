@@ -1,24 +1,30 @@
-//! The tracked-freeze provider (spec v2.2 §E.7, Slice 18 phase 2).
+//! The tracked-freeze provider (spec v2.2 §E.7, Slice 18).
 //!
-//! A live, write-tracked, converging copy of a mounted ext4 filesystem that
-//! sits directly on a partition or disk, ended by one short freeze during
-//! which only the remaining dirty chunks are read, into memory. The engine
-//! drives the passes and the final read through [`TrackedCopy`]; this module
-//! owns the tracking, the freezes, the budgets and the integrity checks.
+//! A live, write-tracked, converging copy of ext4 filesystems that sit
+//! directly on a partition or disk, the running root included, ended by one
+//! short freeze during which only the remaining dirty chunks are read, into
+//! memory. The engine drives the passes and the final read through
+//! [`TrackedCopy`]; this module owns the tracking, the freezes, the budgets
+//! and the integrity checks.
 //!
-//! Phase 2 covers one non-root filesystem and full images, and is selected
-//! only by an explicit `--snapshot tracked-freeze`. The running root and
-//! whole disks follow in phase 3 (`docs/live-backup-plan.md`).
+//! A copy has one or more regions of one disk. A mounted ext4 region is
+//! frozen; every other region (a vfat ESP, a BIOS boot partition, the disk's
+//! leading area, an unmounted partition) cannot be frozen and is held by the
+//! quiet-window rule: it must not be written from its final read until the
+//! thaw. Every frozen filesystem of the copy is frozen together, `/` last.
+//!
+//! The provider is selected only by an explicit `--snapshot tracked-freeze`
+//! until Slice 18 decides the default (spec §M.4).
 
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use lr_core::{Consistency, Error, Result, SnapshotOpts, SourceLayout, Support};
 
-use crate::freeze::{Deadman, FreezeLog, frozen_filesystem_refusal};
-use crate::probe::is_running_root;
+use crate::freeze::{Deadman, FreezeLog};
 use crate::tracking::{self, DevNumber, DirtyMap, TrackedRegion, Tracker};
 use crate::{BlockSnapshot, BlockSnapshotProvider};
 
@@ -40,6 +46,12 @@ pub const TRACK_CHUNK_BYTES: u64 = 64 << 10;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const TMPFS_MAGIC: i64 = 0x0102_1994;
 const RUNTIME_DIR: &str = "/run/linuxreflect";
+/// dpkg's locks (spec §E.7 "Package transactions").
+const DPKG_DIR: &str = "/var/lib/dpkg";
+const DPKG_LOCKS: [&str; 2] = ["/var/lib/dpkg/lock-frontend", "/var/lib/dpkg/lock"];
+const PACKAGE_WAIT: Duration = Duration::from_secs(1);
+/// How long the final read waits for writes in flight to unfrozen regions.
+const QUIET_IDLE_TIMEOUT: Duration = Duration::from_millis(500);
 
 static PROVIDER: TrackedFreezeProvider = TrackedFreezeProvider;
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -68,100 +80,45 @@ impl BlockSnapshotProvider for TrackedFreezeProvider {
 
     fn create(&self, src: &SourceLayout, opts: &SnapshotOpts) -> Result<BlockSnapshot> {
         if let Some(reason) = refusal(src, opts) {
-            return Err(Error::no_consistent_method([
-                format!("tracked-freeze refused: {reason}"),
-                "unmount the filesystem for offline consistency".to_owned(),
-                "boot rescue media for an offline image".to_owned(),
-            ]));
+            return Err(refused(&reason));
         }
-        let tracefs =
-            tracking::tracefs_root().ok_or_else(|| Error::unsupported("tracefs is not mounted"))?;
-        let mountpoint = mountpoint_of(src)
-            .ok_or_else(|| Error::unsupported("tracked-freeze needs a mounted source"))?;
-
-        // The self test writes its own loop image; it must live on a tmpfs,
-        // never on a filesystem that could be the source.
-        let workdir = Path::new(RUNTIME_DIR);
-        std::fs::create_dir_all(workdir).map_err(Error::Io)?;
-        let dir = lr_unsafe::open_dir_readonly(workdir).map_err(Error::Io)?;
-        if lr_unsafe::filemeta::filesystem_type(&dir).map_err(Error::Io)? != TMPFS_MAGIC {
-            return Err(Error::unsupported(format!(
-                "{RUNTIME_DIR} is not a tmpfs; the write-tracking self test needs one"
-            )));
-        }
-        drop(dir);
-        let self_test = tracking::self_test(&tracefs, workdir)?;
-        if !self_test.passed() {
-            return Err(Error::TrackingLost {
-                reason: format!(
-                    "the write-tracking self test failed on this kernel: {self_test:?}"
-                ),
-            });
-        }
-
         let region = region_of(src)?;
-        let start = SourceFacts::read(&src.device, &region)?;
-        let name = format!(
-            "{}tf-{}-{}",
-            tracking::INSTANCE_PREFIX,
-            std::process::id(),
-            JOB_COUNTER.fetch_add(1, Ordering::SeqCst)
-        );
-        let tracker = Tracker::start(
-            &tracefs,
-            &name,
-            vec![region],
-            TRACK_CHUNK_BYTES,
-            opts.tracked.buffer_kb.unwrap_or(DEFAULT_BUFFER_KB),
-        )?;
-        let pending = tracker.empty_map();
-        let log = FreezeLog::default();
-        let grace = Duration::from_secs(
-            opts.deadman_grace_secs
-                .unwrap_or(crate::freeze::DEFAULT_GRACE_SECS),
-        );
-        let freeze_max = opts
-            .freeze_timeout_secs
-            .map_or(DEFAULT_FREEZE_MAX, Duration::from_secs)
-            .min(HARD_FREEZE_MAX);
-        let mut copy = TrackedCopy {
-            tracker,
-            pending,
-            mountpoints: vec![mountpoint],
-            source: src.device.clone(),
-            region,
-            start,
-            limits: Limits {
-                freeze_max,
-                final_max_bytes: opts
-                    .tracked
-                    .final_max_bytes
-                    .unwrap_or(DEFAULT_FINAL_MAX_BYTES),
-                max_passes: opts.tracked.max_passes.unwrap_or(DEFAULT_MAX_PASSES).max(1),
-                grace,
-            },
-            engine_chunk_bytes: 0,
-            log,
-            summary: TrackedSummary::default(),
+        let spec = RegionSpec {
+            start_sector: region.start_sector,
+            sectors: region.sectors,
+            partition: Some(src.device.clone()),
+            fs_type: src
+                .fs
+                .as_ref()
+                .map(|facts| facts.fs_type.clone())
+                .unwrap_or_default(),
+            mountpoints: src.mountpoints.clone(),
         };
-
-        // The barrier: a freeze completes every write already submitted, so
-        // none that predates tracking can land after the first pass reads.
-        let began = Instant::now();
-        copy.frozen(|| Ok(()))?;
-        copy.summary.barrier_ms = elapsed_ms(began);
-        copy.log.flush();
+        let device = if region.part.is_some() {
+            disk_of(&src.device)?
+        } else {
+            src.device.clone()
+        };
+        let copy = TrackedCopy::start(&device, vec![spec], opts)?;
         Ok(BlockSnapshot::new(src.device.clone(), Consistency::Frozen, ()).with_tracked(copy))
     }
 }
 
-/// Why this source cannot be copied with tracked-freeze, if it cannot.
+fn refused(reason: &str) -> Error {
+    Error::no_consistent_method([
+        format!("tracked-freeze refused: {reason}"),
+        "unmount the filesystem for offline consistency".to_owned(),
+        "boot rescue media for an offline image".to_owned(),
+    ])
+}
+
+/// Why this partition (or device) cannot be copied with tracked-freeze.
 fn refusal(src: &SourceLayout, opts: &SnapshotOpts) -> Option<String> {
-    if opts.provider.as_deref() != Some(ID) {
-        return Some(format!("tracked-freeze is opt-in; pass --snapshot {ID}"));
+    if let Some(reason) = opt_in_refusal(opts) {
+        return Some(reason);
     }
     if src.is_whole_disk() {
-        return Some("whole disks follow in Slice 18 phase 3; image a partition".to_owned());
+        return Some("a whole disk is copied through the whole-disk route".to_owned());
     }
     if src.fs.as_ref().is_none_or(|facts| facts.fs_type != "ext4") {
         return Some("tracked-freeze copies ext4 filesystems only".to_owned());
@@ -173,24 +130,20 @@ fn refusal(src: &SourceLayout, opts: &SnapshotOpts) -> Option<String> {
     {
         return Some("the source is on device-mapper; the LVM provider applies".to_owned());
     }
-    let Some(mountpoint) = mountpoint_of(src) else {
+    if src.mountpoints.is_empty() {
         return Some("the source is not mounted; the offline provider applies".to_owned());
-    };
-    let mount_count = src.mountpoints.len();
-    if mount_count > 1 {
-        return Some(format!(
-            "the filesystem is mounted {mount_count} times; phase 2 copies a single mount"
-        ));
     }
-    if is_running_root(src) {
-        return Some(format!(
-            "{} holds the running system; that follows in Slice 18 phase 3",
-            mountpoint.display()
-        ));
-    }
-    if let Some(reason) = frozen_filesystem_refusal(&mountpoint, opts) {
-        return Some(reason);
-    }
+    job_writes_refusal(&src.mountpoints, opts).or_else(tracepoint_refusal)
+}
+
+/// Opt-in check shared by the partition and the whole-disk routes.
+pub fn opt_in_refusal(opts: &SnapshotOpts) -> Option<String> {
+    (opts.provider.as_deref() != Some(ID))
+        .then(|| format!("tracked-freeze is opt-in; pass --snapshot {ID}"))
+}
+
+/// Why this kernel cannot track writes, if it cannot.
+pub fn tracepoint_refusal() -> Option<String> {
     let Some(tracefs) = tracking::tracefs_root() else {
         return Some("tracefs is not mounted".to_owned());
     };
@@ -198,17 +151,103 @@ fn refusal(src: &SourceLayout, opts: &SnapshotOpts) -> Option<String> {
         .join("events")
         .join(tracking::TRACEPOINT)
         .join("format");
-    match std::fs::read_to_string(&format_path) {
-        Ok(format) => tracking::check_format(&format).err(),
-        Err(error) => Some(format!(
+    let completion_path = tracefs
+        .join("events")
+        .join(tracking::COMPLETION_TRACEPOINT)
+        .join("format");
+    match (
+        std::fs::read_to_string(&format_path),
+        std::fs::read_to_string(&completion_path),
+    ) {
+        (Ok(format), Ok(completion)) => tracking::check_format(&format)
+            .and_then(|()| tracking::check_completion_format(&completion))
+            .err(),
+        (Err(error), _) => Some(format!(
             "the {} tracepoint is unavailable: {error}",
             tracking::TRACEPOINT
+        )),
+        (_, Err(error)) => Some(format!(
+            "the {} tracepoint is unavailable: {error}",
+            tracking::COMPLETION_TRACEPOINT
         )),
     }
 }
 
-fn mountpoint_of(src: &SourceLayout) -> Option<PathBuf> {
-    src.mountpoints.first().cloned()
+/// Why the job's own writes could reach a filesystem it will freeze: the
+/// destination or the working directory on it. Unlike the whole-read freeze
+/// (§E.4), other processes' writes are fine; they wait out the short freeze.
+fn job_writes_refusal(mountpoints: &[PathBuf], opts: &SnapshotOpts) -> Option<String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let frozen: Vec<u64> = mountpoints
+        .iter()
+        .filter_map(|mountpoint| std::fs::metadata(mountpoint).ok().map(|m| m.dev()))
+        .collect();
+    let on_frozen = |path: &Path| -> bool {
+        let existing = path.ancestors().find(|p| p.exists()).unwrap_or(path);
+        std::fs::metadata(existing).is_ok_and(|metadata| frozen.contains(&metadata.dev()))
+    };
+    if let Ok(cwd) = std::env::current_dir()
+        && on_frozen(&cwd)
+    {
+        return Some(format!(
+            "the working directory {} is on a filesystem that will be frozen",
+            cwd.display()
+        ));
+    }
+    if opts.destination_remote {
+        return None;
+    }
+    match opts.destination.as_deref() {
+        None => Some(
+            "tracked-freeze needs the destination to prove it is on another filesystem".to_owned(),
+        ),
+        Some(destination) if on_frozen(destination) => Some(format!(
+            "the destination {} is on a filesystem that will be frozen; the copy would \
+             track its own writes",
+            destination.display()
+        )),
+        Some(_) => None,
+    }
+}
+
+/// One region of a source to copy (spec §E.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionSpec {
+    /// First sector on the whole disk (512-byte units).
+    pub start_sector: u64,
+    /// Length in sectors.
+    pub sectors: u64,
+    /// The region's own device node (a partition, or a device with a
+    /// filesystem directly on it); `None` for an area of the disk such as the
+    /// leading region before the first partition.
+    pub partition: Option<PathBuf>,
+    /// Filesystem type from discovery (empty when none).
+    pub fs_type: String,
+    /// Where the filesystem is mounted, if anywhere.
+    pub mountpoints: Vec<PathBuf>,
+}
+
+/// How a region is kept consistent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hold {
+    /// A mounted ext4: frozen; the index is into the copy's mount points.
+    Frozen(usize),
+    /// Cannot be frozen: it must stay unwritten from its final read to the
+    /// thaw (the quiet-window rule).
+    Quiet,
+}
+
+/// Start a tracked copy of whole-disk `regions` of `disk` (the whole-disk
+/// route; the engine checks the partition table itself).
+pub fn track_disk(
+    disk: &Path,
+    regions: Vec<RegionSpec>,
+    opts: &SnapshotOpts,
+) -> Result<TrackedCopy> {
+    if let Some(reason) = opt_in_refusal(opts).or_else(tracepoint_refusal) {
+        return Err(refused(&reason));
+    }
+    TrackedCopy::start(disk, regions, opts)
 }
 
 /// The tracked region of a partition (or of a whole device with a
@@ -218,22 +257,17 @@ fn region_of(src: &SourceLayout) -> Result<TrackedRegion> {
         .join("class/block")
         .join(&src.device_facts.name);
     let own = parse_dev(&read_sysfs(&class.join("dev"))?)?;
-    let size = read_sysfs(&class.join("size"))?
-        .parse::<u64>()
-        .map_err(|_| Error::corrupt("sysfs size is not a number"))?;
+    let size = read_number(&class.join("size"))?;
     if class.join("partition").exists() {
         let real = std::fs::canonicalize(&class).map_err(Error::Io)?;
         let parent = real
             .parent()
             .ok_or_else(|| Error::corrupt("a partition without a parent disk in sysfs"))?;
         let whole = parse_dev(&read_sysfs(&parent.join("dev"))?)?;
-        let start = read_sysfs(&class.join("start"))?
-            .parse::<u64>()
-            .map_err(|_| Error::corrupt("sysfs start is not a number"))?;
         Ok(TrackedRegion {
             whole,
             part: Some(own),
-            start_sector: start,
+            start_sector: read_number(&class.join("start"))?,
             sectors: size,
         })
     } else {
@@ -246,10 +280,28 @@ fn region_of(src: &SourceLayout) -> Result<TrackedRegion> {
     }
 }
 
+/// The disk device node a partition node belongs to.
+fn disk_of(partition: &Path) -> Result<PathBuf> {
+    let name = lr_core::sysfs::device_name(partition).map_err(Error::Io)?;
+    let class = lr_core::sysfs::sysfs_root().join("class/block").join(name);
+    let real = std::fs::canonicalize(&class).map_err(Error::Io)?;
+    let disk = real
+        .parent()
+        .and_then(Path::file_name)
+        .ok_or_else(|| Error::corrupt("a partition without a parent disk in sysfs"))?;
+    Ok(Path::new("/dev").join(disk))
+}
+
 fn read_sysfs(path: &Path) -> Result<String> {
     std::fs::read_to_string(path)
         .map(|text| text.trim().to_owned())
         .map_err(|error| Error::unsupported(format!("{}: {error}", path.display())))
+}
+
+fn read_number(path: &Path) -> Result<u64> {
+    read_sysfs(path)?
+        .parse()
+        .map_err(|_| Error::corrupt(format!("{} is not a number", path.display())))
 }
 
 fn parse_dev(text: &str) -> Result<DevNumber> {
@@ -266,45 +318,75 @@ fn parse_dev(text: &str) -> Result<DevNumber> {
     })
 }
 
-/// What must not change while the copy runs: the partition's place on the
-/// disk and the filesystem's identity and size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SourceFacts {
-    start_sector: u64,
-    sectors: u64,
-    fs_uuid: [u8; 16],
-    fs_blocks: u64,
+fn device_number(path: &Path) -> Result<DevNumber> {
+    use std::os::unix::fs::MetadataExt as _;
+    let rdev = std::fs::metadata(path).map_err(Error::Io)?.rdev();
+    Ok(DevNumber {
+        major: (((rdev >> 32) & 0xffff_f000) | ((rdev >> 8) & 0x0000_0fff)) as u32,
+        minor: (((rdev >> 12) & 0xffff_ff00) | (rdev & 0x0000_00ff)) as u32,
+    })
 }
 
-impl SourceFacts {
-    fn read(device: &Path, region: &TrackedRegion) -> Result<Self> {
-        let fd = lr_unsafe::open_o_direct(device, false).map_err(Error::Io)?;
-        let mut buf = lr_unsafe::AlignedBuf::new(4096, 4096).map_err(Error::Io)?;
-        let read = lr_unsafe::pread_into(&fd, &mut buf, 4096, 0).map_err(Error::Io)?;
-        if read < 2048 {
-            return Err(Error::corrupt("short read of the ext4 superblock"));
-        }
-        let sb = &buf.as_slice()[1024..2048];
-        let le16 = |at: usize| u16::from_le_bytes([sb[at], sb[at + 1]]);
-        let le32 = |at: usize| u32::from_le_bytes([sb[at], sb[at + 1], sb[at + 2], sb[at + 3]]);
-        if le16(0x38) != 0xef53 {
-            return Err(Error::unsupported("the source has no ext4 superblock"));
-        }
-        let incompat_64bit = le32(0x60) & 0x80 != 0;
-        let high = if incompat_64bit {
-            u64::from(le32(0x150))
-        } else {
-            0
+/// What must not change while the copy runs: a region's place on the disk
+/// and, for ext4, the filesystem's identity and size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RegionFacts {
+    start_sector: u64,
+    sectors: u64,
+    ext4: Option<([u8; 16], u64)>,
+}
+
+impl RegionFacts {
+    fn read(spec: &RegionSpec) -> Result<Self> {
+        let (start_sector, sectors) = match &spec.partition {
+            Some(partition) => {
+                let name = lr_core::sysfs::device_name(partition).map_err(Error::Io)?;
+                let class = lr_core::sysfs::sysfs_root().join("class/block").join(name);
+                let start = if class.join("partition").exists() {
+                    read_number(&class.join("start"))?
+                } else {
+                    0
+                };
+                (start, read_number(&class.join("size"))?)
+            }
+            None => (spec.start_sector, spec.sectors),
         };
-        let mut fs_uuid = [0u8; 16];
-        fs_uuid.copy_from_slice(&sb[0x68..0x78]);
+        let ext4 = match (&spec.partition, spec.fs_type.as_str()) {
+            (Some(partition), "ext4") => Some(ext4_identity(partition)?),
+            _ => None,
+        };
         Ok(Self {
-            start_sector: region.start_sector,
-            sectors: region.sectors,
-            fs_uuid,
-            fs_blocks: (high << 32) | u64::from(le32(0x04)),
+            start_sector,
+            sectors,
+            ext4,
         })
     }
+}
+
+fn ext4_identity(device: &Path) -> Result<([u8; 16], u64)> {
+    let fd = lr_unsafe::open_o_direct(device, false).map_err(Error::Io)?;
+    let mut buf = lr_unsafe::AlignedBuf::new(4096, 4096).map_err(Error::Io)?;
+    let read = lr_unsafe::pread_into(&fd, &mut buf, 4096, 0).map_err(Error::Io)?;
+    if read < 2048 {
+        return Err(Error::corrupt("short read of the ext4 superblock"));
+    }
+    let sb = &buf.as_slice()[1024..2048];
+    let le16 = |at: usize| u16::from_le_bytes([sb[at], sb[at + 1]]);
+    let le32 = |at: usize| u32::from_le_bytes([sb[at], sb[at + 1], sb[at + 2], sb[at + 3]]);
+    if le16(0x38) != 0xef53 {
+        return Err(Error::unsupported(format!(
+            "{} has no ext4 superblock",
+            device.display()
+        )));
+    }
+    let high = if le32(0x60) & 0x80 != 0 {
+        u64::from(le32(0x150))
+    } else {
+        0
+    };
+    let mut uuid = [0u8; 16];
+    uuid.copy_from_slice(&sb[0x68..0x78]);
+    Ok((uuid, (high << 32) | u64::from(le32(0x04))))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -328,6 +410,21 @@ pub struct TrackedSummary {
     pub final_freeze_ms: u64,
     /// Length of the barrier freeze.
     pub barrier_ms: u64,
+    /// Filesystems frozen together.
+    #[serde(default)]
+    pub frozen_filesystems: u32,
+    /// Passes added because a package transaction held dpkg's lock.
+    #[serde(default)]
+    pub package_waits: u32,
+}
+
+/// Engine chunks of one region to read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionChunks {
+    /// Index of the region, in the order the copy was started with.
+    pub region: usize,
+    /// Engine chunk numbers within the region, ascending.
+    pub chunks: Vec<u64>,
 }
 
 /// The engine's handle on a tracked copy (see the module documentation).
@@ -335,26 +432,206 @@ pub struct TrackedCopy {
     tracker: Tracker,
     /// Dirty chunks (tracking granularity) not yet re-read.
     pending: DirtyMap,
+    specs: Vec<RegionSpec>,
+    holds: Vec<Hold>,
+    facts: Vec<RegionFacts>,
+    /// Filesystems to freeze, `/` last.
     mountpoints: Vec<PathBuf>,
-    source: PathBuf,
-    region: TrackedRegion,
-    start: SourceFacts,
+    /// The disk's kernel name, for its in-flight counters.
+    disk_name: String,
+    /// Whether one of them holds dpkg's state.
+    holds_dpkg: bool,
     limits: Limits,
     engine_chunk_bytes: u64,
     log: FreezeLog,
     summary: TrackedSummary,
+    inhibitor: Option<Child>,
 }
 
 impl std::fmt::Debug for TrackedCopy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TrackedCopy")
+            .field("specs", &self.specs)
             .field("mountpoints", &self.mountpoints)
             .field("summary", &self.summary)
             .finish_non_exhaustive()
     }
 }
 
+impl Drop for TrackedCopy {
+    fn drop(&mut self) {
+        if let Some(mut inhibitor) = self.inhibitor.take() {
+            let _ = inhibitor.kill();
+            let _ = inhibitor.wait();
+        }
+    }
+}
+
 impl TrackedCopy {
+    /// Start tracking `regions` of `disk`, run the self test, take the
+    /// inhibitor lock and make the barrier freeze.
+    fn start(disk: &Path, specs: Vec<RegionSpec>, opts: &SnapshotOpts) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+        if specs.is_empty() {
+            return Err(Error::unsupported(
+                "a tracked copy needs at least one region",
+            ));
+        }
+        let tracefs =
+            tracking::tracefs_root().ok_or_else(|| Error::unsupported("tracefs is not mounted"))?;
+        let whole = device_number(disk)?;
+        let disk_name = lr_core::sysfs::device_name(disk).map_err(Error::Io)?;
+        // Completions are tracked per request: a bio-based driver reports none.
+        if !lr_core::sysfs::sysfs_root()
+            .join("class/block")
+            .join(&disk_name)
+            .join("mq")
+            .is_dir()
+        {
+            return Err(refused(&format!(
+                "{} is not a blk-mq device, so its write completions cannot be tracked",
+                disk.display()
+            )));
+        }
+
+        // How each region is held, and the filesystems to freeze.
+        let mut mountpoints: Vec<PathBuf> = Vec::new();
+        let mut holds = Vec::with_capacity(specs.len());
+        for spec in &specs {
+            let hold = match (spec.mountpoints.first(), spec.fs_type.as_str()) {
+                (None, _) => Hold::Quiet,
+                (Some(_), "vfat") => Hold::Quiet,
+                (Some(mountpoint), "ext4") => {
+                    mountpoints.push(mountpoint.clone());
+                    Hold::Frozen(mountpoints.len() - 1)
+                }
+                (Some(mountpoint), fs_type) => {
+                    return Err(refused(&format!(
+                        "{} ({fs_type}) is mounted and tracked-freeze cannot hold it; \
+                         unmount it or back it up separately",
+                        mountpoint.display()
+                    )));
+                }
+            };
+            holds.push(hold);
+        }
+        // `/` last: every other freeze, and arming its deadman, may still
+        // need to start programs from it.
+        let order: Vec<usize> = {
+            let mut order: Vec<usize> = (0..mountpoints.len()).collect();
+            order.sort_by_key(|&index| mountpoints[index] == Path::new("/"));
+            order
+        };
+        let sorted: Vec<PathBuf> = order
+            .iter()
+            .map(|&index| mountpoints[index].clone())
+            .collect();
+        for hold in &mut holds {
+            if let Hold::Frozen(index) = hold {
+                *index = order
+                    .iter()
+                    .position(|&original| original == *index)
+                    .unwrap_or(*index);
+            }
+        }
+        let mountpoints = sorted;
+        if let Some(reason) = job_writes_refusal(&mountpoints, opts) {
+            return Err(refused(&reason));
+        }
+        let holds_dpkg = std::fs::metadata(DPKG_DIR).is_ok_and(|dpkg| {
+            mountpoints.iter().any(|mountpoint| {
+                std::fs::metadata(mountpoint).is_ok_and(|metadata| metadata.dev() == dpkg.dev())
+            })
+        });
+
+        // The self test writes its own loop image; it must live on a tmpfs,
+        // never on a filesystem that could be the source.
+        let workdir = Path::new(RUNTIME_DIR);
+        std::fs::create_dir_all(workdir).map_err(Error::Io)?;
+        let dir = lr_unsafe::open_dir_readonly(workdir).map_err(Error::Io)?;
+        if lr_unsafe::filemeta::filesystem_type(&dir).map_err(Error::Io)? != TMPFS_MAGIC {
+            return Err(Error::unsupported(format!(
+                "{RUNTIME_DIR} is not a tmpfs; the write-tracking self test needs one"
+            )));
+        }
+        drop(dir);
+        let self_test = tracking::self_test(&tracefs, workdir)?;
+        if !self_test.passed() {
+            return Err(Error::TrackingLost {
+                reason: format!(
+                    "the write-tracking self test failed on this kernel: {self_test:?}"
+                ),
+            });
+        }
+
+        let mut tracked = Vec::with_capacity(specs.len());
+        let mut facts = Vec::with_capacity(specs.len());
+        for spec in &specs {
+            tracked.push(TrackedRegion {
+                whole,
+                part: spec.partition.as_deref().map(device_number).transpose()?,
+                start_sector: spec.start_sector,
+                sectors: spec.sectors,
+            });
+            facts.push(RegionFacts::read(spec)?);
+        }
+        let name = format!(
+            "{}tf-{}-{}",
+            tracking::INSTANCE_PREFIX,
+            std::process::id(),
+            JOB_COUNTER.fetch_add(1, Ordering::SeqCst)
+        );
+        let tracker = Tracker::start(
+            &tracefs,
+            &name,
+            tracked,
+            TRACK_CHUNK_BYTES,
+            opts.tracked.buffer_kb.unwrap_or(DEFAULT_BUFFER_KB),
+        )?;
+        let pending = tracker.empty_map();
+        let grace = Duration::from_secs(
+            opts.deadman_grace_secs
+                .unwrap_or(crate::freeze::DEFAULT_GRACE_SECS),
+        );
+        let freeze_max = opts
+            .freeze_timeout_secs
+            .map_or(DEFAULT_FREEZE_MAX, Duration::from_secs)
+            .min(HARD_FREEZE_MAX);
+        let mut copy = Self {
+            tracker,
+            pending,
+            specs,
+            holds,
+            facts,
+            mountpoints,
+            disk_name,
+            holds_dpkg,
+            limits: Limits {
+                freeze_max,
+                final_max_bytes: opts
+                    .tracked
+                    .final_max_bytes
+                    .unwrap_or(DEFAULT_FINAL_MAX_BYTES),
+                max_passes: opts.tracked.max_passes.unwrap_or(DEFAULT_MAX_PASSES).max(1),
+                grace,
+            },
+            engine_chunk_bytes: 0,
+            log: FreezeLog::default(),
+            summary: TrackedSummary::default(),
+            inhibitor: None,
+        };
+        copy.summary.frozen_filesystems = u32::try_from(copy.mountpoints.len()).unwrap_or(u32::MAX);
+        copy.inhibitor = inhibit_sleep();
+
+        // The barrier: a freeze completes every write already submitted, so
+        // none that predates tracking can land after the first pass reads.
+        let began = Instant::now();
+        copy.frozen_with(|_| Ok(()))?;
+        copy.summary.barrier_ms = elapsed_ms(began);
+        copy.log.flush();
+        Ok(copy)
+    }
+
     /// Bind the engine's chunk size: a multiple of [`TRACK_CHUNK_BYTES`].
     pub fn bind(&mut self, chunk_bytes: u64) -> Result<()> {
         if chunk_bytes == 0 || !chunk_bytes.is_multiple_of(TRACK_CHUNK_BYTES) {
@@ -366,63 +643,96 @@ impl TrackedCopy {
         Ok(())
     }
 
+    /// The regions, in the order the copy was started with.
+    pub fn regions(&self) -> &[RegionSpec] {
+        &self.specs
+    }
+
     /// Stop or resume the tracking reader, so the kernel loses events (tests).
     #[cfg(feature = "fault-injection")]
     pub fn pause_reader(&self, paused: bool) {
         self.tracker.pause_reader(paused);
     }
 
-    /// The used-block map of the live filesystem (spec §E.7 step 4), taken
-    /// after the barrier. `dumpe2fs` reading a changing filesystem can see a
-    /// bitmap and its checksum from different moments and refuse, so it is
-    /// retried, and the last attempt runs with the filesystem frozen, where
-    /// the metadata is consistent.
-    pub fn used_map(&mut self) -> Result<lr_fsmap::ExtentMap> {
+    /// The used-block map of region `region`'s live ext4 (spec §E.7 step 4),
+    /// taken after the barrier. `dumpe2fs` reading a changing filesystem can
+    /// see a bitmap and its checksum from different moments and refuse, so it
+    /// is retried, and the last attempt runs with the filesystems frozen,
+    /// where the metadata is consistent.
+    pub fn used_map(&mut self, region: usize) -> Result<lr_fsmap::ExtentMap> {
+        let device = self
+            .specs
+            .get(region)
+            .and_then(|spec| spec.partition.clone())
+            .ok_or_else(|| Error::unsupported("only a partition region has a used-block map"))?;
         for _ in 0..3 {
-            if let Ok(map) = lr_fsmap::live_used_extents(&self.source) {
+            if let Ok(map) = lr_fsmap::live_used_extents(&device) {
                 return Ok(map);
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        let source = self.source.clone();
-        self.frozen_with(|_| lr_fsmap::live_used_extents(&source))
+        self.frozen_with(|_| lr_fsmap::live_used_extents(&device))
     }
 
-    /// Engine chunks still pending; the final read reads at least these.
+    /// Engine chunks still pending, over all regions.
     pub fn pending_count(&self) -> usize {
-        self.pending_engine_chunks().len()
+        self.pending_engine_chunks()
+            .iter()
+            .map(|r| r.chunks.len())
+            .sum()
     }
 
-    /// The pending dirty chunks, in engine chunks, ascending.
-    fn pending_engine_chunks(&self) -> Vec<u64> {
+    /// The pending dirty chunks, in engine chunks, per region.
+    fn pending_engine_chunks(&self) -> Vec<RegionChunks> {
         let ratio = self.engine_chunk_bytes / TRACK_CHUNK_BYTES;
-        let mut chunks: Vec<u64> = Vec::new();
-        for bits in self.pending.bits() {
+        let mut all = Vec::with_capacity(self.specs.len());
+        for (region, bits) in self.pending.bits().iter().enumerate() {
+            let mut chunks: Vec<u64> = Vec::new();
             for chunk in bits.iter() {
                 let engine = chunk / ratio;
                 if chunks.last() != Some(&engine) {
                     chunks.push(engine);
                 }
             }
+            if !chunks.is_empty() {
+                all.push(RegionChunks { region, chunks });
+            }
         }
-        chunks
+        all
+    }
+
+    /// A package transaction holds dpkg's lock on a filesystem this copy
+    /// freezes: an image taken now could hold a half-installed system.
+    fn package_transaction_running(&self) -> bool {
+        self.holds_dpkg
+            && DPKG_LOCKS
+                .iter()
+                .any(|lock| lr_unsafe::write_lock_conflicts(Path::new(lock)).unwrap_or(false))
     }
 
     /// After a pass that read `bytes` in `elapsed`: gather what was written
     /// meanwhile. `Ok(None)` means the rest fits the final freeze; otherwise
     /// the engine must read the returned chunks again and call this again.
-    pub fn next_pass(&mut self, bytes: u64, elapsed: Duration) -> Result<Option<Vec<u64>>> {
+    pub fn next_pass(
+        &mut self,
+        bytes: u64,
+        elapsed: Duration,
+    ) -> Result<Option<Vec<RegionChunks>>> {
         debug_assert!(self.engine_chunk_bytes != 0, "bind() first");
         self.tracker.drain(DRAIN_TIMEOUT)?;
         self.tracker.take_into(&mut self.pending);
         self.summary.passes += 1;
         let chunks = self.pending_engine_chunks();
-        let dirty_bytes = chunks.len() as u64 * self.engine_chunk_bytes;
+        let count: u64 = chunks.iter().map(|r| r.chunks.len() as u64).sum();
+        let dirty_bytes = count * self.engine_chunk_bytes;
         // Read time for the rest at the rate the last pass reached; half the
         // freeze budget leaves room for the freeze itself and new writes.
         let rate = bytes as f64 / elapsed.as_secs_f64().max(1e-3);
         let estimate = Duration::from_secs_f64(dirty_bytes as f64 / rate.max(1.0));
-        if dirty_bytes <= self.limits.final_max_bytes && estimate <= self.limits.freeze_max / 2 {
+        let fits =
+            dirty_bytes <= self.limits.final_max_bytes && estimate <= self.limits.freeze_max / 2;
+        let waiting_for_packages = fits && self.package_transaction_running();
+        if fits && !waiting_for_packages {
             return Ok(None);
         }
         if self.summary.passes >= self.limits.max_passes {
@@ -431,35 +741,57 @@ impl TrackedCopy {
                 passes: self.summary.passes,
             });
         }
-        self.summary.recopied_chunks += chunks.len() as u64;
+        if waiting_for_packages {
+            self.summary.package_waits += 1;
+            std::thread::sleep(PACKAGE_WAIT);
+        }
+        self.summary.recopied_chunks += count;
         Ok(Some(chunks))
     }
 
     /// The final read: freeze every tracked filesystem, gather the last
     /// writes, let `read` read the given engine chunks (into memory, nothing
-    /// may be written), and thaw. A freeze longer than `freeze_max` fails the
-    /// copy after the thaw.
-    pub fn final_read<T>(&mut self, read: impl FnOnce(&[u64]) -> Result<T>) -> Result<T> {
+    /// may be written), check the quiet window, and thaw. A freeze longer
+    /// than `freeze_max` fails the copy after the thaw.
+    pub fn final_read<T>(&mut self, read: impl FnOnce(&[RegionChunks]) -> Result<T>) -> Result<T> {
         debug_assert!(self.engine_chunk_bytes != 0, "bind() first");
         let final_max = self.limits.final_max_bytes;
         let chunk_bytes = self.engine_chunk_bytes;
         let mut chunks_read = 0u64;
         let began = Instant::now();
         let outcome = self.frozen_with(|copy| {
+            // A write still in flight to a region that cannot be frozen could
+            // land under the read without a later event: wait it out first.
+            copy.wait_for_quiet_regions()?;
             copy.tracker.drain(DRAIN_TIMEOUT)?;
             let mut late = copy.tracker.empty_map();
             copy.tracker.take_into(&mut late);
             copy.pending.union_with(&late);
             let chunks = copy.pending_engine_chunks();
-            let dirty_bytes = chunks.len() as u64 * chunk_bytes;
+            chunks_read = chunks.iter().map(|r| r.chunks.len() as u64).sum();
+            let dirty_bytes = chunks_read * chunk_bytes;
             if dirty_bytes > final_max {
                 return Err(Error::NoConvergence {
                     dirty_bytes,
                     passes: copy.summary.passes,
                 });
             }
-            chunks_read = chunks.len() as u64;
-            read(&chunks)
+            let value = read(&chunks)?;
+            // The quiet window: a region that cannot be frozen must not have
+            // been written since its final read began.
+            copy.tracker.drain(DRAIN_TIMEOUT)?;
+            copy.tracker.take_into(&mut late);
+            for (index, bits) in late.bits().iter().enumerate() {
+                if bits.count() > 0 && copy.holds[index] == Hold::Quiet {
+                    return Err(Error::SourceChanged {
+                        what: format!(
+                            "{} was written during the final read, and it cannot be frozen",
+                            copy.describe(index)
+                        ),
+                    });
+                }
+            }
+            Ok(value)
         });
         let frozen_for = began.elapsed();
         self.summary.final_freeze_ms = u64::try_from(frozen_for.as_millis()).unwrap_or(u64::MAX);
@@ -473,8 +805,8 @@ impl TrackedCopy {
         Ok(value)
     }
 
-    /// After the copy: no event may have been lost, and the source must have
-    /// kept its shape. Returns what the copy did.
+    /// After the copy: no event may have been lost, and every region must
+    /// have kept its shape. Returns what the copy did.
     pub fn finish(&mut self) -> Result<TrackedSummary> {
         let losses = self.tracker.integrity()?;
         if !losses.is_clean() {
@@ -482,22 +814,89 @@ impl TrackedCopy {
                 reason: format!("{losses:?}"),
             });
         }
-        let region = region_of_device(&self.source, &self.region)?;
-        let now = SourceFacts::read(&self.source, &region)?;
-        if now != self.start {
-            return Err(Error::SourceChanged {
-                what: format!("{:?} became {:?}", self.start, now),
-            });
+        for (index, spec) in self.specs.iter().enumerate() {
+            let now = RegionFacts::read(spec)?;
+            if now != self.facts[index] {
+                return Err(Error::SourceChanged {
+                    what: format!(
+                        "{}: {:?} became {:?}",
+                        self.describe(index),
+                        self.facts[index],
+                        now
+                    ),
+                });
+            }
         }
         Ok(self.summary)
     }
 
-    /// Freeze every tracked filesystem, run `inside`, thaw (always), with a
-    /// deadman armed for each. Nothing is logged while frozen.
-    fn frozen(&mut self, inside: impl FnOnce() -> Result<()>) -> Result<()> {
-        self.frozen_with(|_| inside())
+    /// Writes in flight to the regions held by the quiet window: a quiet
+    /// partition's own counter, and for an area of the disk outside every
+    /// partition, the disk's counter less all of its partitions'.
+    fn quiet_writes_in_flight(&self) -> Result<u64> {
+        let class = lr_core::sysfs::sysfs_root().join("class/block");
+        let writes = |name: &str| -> Result<u64> {
+            let text = read_sysfs(&class.join(name).join("inflight"))?;
+            text.split_ascii_whitespace()
+                .nth(1)
+                .and_then(|count| count.parse().ok())
+                .ok_or_else(|| Error::corrupt(format!("{name}/inflight: {text:?}")))
+        };
+        let mut total = 0;
+        let mut outside_partitions = None;
+        for (index, spec) in self.specs.iter().enumerate() {
+            if self.holds[index] != Hold::Quiet {
+                continue;
+            }
+            match &spec.partition {
+                Some(partition) => {
+                    total += writes(&lr_core::sysfs::device_name(partition).map_err(Error::Io)?)?;
+                }
+                None => {
+                    if outside_partitions.is_none() {
+                        let mut partitions = 0;
+                        let disk_dir = std::fs::canonicalize(class.join(&self.disk_name))
+                            .map_err(Error::Io)?;
+                        for entry in std::fs::read_dir(&disk_dir).map_err(Error::Io)?.flatten() {
+                            if entry.path().join("partition").exists() {
+                                partitions += writes(&entry.file_name().to_string_lossy())?;
+                            }
+                        }
+                        outside_partitions =
+                            Some(writes(&self.disk_name)?.saturating_sub(partitions));
+                    }
+                }
+            }
+        }
+        Ok(total + outside_partitions.unwrap_or(0))
     }
 
+    fn wait_for_quiet_regions(&self) -> Result<()> {
+        if !self.holds.contains(&Hold::Quiet) {
+            return Ok(());
+        }
+        let deadline = Instant::now() + QUIET_IDLE_TIMEOUT;
+        while self.quiet_writes_in_flight()? > 0 {
+            if Instant::now() >= deadline {
+                return Err(Error::SourceChanged {
+                    what: "a region that cannot be frozen kept being written".to_owned(),
+                });
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(())
+    }
+
+    fn describe(&self, index: usize) -> String {
+        let spec = &self.specs[index];
+        match &spec.partition {
+            Some(partition) => format!("{} ({})", partition.display(), spec.fs_type),
+            None => format!("the disk area at sector {}", spec.start_sector),
+        }
+    }
+
+    /// Freeze every tracked filesystem, `/` last, run `inside`, thaw (always),
+    /// with a deadman armed for each. Nothing is logged while frozen.
     fn frozen_with<T>(&mut self, inside: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         // The deadman can only fire after `freeze_max`, and a freeze that long
         // fails the copy anyway, so an early thaw can never be published.
@@ -534,25 +933,24 @@ impl TrackedCopy {
     }
 }
 
-/// The partition's current place on the disk, from sysfs.
-fn region_of_device(device: &Path, before: &TrackedRegion) -> Result<TrackedRegion> {
-    let name = lr_core::sysfs::device_name(device).map_err(Error::Io)?;
-    let class = lr_core::sysfs::sysfs_root().join("class/block").join(name);
-    let sectors = read_sysfs(&class.join("size"))?
-        .parse()
-        .map_err(|_| Error::corrupt("sysfs size is not a number"))?;
-    let start_sector = if before.part.is_some() {
-        read_sysfs(&class.join("start"))?
-            .parse()
-            .map_err(|_| Error::corrupt("sysfs start is not a number"))?
-    } else {
-        0
-    };
-    Ok(TrackedRegion {
-        start_sector,
-        sectors,
-        ..*before
-    })
+/// Hold a logind inhibitor lock (`sleep:shutdown`, block) for the copy, so
+/// the machine is not suspended or shut down in the middle of a freeze. No
+/// logind or no `systemd-inhibit`: nothing to hold.
+fn inhibit_sleep() -> Option<Child> {
+    Command::new("systemd-inhibit")
+        .args([
+            "--what=sleep:shutdown",
+            "--who=LinuxReflect",
+            "--why=a live backup is copying this disk",
+            "--mode=block",
+            "sleep",
+            "infinity",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()
 }
 
 /// Filesystems frozen together, thawed in reverse order exactly once.
@@ -619,22 +1017,57 @@ mod tests {
     }
 
     #[test]
-    fn other_filesystems_and_the_running_root_are_refused() {
+    fn other_filesystems_and_unmounted_sources_are_refused() {
         let mut xfs = mounted_ext4();
         if let Some(fs) = xfs.fs.as_mut() {
             fs.fs_type = "xfs".to_owned();
         }
         assert!(refusal(&xfs, &forced()).expect("xfs").contains("ext4"));
+        let unmounted = test_layout::offline("/dev/sdq1");
+        assert!(
+            refusal(&unmounted, &forced())
+                .expect("unmounted")
+                .contains("not mounted")
+        );
+    }
+
+    #[test]
+    fn the_running_root_is_no_longer_refused_for_being_root() {
         let mut root = mounted_ext4();
         root.mountpoints = vec![PathBuf::from("/")];
-        assert!(refusal(&root, &forced()).expect("root").contains("phase 3"));
-        let unmounted = test_layout::offline("/dev/sdq1");
-        assert!(refusal(&unmounted, &forced()).is_some());
+        let reason = refusal(&root, &forced());
+        assert!(
+            reason
+                .as_deref()
+                .is_none_or(|reason| !reason.contains("running system")),
+            "{reason:?}"
+        );
+    }
+
+    #[test]
+    fn a_destination_on_a_frozen_filesystem_is_refused() {
+        let dir = tempfile::tempdir().expect("dir");
+        let opts = SnapshotOpts {
+            provider: Some(ID.to_owned()),
+            destination: Some(dir.path().join("backups")),
+            ..SnapshotOpts::default()
+        };
+        // The working directory may share that filesystem; either refusal is
+        // the right one.
+        let reason = job_writes_refusal(&[dir.path().to_path_buf()], &opts).expect("refused");
+        assert!(reason.contains("will be frozen"), "{reason}");
+        let remote = SnapshotOpts {
+            destination_remote: true,
+            ..opts
+        };
+        assert_eq!(
+            job_writes_refusal(&[PathBuf::from("/nonexistent-mount")], &remote),
+            None
+        );
     }
 
     #[test]
     fn engine_chunks_must_be_multiples_of_the_tracking_chunk() {
-        // Exercised through the arithmetic only: binding needs no tracker.
         assert!(TRACK_CHUNK_BYTES.is_power_of_two());
         assert!((256u64 << 10).is_multiple_of(TRACK_CHUNK_BYTES));
     }
