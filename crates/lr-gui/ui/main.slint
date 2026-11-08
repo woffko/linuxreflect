@@ -9,7 +9,7 @@
 // This file is compiled with Slint under the Royalty-Free 2.0 licence; the
 // attribution the licence asks for is shown in the navigation (see D-090).
 
-import { ScrollView, ListView, Button, ComboBox, CheckBox, LineEdit, ProgressIndicator, Palette } from "std-widgets.slint";
+import { ScrollView, ListView, Button, ComboBox, CheckBox, LineEdit, ProgressIndicator, Palette, SpinBox } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { ConfiguredDestination, DiskRow, HistoryRow, PartitionTile, DiskCard, JobStage, JobPresentation } from "types.slint";
 import { NavItem, DiskPanel, StepList, Banner, PageHeader } from "widgets.slint";
@@ -42,6 +42,8 @@ export component MainWindow inherits Window {
     in-out property <string> member-type: "full";
     in-out property <string> snapshot: "auto";
     in-out property <bool> allow-freeze: false;
+    // Tracked-freeze: the longest final freeze in seconds (spec §E.7 freeze_max).
+    in-out property <int> freeze-max: 3;
     in-out property <bool> allow-inconsistent: false;
     in-out property <string> compress: "zstd:9";
     in-out property <string> bad-sector: "abort";
@@ -60,6 +62,7 @@ export component MainWindow inherits Window {
     changed member-type => { root.backup-inputs-changed(); }
     changed snapshot => { root.backup-inputs-changed(); }
     changed allow-freeze => { root.backup-inputs-changed(); }
+    changed freeze-max => { root.backup-inputs-changed(); }
     changed allow-inconsistent => { root.backup-inputs-changed(); }
     changed compress => { root.backup-inputs-changed(); }
     changed bad-sector => { root.backup-inputs-changed(); }
@@ -465,7 +468,20 @@ export component MainWindow inherits Window {
                                             HorizontalLayout {
                                                 spacing: 8px;
                                                 Text { text: "Consistency"; vertical-alignment: center; width: 130px; color: Theme.text; }
-                                                ComboBox { max-width: 320px; model: ["auto", "offline", "btrfs", "lvm", "freeze", "none"]; current-value <=> root.snapshot; }
+                                                ComboBox { max-width: 320px; model: ["auto", "offline", "btrfs", "lvm", "tracked-freeze", "freeze", "none"]; current-value <=> root.snapshot; }
+                                            }
+                                            if root.snapshot == "tracked-freeze": VerticalLayout {
+                                                spacing: 6px;
+                                                Text {
+                                                    text: "Copies the disk while the system runs, then pauses writes to its ext4 filesystems only for a final read of the last changes (Debian and Ubuntu on ext4).";
+                                                    color: Theme.muted;
+                                                    wrap: word-wrap;
+                                                }
+                                                HorizontalLayout {
+                                                    spacing: 8px;
+                                                    Text { text: "Longest pause (s)"; vertical-alignment: center; width: 130px; color: Theme.text; }
+                                                    SpinBox { max-width: 120px; minimum: 1; maximum: 30; value <=> root.freeze-max; }
+                                                }
                                             }
                                             if root.snapshot == "freeze": CheckBox {
                                                 text: "Allow a temporary filesystem freeze (applications may pause)";

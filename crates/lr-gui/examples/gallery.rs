@@ -111,9 +111,10 @@ const SCENES: &[Scene] = &[
         ui.set_backup_set("gui-test".into());
         ui.set_backup_plan_error(
             "No consistent imaging method is available for this source with the selected settings. \
-             For an image of the running system disk, boot rescue media and back it up offline. \
-             To test the GUI now, go Back to Source, choose a small local folder, and keep your \
-             network folder as Destination. A second local drive is not required."
+             For an image of the running system disk on Debian or Ubuntu with ext4, open Backup \
+             options and choose Consistency: tracked-freeze; otherwise boot rescue media and back \
+             it up offline. To test the GUI now, go Back to Source, choose a small local folder, \
+             and keep your network folder as Destination. A second local drive is not required."
                 .into(),
         );
         ui.set_backup_plan_error_details(
@@ -123,6 +124,38 @@ const SCENES: &[Scene] = &[
         );
         ui.set_show_backup_plan_error_details(true);
         ui.set_status("Backup planning failed. See the message in the wizard.".into());
+    }),
+    ("backup-live-system", |ui| {
+        ui.set_current_tab(1);
+        ui.set_backup_step(1);
+        ui.set_source("/dev/nvme0n1".into());
+        ui.set_destination("/media/backup-drive/LinuxReflect".into());
+        ui.set_backup_set("workstation".into());
+        ui.set_advanced_backup(true);
+        ui.set_snapshot("tracked-freeze".into());
+        ui.set_freeze_max(3);
+    }),
+    ("backup-live-summary", |ui| {
+        ui.set_current_tab(1);
+        ui.set_backup_step(2);
+        ui.set_source("/dev/nvme0n1".into());
+        ui.set_destination("/media/backup-drive/LinuxReflect".into());
+        ui.set_backup_set("workstation".into());
+        ui.set_backup_summary(
+            "Planned method: tracked-freeze · Image kind: Block\n\
+             Planned consistency: copied while the system runs; filesystem writes pause only \
+             for a final read of the last changes.\n\
+             The daemon checks the source and safety requirements again when the backup starts.\n\
+             Note: tracked-freeze copies while the system runs, then freezes /boot, / together \
+             for at most 3 s (--freeze-max) to read the last changes; programs writing there \
+             wait during that freeze\n\
+             Note: 3 region(s) that cannot be frozen (an EFI system partition, BIOS boot, the \
+             boot area) are read under the same freeze; a write to one of them during that read \
+             fails the backup\n\
+             Note: no hooks are installed (/etc/linuxreflect/hooks): applications are imaged as \
+             a power cut would leave them on disk"
+                .into(),
+        );
     }),
     ("backup-running", |ui| {
         ui.set_current_tab(1);

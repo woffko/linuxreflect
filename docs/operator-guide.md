@@ -138,13 +138,17 @@ and choose the mounted network folder as Destination. Verify the created image
 in the Restore library, then restore into a new empty local directory.
 This exercises file recovery, not whole-disk boot recovery.
 
-The wizard still plans whole-disk images offline only, including every
-partition and active swap: it does not offer tracked-freeze yet. A running
-system disk without a suitable partition-level snapshot cannot be made
-consistent by choosing a network destination. Image it live from the CLI with
-tracked-freeze ([below](#live-system-images-tracked-freeze)), or boot rescue
-media for an offline whole-disk image; never freeze the running root
-filesystem with the plain freeze provider.
+With the default consistency, the wizard plans whole-disk images offline
+only, including every partition and active swap. A running system disk
+without a suitable partition-level snapshot cannot be made consistent by
+choosing a network destination. On Debian or Ubuntu with ext4, open **Backup
+options** and choose **Consistency: tracked-freeze** to image it while it
+runs ([below](#live-system-images-tracked-freeze)). **Longest pause** is
+`--freeze-max`, and the review names the filesystems the final freeze holds
+(rendered: [the option](screenshots/backup-live-system-1024x768@100-dark.png),
+[the review](screenshots/backup-live-summary-1024x768@100-dark.png)).
+Otherwise boot rescue media for an offline whole-disk image. Never freeze the
+running root filesystem with the plain freeze provider.
 Planning refusals appear in the wizard with expandable technical details.
 The [rendered refusal example](screenshots/backup-planning-refused-1024x768@100-dark.png)
 shows the layout, not acceptance on a physical desktop.
@@ -204,7 +208,8 @@ to an image file (A14).
 and in use, the root filesystem included, and with them the whole disk of a
 running system: `/`, `/boot`, the EFI system partition, the BIOS boot
 partition and the boot area before the first partition (spec §E.7, Slice 18).
-It is opt-in and, for now, a CLI feature:
+It is opt-in: in the backup wizard, choose **Consistency: tracked-freeze**
+under **Backup options**, or on the command line:
 
 ```sh
 sudo linuxreflect backup create --source /dev/nvme0n1 --dest /mnt/backup \
@@ -333,10 +338,10 @@ write load, restored to another disk, and booted from that disk alone
 ([`live-backup-acceptance.md`](live-backup-acceptance.md)).
 
 **Not done yet:** incremental and differential members (a tracked copy is
-always a full image; other types are refused), the backup wizard and
-`PlanBackup` predictions, the `--allow-inconsistent` exception for a busy
-ESP, and xfs. **Untested so far:** real hardware at full speed and a desktop
-session during the backup. Jobs through the daemon are covered by a root test
+always a full image; other types are refused), the `--allow-inconsistent`
+exception for a busy ESP, and xfs. **Untested so far:** real hardware at
+full speed, a desktop session during the backup, and a backup started from
+the GUI in a VM. Jobs through the daemon are covered by a root test
 on loop disks, not by the VM acceptance, which runs the CLI without a daemon.
 
 ## Chains: full, incremental, differential
