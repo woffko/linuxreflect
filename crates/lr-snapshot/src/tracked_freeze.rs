@@ -174,8 +174,10 @@ pub fn tracepoint_refusal() -> Option<String> {
 }
 
 /// Why the job's own writes could reach a filesystem it will freeze: the
-/// destination or the working directory on it. Unlike the whole-read freeze
-/// (§E.4), other processes' writes are fine; they wait out the short freeze.
+/// destination on it (the copy would track its own writes). Unlike the
+/// whole-read freeze (§E.4), other processes' writes are fine, since they
+/// wait out the short freeze, and so is the working directory: nothing is
+/// written while frozen, and a daemon's working directory is `/`.
 fn job_writes_refusal(mountpoints: &[PathBuf], opts: &SnapshotOpts) -> Option<String> {
     use std::os::unix::fs::MetadataExt as _;
     let frozen: Vec<u64> = mountpoints
@@ -186,14 +188,6 @@ fn job_writes_refusal(mountpoints: &[PathBuf], opts: &SnapshotOpts) -> Option<St
         let existing = path.ancestors().find(|p| p.exists()).unwrap_or(path);
         std::fs::metadata(existing).is_ok_and(|metadata| frozen.contains(&metadata.dev()))
     };
-    if let Ok(cwd) = std::env::current_dir()
-        && on_frozen(&cwd)
-    {
-        return Some(format!(
-            "the working directory {} is on a filesystem that will be frozen",
-            cwd.display()
-        ));
-    }
     if opts.destination_remote {
         return None;
     }
@@ -1052,10 +1046,8 @@ mod tests {
             destination: Some(dir.path().join("backups")),
             ..SnapshotOpts::default()
         };
-        // The working directory may share that filesystem; either refusal is
-        // the right one.
         let reason = job_writes_refusal(&[dir.path().to_path_buf()], &opts).expect("refused");
-        assert!(reason.contains("will be frozen"), "{reason}");
+        assert!(reason.contains("track its own writes"), "{reason}");
         let remote = SnapshotOpts {
             destination_remote: true,
             ..opts

@@ -9,10 +9,12 @@ do not redesign it. Where the specification is silent, record the decision in
 (November 2026, D-138; the file keeps its v2.1 name) adds live ext4 images
 through the tracked-freeze provider (§E.7, Slice 18), planned in
 `docs/live-backup-plan.md`. Phase 0 (`docs/live-backup-spike.md`) and phase 1
-(`lr_snapshot::tracking`) are done; phase 2 copies one mounted, non-root ext4
-partition into a full image with `--snapshot tracked-freeze` (root test
-`lr-engine/tests/root_tracked.rs`); the root filesystem, whole disks and
-incrementals are not done yet.
+(`lr_snapshot::tracking`) are done; phases 2 and 3 copy a running system's whole
+disk (root, `/boot`, ESP) live into a full image with `--snapshot
+tracked-freeze` (root tests `lr-engine/tests/root_tracked.rs`; VM acceptance
+`tools/vm/live_restore_matrix.py`, results in `docs/live-backup-acceptance.md`:
+six distribution and firmware runs imaged live, restored and booted).
+Incremental members and the daemon/GUI wiring are not done yet.
 
 The MVP is slices S1–S11 (spec §K). Slices are landed one pull request each.
 Current state: S1 (workspace, `lr-core`, `lr-unsafe`, capability probe,

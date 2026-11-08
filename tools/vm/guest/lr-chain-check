@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""Check the writer's hash chain in a restored system."""
+import hashlib, sys
+text = open(sys.argv[1]).read()
+prev, count, valid = b"genesis", 0, True
+for line in text.splitlines():
+    seq, _, digest = line.partition(" ")
+    if not seq.isdigit() or int(seq) != count:
+        valid = False
+        break
+    want = hashlib.sha256(prev + seq.encode()).hexdigest()
+    if digest != want:
+        valid = False
+        break
+    prev, count = digest.encode(), count + 1
+torn = bool(text) and not text.endswith("\n")
+print(f"chain valid={valid} count={count} torn={torn}")

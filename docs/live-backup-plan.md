@@ -3,12 +3,15 @@
 Status, 2026-11-08: phase 0 is done (`docs/live-backup-spike.md`: the
 mechanism holds on kernels 5.15 to 6.18), phase 1 is done
 (`lr_snapshot::tracking`), and phase 2 is done except incremental members
-(refused for now), and phase 3 is in progress: whole disks with the root
+(refused for now), and phase 3 is done: whole disks with the root
 filesystem, a vfat ESP and other unfrozen regions under the quiet-window
 rule are copied live with `--snapshot tracked-freeze`, writes are tracked on
 submission and on completion, dpkg's lock postpones the final freeze and a
-logind inhibitor blocks sleep. The phase 3 VM acceptance (a running system
-imaged, restored to another disk and booted) is still open. It implements spec v2.2 §E.7 and
+logind inhibitor blocks sleep, and the VM acceptance passed on Debian 12,
+Debian 13, Ubuntu 22.04 and Ubuntu 24.04, UEFI with Secure Boot and BIOS
+(`docs/live-backup-acceptance.md`: each running system imaged live, restored
+onto another disk, and booted from it alone). Still open: incremental
+members, phase 4 (daemon, GUI, operator guide) and phase 5. It implements spec v2.2 §E.7 and
 Slice 18 (decision D-138).
 
 ## Goal
