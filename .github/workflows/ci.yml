@@ -99,7 +99,7 @@ jobs:
             libx11-6 libx11-xcb1 libxcursor1 libxrandr2 libxi6 libxkbcommon0 \
             libxkbcommon-x11-0 libwayland-client0 libfontconfig1 fonts-dejavu-core \
             rsync acl openssh-server openssh-client nbd-client kmod procps \
-            dbus-daemon python3 python3-dbus python3-gi polkitd
+            dbus-daemon python3 python3-dbus python3-gi polkitd systemd
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -125,6 +125,14 @@ jobs:
             /usr/lib/polkit-1/polkitd --no-debug &
           [ -e "/lib/modules/$(uname -r)" ] || ln -s "/host-modules/$(uname -r)" "/lib/modules/$(uname -r)"
           modprobe nbd nbds_max=16 || echo "nbd is not available on this runner kernel"
+          # Tracked-freeze (spec §E.7): tracefs for the block tracepoints, and
+          # the tmpfs its write-tracking self test needs. Without systemd as
+          # PID 1, the freeze deadman uses its detached helper.
+          mountpoint -q /sys/kernel/tracing \
+            || mount -t tracefs nodev /sys/kernel/tracing \
+            || echo "tracefs is not available in this container"
+          mkdir -p /run/linuxreflect
+          mountpoint -q /run/linuxreflect || mount -t tmpfs -o mode=0700 tmpfs /run/linuxreflect
           # Root tests run the workspace's own binaries (the daemon, the
           # session helper), which `cargo test` alone does not build.
           cargo build --workspace
