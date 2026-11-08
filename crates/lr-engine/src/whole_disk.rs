@@ -181,8 +181,103 @@ pub(crate) fn preflight(
 }
 
 /// Whether the whole disk is copied live with tracked-freeze (spec §E.7).
-fn tracked_mode(request: &crate::backup::BackupRequest) -> bool {
+pub(crate) fn tracked_mode(request: &crate::backup::BackupRequest) -> bool {
     request.snapshot_provider.as_deref() == Some(lr_snapshot::tracked_freeze::ID)
+}
+
+/// The regions of a whole disk, without reading it: the leading area, then
+/// every partition in disk order. The numbers need not follow the disk
+/// (partition 2 may come before 1), so regions are ordered by position and
+/// keep their own numbers (R37). A swap region's header is read by the
+/// backup.
+fn layout_regions(
+    layout: &SourceLayout,
+    lbs: u32,
+    disk_size: u64,
+    consistency: Consistency,
+) -> Vec<RegionRecord> {
+    let mut regions: Vec<RegionRecord> = Vec::new();
+    let first_partition_byte = layout
+        .partitions
+        .iter()
+        .map(|partition| partition.start_lba * u64::from(lbs))
+        .min()
+        .unwrap_or(disk_size);
+    let leading_bytes = first_partition_byte.min(MAX_LEADING_BYTES);
+    if leading_bytes > 0 {
+        let mut region = RegionRecord::new(RegionKind::Leading, 0, 0, leading_bytes);
+        region.consistency = consistency;
+        regions.push(region);
+    }
+    let mut plans: Vec<PartitionPlan> = layout
+        .partitions
+        .iter()
+        .filter(|partition| partition.size_bytes > 0)
+        .map(plan_partition)
+        .collect();
+    plans.sort_by_key(|plan| (plan.start_lba, plan.index));
+    for plan in &plans {
+        let mut region = RegionRecord::new(plan.kind, plan.index, plan.start_lba, plan.size_bytes);
+        region.consistency = consistency;
+        region.bootable = plan.bootable;
+        region.type_guid = plan.type_guid.clone();
+        region.partuuid = plan.partuuid.clone();
+        region.fs_type = plan.fs_type.clone();
+        region.fs_uuid = plan.fs_uuid.clone();
+        region.fs_label = plan.fs_label.clone();
+        regions.push(region);
+    }
+    regions
+}
+
+/// What a tracked copy tracks: every region with a manifest, in order.
+fn tracked_specs(
+    regions: &[RegionRecord],
+    layout: &SourceLayout,
+    lbs: u32,
+) -> Vec<lr_snapshot::tracked_freeze::RegionSpec> {
+    let sector = |bytes: u64| bytes / 512;
+    regions
+        .iter()
+        .filter(|region| region.has_manifest())
+        .map(|region| {
+            let partition = layout.partitions.iter().find(|partition| {
+                region.kind != RegionKind::Leading && partition.index == region.index
+            });
+            lr_snapshot::tracked_freeze::RegionSpec {
+                start_sector: sector(region.start_lba * u64::from(lbs)),
+                sectors: sector(region.size_bytes),
+                partition: partition.and_then(|partition| partition.path.clone()),
+                fs_type: region.fs_type.clone(),
+                mountpoints: partition
+                    .map(|partition| partition.mountpoints.clone())
+                    .unwrap_or_default(),
+            }
+        })
+        .collect()
+}
+
+/// Plan a whole-disk tracked copy without tracing or freezing (the backup
+/// plan): the same regions and the same checks as the backup.
+///
+/// # Errors
+/// The refusals the backup would return before it starts tracing.
+pub(crate) fn plan_tracked(
+    request: &crate::backup::BackupRequest,
+    layout: &SourceLayout,
+) -> Result<lr_snapshot::tracked_freeze::TrackedPlan> {
+    let lbs = layout.device_facts.logical_block_size;
+    let regions = layout_regions(
+        layout,
+        lbs,
+        layout.device_facts.size_bytes,
+        Consistency::Frozen,
+    );
+    lr_snapshot::tracked_freeze::plan_disk(
+        &request.source,
+        &tracked_specs(&regions, layout, lbs),
+        &crate::backup::snapshot_opts(request),
+    )
 }
 
 /// Back up a whole disk.
@@ -226,54 +321,21 @@ pub(crate) fn backup_whole_disk_with_layout(
     let lbs = source.logical_block_size();
     let mut buffer = source.buffer(request.chunk_size as usize)?;
 
-    // Regions: the leading area, then every partition in disk order. The
-    // numbers need not follow the disk (partition 2 may come before 1), so
-    // regions are ordered by position and keep their own numbers (R37).
-    let mut regions: Vec<RegionRecord> = Vec::new();
-    let first_partition_byte = layout
-        .partitions
-        .iter()
-        .map(|partition| partition.start_lba * u64::from(lbs))
-        .min()
-        .unwrap_or(disk_size);
-    let leading_bytes = first_partition_byte.min(MAX_LEADING_BYTES);
-    if leading_bytes > 0 {
-        let mut region = RegionRecord::new(RegionKind::Leading, 0, 0, leading_bytes);
-        region.consistency = consistency;
-        regions.push(region);
-    }
-    let mut plans: Vec<PartitionPlan> = layout
-        .partitions
-        .iter()
-        .filter(|partition| partition.size_bytes > 0)
-        .map(plan_partition)
-        .collect();
-    plans.sort_by_key(|plan| (plan.start_lba, plan.index));
-    for plan in &plans {
-        let mut region = RegionRecord::new(plan.kind, plan.index, plan.start_lba, plan.size_bytes);
-        region.consistency = consistency;
-        region.bootable = plan.bootable;
-        region.type_guid = plan.type_guid.clone();
-        region.partuuid = plan.partuuid.clone();
-        region.fs_type = plan.fs_type.clone();
-        region.fs_uuid = plan.fs_uuid.clone();
-        region.fs_label = plan.fs_label.clone();
-        if plan.kind == RegionKind::Swap {
-            let mut header = source.buffer(SWAP_HEADER_BYTES)?;
-            let read = source.read_at(
-                plan.start_lba * u64::from(lbs),
-                &mut header,
-                SWAP_HEADER_BYTES,
-            )?;
-            if read != SWAP_HEADER_BYTES {
-                return Err(Error::BadSector {
-                    offset: plan.start_lba * u64::from(lbs),
-                    len: SWAP_HEADER_BYTES as u64,
-                });
-            }
-            region.swap_header = header.as_slice().to_vec();
+    let mut regions = layout_regions(layout, lbs, disk_size, consistency);
+    for region in regions
+        .iter_mut()
+        .filter(|region| region.kind == RegionKind::Swap)
+    {
+        let mut header = source.buffer(SWAP_HEADER_BYTES)?;
+        let offset = region.start_lba * u64::from(lbs);
+        let read = source.read_at(offset, &mut header, SWAP_HEADER_BYTES)?;
+        if read != SWAP_HEADER_BYTES {
+            return Err(Error::BadSector {
+                offset,
+                len: SWAP_HEADER_BYTES as u64,
+            });
         }
-        regions.push(region);
+        region.swap_header = header.as_slice().to_vec();
     }
 
     let disk_header = DiskHeader {
@@ -343,29 +405,9 @@ pub(crate) fn backup_whole_disk_with_layout(
 
     // Tracked: one copy over every region that has a manifest, in order.
     let mut tracked = if tracked_mode {
-        let sector = |bytes: u64| bytes / 512;
-        let mut specs = Vec::new();
-        for region in disk_header
-            .regions
-            .iter()
-            .filter(|region| region.has_manifest())
-        {
-            let partition = layout.partitions.iter().find(|partition| {
-                region.kind != RegionKind::Leading && partition.index == region.index
-            });
-            specs.push(lr_snapshot::tracked_freeze::RegionSpec {
-                start_sector: sector(region.start_lba * u64::from(lbs)),
-                sectors: sector(region.size_bytes),
-                partition: partition.and_then(|partition| partition.path.clone()),
-                fs_type: region.fs_type.clone(),
-                mountpoints: partition
-                    .map(|partition| partition.mountpoints.clone())
-                    .unwrap_or_default(),
-            });
-        }
         let mut copy = lr_snapshot::tracked_freeze::track_disk(
             &request.source,
-            specs,
+            tracked_specs(&disk_header.regions, layout, lbs),
             &crate::backup::snapshot_opts(request),
         )?;
         copy.bind(u64::from(request.chunk_size))?;
@@ -673,7 +715,11 @@ pub(crate) fn backup_whole_disk_with_layout(
         }
         .to_owned(),
         image_bytes,
-        leading_bytes,
+        leading_bytes: disk_header
+            .regions
+            .iter()
+            .find(|region| region.kind == RegionKind::Leading)
+            .map_or(0, |region| region.size_bytes),
         regions: reports,
         encrypted: new_keys.encrypted,
         tracked: tracked_summary,

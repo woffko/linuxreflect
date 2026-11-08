@@ -83,6 +83,16 @@ fn plan_source_layout(
     if layout.is_whole_disk() {
         validate_mode_selection(mode, ImageKind::Block, true)?;
         crate::whole_disk::preflight(request, layout)?;
+        if crate::whole_disk::tracked_mode(request) {
+            let tracked = crate::whole_disk::plan_tracked(request, layout)?;
+            return Ok(BackupPlan {
+                provider: lr_snapshot::tracked_freeze::ID.to_owned(),
+                image_kind: ImageKind::Block,
+                consistency: Consistency::Frozen,
+                estimated_bytes: layout.device_facts.size_bytes,
+                warnings: tracked.notes(),
+            });
+        }
         return Ok(BackupPlan {
             provider: "offline".to_owned(),
             image_kind: ImageKind::Block,
@@ -116,12 +126,16 @@ fn plan_source_layout(
         }
     }
 
+    let mut warnings = source_plan.warnings;
+    if source_plan.provider == lr_snapshot::tracked_freeze::ID {
+        warnings.extend(lr_snapshot::tracked_freeze::plan_partition(layout, &opts)?.notes());
+    }
     Ok(BackupPlan {
         provider: source_plan.provider,
         image_kind: source_plan.image_kind,
         consistency: source_plan.consistency,
         estimated_bytes: source_plan.estimated_bytes,
-        warnings: source_plan.warnings,
+        warnings,
     })
 }
 

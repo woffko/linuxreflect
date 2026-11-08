@@ -1035,6 +1035,77 @@ fn whole_disk_request(disk: &str, dest: &Path) -> BackupRequest {
     request(disk, dest)
 }
 
+/// `PlanBackup` for a running system disk (spec §E.7, D-136): the plan
+/// predicts tracked-freeze and `Frozen`, names the filesystems the final
+/// freeze holds and its budget, and refuses what the backup would refuse,
+/// all without tracing or freezing anything.
+#[test]
+#[ignore = "requires root, loop devices and tracefs"]
+fn the_backup_plan_predicts_a_live_whole_disk_copy() {
+    if !root_tests_enabled() || !prerequisites() {
+        return;
+    }
+    let Some(disk) = SystemDisk::create() else {
+        return;
+    };
+    let work = tempfile::tempdir().expect("work");
+    let plan_of = |request: &BackupRequest| {
+        lr_engine::plan_backup(
+            request,
+            lr_engine::options::Mode::Auto,
+            &lr_engine::FileBackupOptions::default(),
+        )
+    };
+    let mut live = whole_disk_request(&disk.device, &work.path().join("backups"));
+    live.hooks_dir = Some(work.path().join("no-hooks"));
+    let plan = plan_of(&live).expect("a plan for the running disk");
+    assert_eq!(plan.provider, "tracked-freeze");
+    assert_eq!(plan.consistency, lr_core::Consistency::Frozen);
+    assert_eq!(plan.image_kind, lr_core::ImageKind::Block);
+    let notes = plan.warnings.join("\n");
+    assert!(
+        notes.contains(&format!(
+            "freezes {} together for at most 3 s",
+            disk.root().display()
+        )),
+        "{notes}"
+    );
+    // The boot area before the first partition and the vfat ESP.
+    assert!(
+        notes.contains("2 region(s) that cannot be frozen"),
+        "{notes}"
+    );
+    assert!(notes.contains("no hooks are installed"), "{notes}");
+    assert_eq!(trace_leftovers(), 0, "planning created a trace instance");
+    assert!(
+        writable_within(&disk.root(), Duration::from_secs(2)),
+        "planning froze the source"
+    );
+
+    // A longer budget is shown as asked; one past the cap is refused.
+    let mut longer = whole_disk_request(&disk.device, &work.path().join("backups"));
+    longer.hooks_dir = Some(work.path().join("no-hooks"));
+    longer.tracked_tuning.freeze_max_secs = Some(10);
+    let notes = plan_of(&longer).expect("plan").warnings.join("\n");
+    assert!(notes.contains("for at most 10 s"), "{notes}");
+    longer.tracked_tuning.freeze_max_secs = Some(31);
+    let error = plan_of(&longer).expect_err("past the cap");
+    assert!(error.to_string().contains("1 to 30 seconds"), "{error}");
+
+    // What the backup refuses, the plan refuses: a destination on the root
+    // filesystem, and a mounted disk without tracked-freeze.
+    let on_root = whole_disk_request(&disk.device, &disk.root().join("backups"));
+    let error = plan_of(&on_root).expect_err("a destination on a frozen filesystem");
+    assert!(error.to_string().contains("will be frozen"), "{error}");
+    let mut offline = whole_disk_request(&disk.device, &work.path().join("backups"));
+    offline.snapshot_provider = None;
+    let error = plan_of(&offline).expect_err("a mounted disk without tracked-freeze");
+    assert!(
+        error.to_string().contains("offline read refused"),
+        "{error}"
+    );
+}
+
 /// `sfdisk -d` without the device names, for comparing two disks' layouts.
 fn layout_of(device: &str) -> String {
     let output = Command::new("sfdisk")

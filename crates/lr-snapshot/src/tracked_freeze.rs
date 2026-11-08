@@ -80,29 +80,135 @@ impl BlockSnapshotProvider for TrackedFreezeProvider {
     }
 
     fn create(&self, src: &SourceLayout, opts: &SnapshotOpts) -> Result<BlockSnapshot> {
-        if let Some(reason) = refusal(src, opts) {
-            return Err(refused(&reason));
-        }
-        let region = region_of(src)?;
-        let spec = RegionSpec {
-            start_sector: region.start_sector,
-            sectors: region.sectors,
-            partition: Some(src.device.clone()),
-            fs_type: src
-                .fs
-                .as_ref()
-                .map(|facts| facts.fs_type.clone())
-                .unwrap_or_default(),
-            mountpoints: src.mountpoints.clone(),
-        };
-        let device = if region.part.is_some() {
-            disk_of(&src.device)?
-        } else {
-            src.device.clone()
-        };
+        let (device, spec) = partition_route(src, opts)?;
         let copy = TrackedCopy::start(&device, vec![spec], opts)?;
         Ok(BlockSnapshot::new(src.device.clone(), Consistency::Frozen, ()).with_tracked(copy))
     }
+}
+
+/// The disk to trace and the one region of a partition (or of a device with
+/// ext4 directly on it), after the partition route's refusals.
+fn partition_route(src: &SourceLayout, opts: &SnapshotOpts) -> Result<(PathBuf, RegionSpec)> {
+    if let Some(reason) = refusal(src, opts) {
+        return Err(refused(&reason));
+    }
+    let region = region_of(src)?;
+    let spec = RegionSpec {
+        start_sector: region.start_sector,
+        sectors: region.sectors,
+        partition: Some(src.device.clone()),
+        fs_type: src
+            .fs
+            .as_ref()
+            .map(|facts| facts.fs_type.clone())
+            .unwrap_or_default(),
+        mountpoints: src.mountpoints.clone(),
+    };
+    let device = if region.part.is_some() {
+        disk_of(&src.device)?
+    } else {
+        src.device.clone()
+    };
+    Ok((device, spec))
+}
+
+/// What a tracked copy would do, found with the checks it makes before it
+/// traces or freezes anything (the backup plan, spec §E.7, D-136). The
+/// write-tracking self test is not run: it needs a loop device of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackedPlan {
+    /// Filesystems the final freeze holds together, `/` last.
+    pub frozen: Vec<PathBuf>,
+    /// Regions held by the quiet-window rule (an ESP, BIOS boot, the boot
+    /// area before the first partition).
+    pub quiet_regions: usize,
+    /// The final-freeze budget (`--freeze-max`).
+    pub freeze_max: Duration,
+    /// Pre-freeze hooks that would run.
+    pub pre_freeze_hooks: usize,
+    /// Post-thaw hooks that would run.
+    pub post_thaw_hooks: usize,
+}
+
+impl TrackedPlan {
+    /// What the plan tells the operator before the backup starts.
+    #[must_use]
+    pub fn notes(&self) -> Vec<String> {
+        let frozen: Vec<String> = self
+            .frozen
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        let mut notes = vec![format!(
+            "tracked-freeze copies while the system runs, then freezes {} together for at \
+             most {} s (--freeze-max) to read the last changes; programs writing there wait \
+             during that freeze",
+            frozen.join(", "),
+            self.freeze_max.as_secs()
+        )];
+        if self.quiet_regions > 0 {
+            notes.push(format!(
+                "{} region(s) that cannot be frozen (an EFI system partition, BIOS boot, the \
+                 boot area) are read under the same freeze; a write to one of them during \
+                 that read fails the backup",
+                self.quiet_regions
+            ));
+        }
+        notes.push(if self.pre_freeze_hooks + self.post_thaw_hooks == 0 {
+            "no hooks are installed (/etc/linuxreflect/hooks): applications are imaged as a \
+             power cut would leave them on disk"
+                .to_owned()
+        } else {
+            format!(
+                "{} pre-freeze and {} post-thaw hook(s) run around the final freeze",
+                self.pre_freeze_hooks, self.post_thaw_hooks
+            )
+        });
+        notes.push(
+            "the write-tracking self test runs when the backup starts; a kernel that fails it \
+             refuses the backup"
+                .to_owned(),
+        );
+        notes
+    }
+}
+
+/// Plan the tracked copy of a partition (or of a device with ext4 directly
+/// on it) without tracing or freezing anything.
+///
+/// # Errors
+/// The refusals [`BlockSnapshotProvider::create`] would return before it
+/// starts tracing.
+pub fn plan_partition(src: &SourceLayout, opts: &SnapshotOpts) -> Result<TrackedPlan> {
+    let (device, spec) = partition_route(src, opts)?;
+    plan_regions(&device, &[spec], opts)
+}
+
+/// Plan the tracked copy of whole-disk `regions` of `disk` without tracing
+/// or freezing anything.
+///
+/// # Errors
+/// The refusals [`track_disk`] would return before it starts tracing.
+pub fn plan_disk(disk: &Path, regions: &[RegionSpec], opts: &SnapshotOpts) -> Result<TrackedPlan> {
+    if let Some(reason) = opt_in_refusal(opts).or_else(tracepoint_refusal) {
+        return Err(refused(&reason));
+    }
+    plan_regions(disk, regions, opts)
+}
+
+fn plan_regions(disk: &Path, regions: &[RegionSpec], opts: &SnapshotOpts) -> Result<TrackedPlan> {
+    let checked = TrackedCopy::check(disk, regions, opts)?;
+    Ok(TrackedPlan {
+        quiet_regions: checked
+            .holds
+            .iter()
+            .filter(|hold| **hold == Hold::Quiet)
+            .count(),
+        frozen: checked.mountpoints,
+        freeze_max: checked.freeze_max,
+        pre_freeze_hooks: checked.hooks.of(crate::hooks::Stage::PreFreeze).len(),
+        post_thaw_hooks: checked.hooks.of(crate::hooks::Stage::PostThaw).len(),
+    })
 }
 
 fn refused(reason: &str) -> Error {
@@ -525,10 +631,23 @@ impl Drop for TrackedCopy {
     }
 }
 
+/// What [`TrackedCopy::check`] established.
+struct Checked {
+    tracefs: PathBuf,
+    whole: DevNumber,
+    disk_name: String,
+    holds: Vec<Hold>,
+    /// Filesystems to freeze, `/` last.
+    mountpoints: Vec<PathBuf>,
+    freeze_max: Duration,
+    hooks: crate::hooks::Hooks,
+    holds_dpkg: bool,
+}
+
 impl TrackedCopy {
-    /// Start tracking `regions` of `disk`, run the self test, take the
-    /// inhibitor lock and make the barrier freeze.
-    fn start(disk: &Path, specs: Vec<RegionSpec>, opts: &SnapshotOpts) -> Result<Self> {
+    /// Everything `start` checks before anything is traced or frozen; the
+    /// backup plan runs the same checks ([`plan_disk`], [`plan_partition`]).
+    fn check(disk: &Path, specs: &[RegionSpec], opts: &SnapshotOpts) -> Result<Checked> {
         use std::os::unix::fs::MetadataExt as _;
         if specs.is_empty() {
             return Err(Error::unsupported(
@@ -555,7 +674,7 @@ impl TrackedCopy {
         // How each region is held, and the filesystems to freeze.
         let mut mountpoints: Vec<PathBuf> = Vec::new();
         let mut holds = Vec::with_capacity(specs.len());
-        for spec in &specs {
+        for spec in specs {
             let hold = match (spec.mountpoints.first(), spec.fs_type.as_str()) {
                 (None, _) => Hold::Quiet,
                 (Some(_), "vfat") => Hold::Quiet,
@@ -609,6 +728,31 @@ impl TrackedCopy {
                 std::fs::metadata(mountpoint).is_ok_and(|metadata| metadata.dev() == dpkg.dev())
             })
         });
+        Ok(Checked {
+            tracefs,
+            whole,
+            disk_name,
+            holds,
+            mountpoints,
+            freeze_max,
+            hooks,
+            holds_dpkg,
+        })
+    }
+
+    /// Start tracking `regions` of `disk`, run the self test, take the
+    /// inhibitor lock and make the barrier freeze.
+    fn start(disk: &Path, specs: Vec<RegionSpec>, opts: &SnapshotOpts) -> Result<Self> {
+        let Checked {
+            tracefs,
+            whole,
+            disk_name,
+            holds,
+            mountpoints,
+            freeze_max,
+            hooks,
+            holds_dpkg,
+        } = Self::check(disk, &specs, opts)?;
 
         // The self test writes its own loop image; it must live on a tmpfs,
         // never on a filesystem that could be the source.
@@ -1271,6 +1415,45 @@ mod tests {
             copy.after_pass(&limits, MIB, 100 * MIB, second, false),
             Verdict::Final
         );
+    }
+
+    /// What the backup plan says about a tracked copy (D-136: the review
+    /// shows what will happen, before anything does).
+    #[test]
+    fn the_plan_names_the_frozen_filesystems_the_budget_and_the_hooks() {
+        let plan = TrackedPlan {
+            frozen: vec![PathBuf::from("/boot"), PathBuf::from("/")],
+            quiet_regions: 3,
+            freeze_max: Duration::from_secs(3),
+            pre_freeze_hooks: 0,
+            post_thaw_hooks: 0,
+        };
+        let notes = plan.notes().join("\n");
+        assert!(
+            notes.contains("freezes /boot, / together for at most 3 s"),
+            "{notes}"
+        );
+        assert!(
+            notes.contains("3 region(s) that cannot be frozen"),
+            "{notes}"
+        );
+        assert!(notes.contains("no hooks are installed"), "{notes}");
+        assert!(
+            notes.contains("self test runs when the backup starts"),
+            "{notes}"
+        );
+        let hooked = TrackedPlan {
+            quiet_regions: 0,
+            pre_freeze_hooks: 2,
+            post_thaw_hooks: 1,
+            ..plan
+        };
+        let notes = hooked.notes().join("\n");
+        assert!(
+            notes.contains("2 pre-freeze and 1 post-thaw hook(s)"),
+            "{notes}"
+        );
+        assert!(!notes.contains("cannot be frozen"), "{notes}");
     }
 
     /// `freeze_max` is its own budget (3 s by default, at most 30 s); the
