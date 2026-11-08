@@ -674,6 +674,9 @@ pub(crate) enum SnapshotChoice {
     Lvm,
     /// `FIFREEZE`/`FITHAW` quiesced read (Slice S8).
     Freeze,
+    /// Write-tracked live copy of a mounted ext4 filesystem, frozen briefly at
+    /// the end (spec v2.2 §E.7, Slice 18).
+    TrackedFreeze,
     /// Read an unmounted, holder-free device.
     Offline,
     /// Live, inconsistent read (Slice S8).

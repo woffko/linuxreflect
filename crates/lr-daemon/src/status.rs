@@ -20,6 +20,8 @@ pub fn error_code(error: &Error) -> (String, String) {
         Error::SnapshotOverflow => "E_SNAPSHOT_OVERFLOW",
         Error::FreezeTimeout => "E_FREEZE_TIMEOUT",
         Error::TrackingLost { .. } => "E_TRACKING_LOST",
+        Error::NoConvergence { .. } => "E_NO_CONVERGENCE",
+        Error::SourceChanged { .. } => "E_SOURCE_CHANGED",
         Error::BadSector { .. } => "E_BAD_SECTOR",
         Error::Unsupported { .. } => "E_UNSUPPORTED",
         Error::Corrupt { .. } => "E_CORRUPT",
@@ -51,9 +53,11 @@ pub fn grpc_status(error: &Error) -> Status {
         // `FailedPrecondition` is the honest code (D-089).
         Error::Unsupported { .. } => Code::FailedPrecondition,
         Error::Corrupt { .. } | Error::Aead | Error::BadSector { .. } => Code::DataLoss,
-        Error::SnapshotOverflow | Error::FreezeTimeout | Error::TrackingLost { .. } => {
-            Code::Aborted
-        }
+        Error::SnapshotOverflow
+        | Error::FreezeTimeout
+        | Error::TrackingLost { .. }
+        | Error::NoConvergence { .. }
+        | Error::SourceChanged { .. } => Code::Aborted,
         // A missing set, image or file is the caller's to fix (A9).
         Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound => Code::NotFound,
         Error::NetworkTimeout(_) | Error::Io(_) => Code::Internal,
@@ -106,6 +110,19 @@ mod tests {
                     reason: "overrun".to_owned(),
                 },
                 "E_TRACKING_LOST",
+            ),
+            (
+                Error::NoConvergence {
+                    dirty_bytes: 1,
+                    passes: 10,
+                },
+                "E_NO_CONVERGENCE",
+            ),
+            (
+                Error::SourceChanged {
+                    what: "partition table".to_owned(),
+                },
+                "E_SOURCE_CHANGED",
             ),
         ] {
             assert_eq!(error_code(&error).0, expected, "{error}");

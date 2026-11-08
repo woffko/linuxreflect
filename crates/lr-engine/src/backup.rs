@@ -303,6 +303,9 @@ pub struct BackupReport {
     pub changed_chunks: u64,
     /// Chunks inherited unchanged from an ancestor.
     pub inherited_chunks: u64,
+    /// What a tracked-freeze copy did (spec §E.7); `None` for other providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracked: Option<lr_snapshot::TrackedSummary>,
 }
 
 /// Delete the temporary image unless the job succeeded. The manifest spool
@@ -378,9 +381,14 @@ pub fn backup_block_with(
     request.context.phase("snapshot");
     let snapshot_opts = snapshot_opts(request);
     lr_snapshot::probe::confirm(provider, &layout, &snapshot_opts)?;
-    let snapshot = provider.create(&layout, &snapshot_opts)?;
+    let mut snapshot = provider.create(&layout, &snapshot_opts)?;
+    if let Some(tracked) = snapshot.tracked_mut() {
+        tracked.bind(u64::from(request.chunk_size))?;
+    }
 
-    // 2. Which blocks must be read?
+    // 2. Which blocks must be read? For a tracked copy the map is taken after
+    //    the provider's barrier freeze (spec §E.7): a block allocated later is
+    //    written later, so the tracker sees it.
     let fs_type = layout
         .fs
         .as_ref()
@@ -415,6 +423,12 @@ pub fn backup_block_with(
     let seq_in_chain = resolved_plan.seq_in_chain();
     let parent_uuid = resolved_plan.parent_uuid();
     let member_kind = resolved_plan.member_kind();
+    if snapshot.is_tracked() && parent.is_some() {
+        return Err(Error::unsupported(
+            "tracked-freeze makes full images in this release (Slice 18 phase 2); \
+             start a new chain with --type full",
+        ));
+    }
 
     // 5. Keys and superblock. A member reuses the chain key of its parent, so
     //    the whole chain shares one `dedup_key` (spec §G.4).
@@ -499,6 +513,7 @@ pub fn backup_block_with(
     let mut image_writer = ImageWriter::create(tmp.writer, &superblock, mac_key)?;
     let mut nonce_seq = NonceSeq::new();
     let mut spool_file = crate::spool::scratch_file(&spool_dir)?;
+    let mut tracked_summary = None;
     let counts = {
         let mut spool = BufWriter::new(&mut spool_file);
         let header = BlockManifestHeader {
@@ -523,7 +538,9 @@ pub fn backup_block_with(
         let counts = match parent {
             None => {
                 header.write(&mut spool, false)?;
-                let counts = write_full_entries(
+                let entries_start = spool.stream_position().map_err(Error::Io)?;
+                let pass_started = std::time::Instant::now();
+                let mut counts = write_full_entries(
                     &mut image_writer,
                     options,
                     &writer_keys,
@@ -538,6 +555,24 @@ pub fn backup_block_with(
                     &mut spool,
                 )?;
                 patch_entry_count(&mut spool, header_offset, chunk_count)?;
+                if let Some(tracked) = snapshot.tracked_mut() {
+                    reporter.phase("converge");
+                    tracked_summary = Some(converge_tracked(
+                        tracked,
+                        &mut image_writer,
+                        options,
+                        &writer_keys,
+                        &mut nonce_seq,
+                        &mut source,
+                        &mut buffer,
+                        &mut spool,
+                        entries_start,
+                        &mut counts,
+                        request,
+                        device_size,
+                        (imaged_bytes, pass_started.elapsed()),
+                    )?);
+                }
                 counts
             }
             Some(parent) => {
@@ -738,6 +773,7 @@ pub fn backup_block_with(
         parent_uuid,
         changed_chunks: counts.changed,
         inherited_chunks: counts.inherited,
+        tracked: tracked_summary,
     })
 }
 
@@ -990,29 +1026,15 @@ fn store_chunk(
             // The read may have outlived the snapshot: its bytes count only
             // if the snapshot is still healthy now (R29).
             snapshot.check_health()?;
-            if is_all_zero(bytes) {
-                return Ok(if matches!(parent, ChunkState::Zero) {
-                    SourceState::Unchanged
-                } else {
-                    SourceState::Zero
-                });
-            }
-            let hash = lr_crypto::content_hash(&writer_keys.dedup_key, bytes);
-            if let ChunkState::Stored {
-                hash: parent_hash, ..
-            } = parent
-                && *parent_hash == hash
-            {
-                return Ok(SourceState::Unchanged);
-            }
-            let reference =
-                writer.append_chunk(options, writer_keys, ImageKind::Block, nonce_seq, bytes)?;
-            Ok(SourceState::Stored(BlockEntry::stored(
+            store_bytes(
+                writer,
+                options,
+                writer_keys,
+                nonce_seq,
                 member,
-                reference.hash,
-                reference.offset,
-                reference.stored_len,
-            )?))
+                bytes,
+                parent,
+            )
         }
         Err(error @ Error::BadSector { .. }) => match on_bad_sector {
             BadSectorPolicy::Abort => Err(error),
@@ -1025,6 +1047,205 @@ fn store_chunk(
         },
         Err(error) => Err(error),
     }
+}
+
+/// Store chunk bytes that were read already, unless they equal `parent`.
+fn store_bytes(
+    writer: &mut ImageWriter<impl Write + Seek>,
+    options: ChunkOptions,
+    writer_keys: &WriterKeys,
+    nonce_seq: &mut NonceSeq,
+    member: u16,
+    bytes: &[u8],
+    parent: &ChunkState,
+) -> Result<SourceState> {
+    if is_all_zero(bytes) {
+        return Ok(if matches!(parent, ChunkState::Zero) {
+            SourceState::Unchanged
+        } else {
+            SourceState::Zero
+        });
+    }
+    let hash = lr_crypto::content_hash(&writer_keys.dedup_key, bytes);
+    if let ChunkState::Stored {
+        hash: parent_hash, ..
+    } = parent
+        && *parent_hash == hash
+    {
+        return Ok(SourceState::Unchanged);
+    }
+    let reference =
+        writer.append_chunk(options, writer_keys, ImageKind::Block, nonce_seq, bytes)?;
+    Ok(SourceState::Stored(BlockEntry::stored(
+        member,
+        reference.hash,
+        reference.offset,
+        reference.stored_len,
+    )?))
+}
+
+/// The plan for chunk `index` of a source of `device_size` bytes.
+fn chunk_plan_at(index: u64, chunk_size: u64, device_size: u64) -> lr_blocksource::ChunkPlan {
+    let offset = index * chunk_size;
+    lr_blocksource::ChunkPlan {
+        index,
+        offset,
+        len: u32::try_from(chunk_size.min(device_size.saturating_sub(offset))).unwrap_or(u32::MAX),
+    }
+}
+
+/// Replace chunk `index`'s entry in a spooled full manifest, keeping the
+/// counts right. A tracked copy stores a chunk again when it changed after
+/// it was read; the new record supersedes the old one, which stays in the
+/// file unreferenced (spec §E.7: no format change).
+fn patch_entry(
+    spool: &File,
+    entries_start: u64,
+    index: u64,
+    entry: &BlockEntry,
+    counts: &mut Counts,
+) -> Result<()> {
+    use std::os::unix::fs::FileExt as _;
+    let at = entries_start + index * lr_format::ENTRY_LEN as u64;
+    let mut old = [0u8; lr_format::ENTRY_LEN];
+    spool.read_exact_at(&mut old, at).map_err(Error::Io)?;
+    for (state, delta) in [
+        (BlockEntry::decode(&old)?.state, false),
+        (entry.state, true),
+    ] {
+        let counter = match state {
+            lr_format::STATE_STORED => &mut counts.stored,
+            lr_format::STATE_ZERO => &mut counts.zero,
+            lr_format::STATE_BAD_SECTOR => &mut counts.bad,
+            _ => continue,
+        };
+        *counter = if delta {
+            *counter + 1
+        } else {
+            counter.saturating_sub(1)
+        };
+    }
+    spool.write_all_at(&entry.encode()?, at).map_err(Error::Io)
+}
+
+/// The entry a chunk's source state becomes in a full manifest.
+fn full_entry(state: SourceState) -> BlockEntry {
+    match state {
+        SourceState::Stored(entry) | SourceState::BadSector(entry) => entry,
+        SourceState::Zero => BlockEntry::zero(),
+        SourceState::Unchanged | SourceState::Missing => BlockEntry::unused(),
+    }
+}
+
+/// Drive a tracked-freeze copy after the first pass (spec §E.7): re-read the
+/// chunks written meanwhile until the rest fits the final freeze, then read
+/// the rest under the freeze into buffers allocated beforehand, store it after
+/// the thaw, and check that tracking lost nothing.
+#[allow(clippy::too_many_arguments)]
+fn converge_tracked(
+    tracked: &mut lr_snapshot::TrackedCopy,
+    writer: &mut ImageWriter<impl Write + Seek>,
+    options: ChunkOptions,
+    writer_keys: &WriterKeys,
+    nonce_seq: &mut NonceSeq,
+    source: &mut DirectBlockSource,
+    buffer: &mut lr_unsafe::AlignedBuf,
+    spool: &mut BufWriter<&mut File>,
+    entries_start: u64,
+    counts: &mut Counts,
+    request: &BackupRequest,
+    device_size: u64,
+    first_pass: (u64, std::time::Duration),
+) -> Result<lr_snapshot::TrackedSummary> {
+    spool.flush().map_err(Error::Io)?;
+    let chunk_size = u64::from(request.chunk_size);
+    let (mut bytes, mut elapsed) = first_pass;
+    while let Some(chunks) = tracked.next_pass(bytes, elapsed)? {
+        let started = std::time::Instant::now();
+        bytes = 0;
+        for index in chunks {
+            let plan = chunk_plan_at(index, chunk_size, device_size);
+            let state = match read_chunk(source, &plan, buffer) {
+                Ok(read) => store_bytes(
+                    writer,
+                    options,
+                    writer_keys,
+                    nonce_seq,
+                    0,
+                    read,
+                    &ChunkState::Unused,
+                )?,
+                Err(error @ Error::BadSector { .. }) => match request.on_bad_sector {
+                    BadSectorPolicy::Abort => return Err(error),
+                    BadSectorPolicy::Record => {
+                        SourceState::BadSector(BlockEntry::bad_sector(plan.offset, plan.len))
+                    }
+                },
+                Err(error) => return Err(error),
+            };
+            patch_entry(
+                spool.get_ref(),
+                entries_start,
+                index,
+                &full_entry(state),
+                counts,
+            )?;
+            bytes += u64::from(plan.len);
+        }
+        elapsed = started.elapsed();
+    }
+
+    // The final read happens with the filesystems frozen: buffers are
+    // allocated now, and nothing is logged or written until the thaw.
+    let alignment = source.alignment();
+    let capacity = tracked.pending_count().saturating_mul(2).saturating_add(8);
+    let mut pool = Vec::with_capacity(capacity);
+    for _ in 0..capacity {
+        pool.push(
+            lr_unsafe::AlignedBuf::new(request.chunk_size as usize, alignment)
+                .map_err(Error::Io)?,
+        );
+    }
+    let read_back = tracked.final_read(|chunks| {
+        let mut done = Vec::with_capacity(chunks.len());
+        for (slot, &index) in chunks.iter().enumerate() {
+            if slot == pool.len() {
+                pool.push(
+                    lr_unsafe::AlignedBuf::new(request.chunk_size as usize, alignment)
+                        .map_err(Error::Io)?,
+                );
+            }
+            let plan = chunk_plan_at(index, chunk_size, device_size);
+            let read = source.read_at(plan.offset, &mut pool[slot], plan.len as usize)?;
+            if read != plan.len as usize {
+                return Err(Error::BadSector {
+                    offset: plan.offset,
+                    len: u64::from(plan.len),
+                });
+            }
+            done.push((index, slot, plan.len as usize));
+        }
+        Ok(done)
+    })?;
+    for (index, slot, len) in read_back {
+        let state = store_bytes(
+            writer,
+            options,
+            writer_keys,
+            nonce_seq,
+            0,
+            &pool[slot].as_slice()[..len],
+            &ChunkState::Unused,
+        )?;
+        patch_entry(
+            spool.get_ref(),
+            entries_start,
+            index,
+            &full_entry(state),
+            counts,
+        )?;
+    }
+    tracked.finish()
 }
 
 /// Write a full manifest: every chunk in order, holes filled with `unused`.

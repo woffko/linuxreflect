@@ -1,7 +1,13 @@
 # Live backup plan: running Debian and Ubuntu systems on ext4
 
-Status: plan, November 2026. It implements spec v2.2 §E.7 and Slice 18
-(decision D-138). Nothing here is implemented yet.
+Status, 2026-11-08: phase 0 is done (`docs/live-backup-spike.md`: the
+mechanism holds on kernels 5.15 to 6.18), phase 1 is done
+(`lr_snapshot::tracking`), and phase 2 is in progress: the provider copies a
+single mounted, non-root ext4 partition into a full image when
+`--snapshot tracked-freeze` is given. Still open in phase 2: the
+non-convergence, lost-event and SIGKILL-during-freeze root tests, and
+incremental members (refused for now). It implements spec v2.2 §E.7 and
+Slice 18 (decision D-138).
 
 ## Goal
 

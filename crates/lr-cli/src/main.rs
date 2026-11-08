@@ -450,6 +450,7 @@ fn snapshot_id(choice: cli::SnapshotChoice) -> &'static str {
         cli::SnapshotChoice::Btrfs => "btrfs",
         cli::SnapshotChoice::Lvm => "lvm",
         cli::SnapshotChoice::Freeze => "freeze",
+        cli::SnapshotChoice::TrackedFreeze => "tracked-freeze",
         cli::SnapshotChoice::Offline => "offline",
         cli::SnapshotChoice::None => "none",
     }

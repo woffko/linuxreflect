@@ -15,6 +15,7 @@ pub mod live_none;
 pub mod lvm;
 pub mod offline;
 pub mod probe;
+pub mod tracked_freeze;
 pub mod tracking;
 
 pub use btrfs::{BtrfsProvider, PathMount, TreeSnapshot, TreeSnapshotOpts};
@@ -23,6 +24,7 @@ pub use live_none::LiveNoneProvider;
 pub use lvm::LvmProvider;
 pub use offline::OfflineProvider;
 pub use probe::{Plan, decide, probe as probe_source};
+pub use tracked_freeze::{TrackedCopy, TrackedFreezeProvider, TrackedSummary};
 
 use std::path::PathBuf;
 
@@ -61,6 +63,8 @@ pub struct BlockSnapshot {
     guard: Option<Box<dyn Send + Sync>>,
     /// Provider health check, when the provider needs one.
     health: Option<std::sync::Arc<dyn SnapshotHealth>>,
+    /// The tracked-freeze copy the engine drives, for that provider only.
+    tracked: Option<TrackedCopy>,
 }
 
 impl Drop for BlockSnapshot {
@@ -83,7 +87,26 @@ impl BlockSnapshot {
             consistency,
             guard: Some(Box::new(guard)),
             health: None,
+            tracked: None,
         }
+    }
+
+    /// Attach the tracked-freeze copy the engine must drive (spec §E.7).
+    #[must_use]
+    pub fn with_tracked(mut self, tracked: TrackedCopy) -> Self {
+        self.tracked = Some(tracked);
+        self
+    }
+
+    /// The tracked-freeze copy, when this snapshot is one: its passes and its
+    /// final read are the engine's to run before the image is accepted.
+    pub fn tracked_mut(&mut self) -> Option<&mut TrackedCopy> {
+        self.tracked.as_mut()
+    }
+
+    /// Whether this snapshot is a tracked-freeze copy.
+    pub fn is_tracked(&self) -> bool {
+        self.tracked.is_some()
     }
 
     /// Attach a provider health check.
