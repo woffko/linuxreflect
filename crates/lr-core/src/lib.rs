@@ -21,8 +21,8 @@ pub use caps::{Capabilities, Capability};
 pub use catalog::{Catalog, ChainRecord, MemberKind, MemberRecord};
 pub use consistency::Consistency;
 pub use discovery::{
-    BlockDeviceType, DeviceFacts, FsFacts, LvmFacts, PartitionLayout, PartitionTableInfo,
-    PartitionTableKind, SourceLayout, discover_source,
+    BlockDeviceType, DeviceFacts, DeviceIdentity, FsFacts, LvmFacts, PartitionLayout,
+    PartitionTableInfo, PartitionTableKind, SourceLayout, discover_source,
 };
 pub use error::{Error, Result};
 pub use geometry::Geometry;
@@ -101,10 +101,14 @@ pub struct SnapshotOpts {
 pub struct TrackedTuning {
     /// Most bytes the final freeze may read (`final_max`, default 256 MiB).
     pub final_max_bytes: Option<u64>,
-    /// Passes before the copy gives up (`max_passes`, default 10).
+    /// Passes that do not shrink the dirty set (or only wait for a package
+    /// transaction) before the copy gives up (`max_passes`, default 10).
     pub max_passes: Option<u32>,
     /// Per-CPU ring buffer of the trace instance in KiB (default 16384).
     pub buffer_kb: Option<u32>,
+    /// Longest final freeze in seconds (`freeze_max`, default 3, at most
+    /// 30). The freeze provider's `freeze_timeout_secs` does not apply.
+    pub freeze_max_secs: Option<u64>,
 }
 
 /// Result of a provider support query.

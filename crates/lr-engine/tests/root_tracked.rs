@@ -540,7 +540,7 @@ fn a_source_that_keeps_changing_fails_without_publishing() {
     tight.tracked_tuning = lr_core::TrackedTuning {
         final_max_bytes: Some(u64::from(CHUNK_SIZE)),
         max_passes: Some(1),
-        buffer_kb: None,
+        ..lr_core::TrackedTuning::default()
     };
     let outcome = backup_image(&tight);
     drop(writer.stop());
@@ -569,8 +569,11 @@ fn tracked_freeze_child_helper() {
     let layout = lr_core::discover_source(Path::new(&device)).expect("discover");
     let options = lr_core::SnapshotOpts {
         provider: Some("tracked-freeze".to_owned()),
-        freeze_timeout_secs: Some(1),
         deadman_grace_secs: Some(2),
+        tracked: lr_core::TrackedTuning {
+            freeze_max_secs: Some(1),
+            ..lr_core::TrackedTuning::default()
+        },
         destination: Some(destination),
         ..lr_core::SnapshotOpts::default()
     };

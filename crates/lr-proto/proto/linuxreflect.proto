@@ -114,6 +114,9 @@ message BackupSpec {
   uint64 deadman_grace_secs = 26;
   // Break a set lock whose lease has expired.
   bool break_stale_lock = 27;
+  // Tracked-freeze provider: longest final freeze in seconds (1..=30);
+  // 0 = default (3).
+  uint64 freeze_max_secs = 28;
 }
 
 message MemberInfo {

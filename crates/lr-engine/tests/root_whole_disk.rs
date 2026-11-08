@@ -888,6 +888,153 @@ fn a_4kn_disk_round_trips_and_needs_a_4kn_target() {
     );
 }
 
+/// `blkid -p` value of `tag` on `device`.
+fn blkid_value(device: &Path, tag: &str) -> String {
+    output(
+        "blkid",
+        &[
+            "-p",
+            "-s",
+            tag,
+            "-o",
+            "value",
+            &device.display().to_string(),
+        ],
+    )
+    .trim()
+    .to_owned()
+}
+
+/// Spec v2.2 §E.7 Restore, risk 13 of the live backup plan: a copy restored
+/// to a second disk of the same machine carries the source's partition and
+/// filesystem UUIDs, so the plan names the source disk while it is attached,
+/// and says nothing once only the copy carries them (the target itself is
+/// never counted: what it holds is overwritten).
+#[test]
+#[ignore = "requires root and loop devices"]
+fn a_copy_next_to_its_source_names_the_disk_that_shares_its_uuids() {
+    if !root_tests_enabled() {
+        return;
+    }
+    for tool in ["sgdisk", "mkfs.ext4", "mkfs.vfat", "blkid", "partx"] {
+        if !have(tool) {
+            lr_testkit::unavailable!("{tool} missing");
+        }
+    }
+    let work = tempfile::tempdir().expect("workdir");
+    let Some(source) = LoopDisk::attach(work.path(), "uuid-src.img", SRC_SIZE) else {
+        return;
+    };
+    let label = source.label();
+    if !run(
+        "sgdisk",
+        &[
+            "--clear",
+            "-n",
+            "1:0:+64M",
+            "-t",
+            "1:ef00",
+            "-n",
+            "2:0:+128M",
+            "-t",
+            "2:8300",
+            &label,
+        ],
+    ) {
+        lr_testkit::fixture_failed!("sgdisk failed on the source disk");
+    }
+    wait_for_partitions(&source, 2);
+    if !run("mkfs.vfat", &[&source.partition(1).display().to_string()])
+        || !run(
+            "mkfs.ext4",
+            &["-F", "-q", &source.partition(2).display().to_string()],
+        )
+    {
+        lr_testkit::fixture_failed!("mkfs failed on the source partitions");
+    }
+    let esp_partuuid = blkid_value(&source.partition(1), "PART_ENTRY_UUID");
+    let root_uuid = blkid_value(&source.partition(2), "UUID");
+    assert!(
+        !esp_partuuid.is_empty() && !root_uuid.is_empty(),
+        "fixture identities: {esp_partuuid:?} {root_uuid:?}"
+    );
+
+    let outcome = work.path().join("uuid-out");
+    let mut request =
+        BackupRequest::new(&source.device, &outcome, "uuid-set", Encryption::NoEncrypt)
+            .expect("request");
+    request.chunk_size = CHUNK_SIZE;
+    request.compression = Compression::None;
+    let report = backup_image(&request).expect("whole-disk backup");
+    let image = whole_disk_report(&report).image_path.clone();
+
+    let Some(target) = LoopDisk::attach(work.path(), "uuid-dst.img", DST_SIZE) else {
+        return;
+    };
+    let shared = |warnings: &[String]| {
+        warnings
+            .iter()
+            .find(|warning| warning.contains("shares them"))
+            .cloned()
+    };
+
+    // The source is still attached: the plan names its partitions.
+    let plan = prepare_restore(&PrepareRequest::from_path(
+        &image,
+        &target.device,
+        Encryption::NoEncrypt,
+    ))
+    .expect("prepare next to the source");
+    let warning = shared(&plan.warnings).unwrap_or_else(|| {
+        panic!(
+            "no shared-identity warning with the source attached: {:?}",
+            plan.warnings
+        )
+    });
+    let esp = source.partition(1).display().to_string();
+    let root = source.partition(2).display().to_string();
+    assert!(
+        warning.contains(&format!("{esp} has partition UUID"))
+            && warning
+                .to_ascii_lowercase()
+                .contains(&esp_partuuid.to_ascii_lowercase()),
+        "{warning}"
+    );
+    assert!(
+        warning.contains(&format!("{root} has partition UUID"))
+            && warning.contains(&format!("filesystem UUID {root_uuid}")),
+        "{warning}"
+    );
+    assert!(
+        warning.contains("detach it or choose the copy in the firmware's boot menu"),
+        "{warning}"
+    );
+    apply_restore(&ApplyRequest {
+        token: plan.token,
+        confirm: true,
+        accept_inconsistent: false,
+        encryption: Encryption::NoEncrypt,
+        context: lr_engine::progress::EngineContext::silent(),
+    })
+    .expect("apply");
+    wait_for_partitions(&target, 2);
+    assert_eq!(
+        blkid_value(&target.partition(2), "UUID"),
+        root_uuid,
+        "the copy carries the source's filesystem UUID"
+    );
+
+    // Only the copy carries them now; it is the target, so it does not count.
+    drop(source);
+    let plan = prepare_restore(&PrepareRequest::from_path(
+        &image,
+        &target.device,
+        Encryption::NoEncrypt,
+    ))
+    .expect("prepare with the source detached");
+    assert_eq!(shared(&plan.warnings), None, "{:?}", plan.warnings);
+}
+
 #[test]
 #[ignore = "needs no root, but checks the fixture helpers"]
 fn helpers_are_consistent() {

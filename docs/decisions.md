@@ -2021,3 +2021,26 @@ controls, is `docs/live-backup-plan.md`.
 Slice 18 supersedes D-136's "whole-disk reads remain offline-only" for disks
 whose filesystem partitions are all covered by tracked-freeze; every other
 whole-disk source stays offline-only.
+
+## D-139 — How the restore plan finds a disk that shares the copy's UUIDs
+
+Spec §E.7 (Restore) requires the plan to say when a copy restored next to its
+source carries the source's partition and filesystem UUIDs, but not how the
+source is recognised. `restore prepare` of a whole-disk image compares the
+`partuuid` and `fs_uuid` of every region in the image's disk header with what
+one read-only `blkid -p` run reports for every attached block device,
+case-insensitively. The target and its partitions are left out, because what
+they hold is overwritten. Any match becomes one warning that names each device
+and identity, and says to detach that disk or choose the copy in the firmware
+before booting the copy. When the probe cannot run or does not finish within
+15 s (a failing disk can hold `blkid` in an uninterruptible read), the plan
+says that the copy carries the source's UUIDs and that attached disks could
+not be checked, so it is never silent. Block, stream and file images are not
+checked: their headers record no filesystem UUID.
+
+`--freeze-max` takes whole seconds, like `--freeze-timeout`; the spec's
+synopsis writes `3s`. It is separate from `--freeze-timeout`, whose 300 s
+default belongs to the plain freeze provider.
+
+Revisit when the "new identity" restore (`docs/live-backup-plan.md`, later
+work) lands: it would make the warning an offer.

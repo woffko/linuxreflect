@@ -154,6 +154,78 @@ pub fn check_kinds(
     Ok(vec![summary])
 }
 
+/// Name every disk still attached to this machine that shares an identity
+/// with the copy (spec v2.2 §E.7 Restore). A whole-disk image restores the
+/// source's partition and filesystem UUIDs; with both disks present, the next
+/// boot may mount partitions from either. The target and its partitions are
+/// left out: what they hold now is overwritten.
+///
+/// When the attached disks cannot be probed, the warning says that instead,
+/// so the plan never stays silent about the copy's identities.
+#[must_use]
+pub fn duplicate_identity_warnings(
+    target: &Path,
+    disk: &lr_format::disk::DiskHeader,
+) -> Vec<String> {
+    if !disk
+        .regions
+        .iter()
+        .any(|region| !region.partuuid.is_empty() || !region.fs_uuid.is_empty())
+    {
+        return Vec::new();
+    }
+    let skip = lr_core::sysfs::device_name(target).ok();
+    match lr_core::discovery::attached_identities(skip.as_deref()) {
+        Ok(attached) => duplicate_identities(&disk.regions, &attached),
+        Err(reason) => vec![format!(
+            "the copy carries the source disk's partition and filesystem UUIDs, and the disks \
+             attached to this machine could not be checked for them ({reason}); if the source \
+             disk stays attached, detach it or choose the copy in the firmware's boot menu \
+             before booting the copy"
+        )],
+    }
+}
+
+/// The plan warning for the attached devices that carry one of `regions`'
+/// partition or filesystem UUIDs, or nothing when none does.
+fn duplicate_identities(
+    regions: &[lr_format::disk::RegionRecord],
+    attached: &[lr_core::DeviceIdentity],
+) -> Vec<String> {
+    let same = |have: Option<&String>, want: &str| {
+        !want.is_empty() && have.is_some_and(|have| have.eq_ignore_ascii_case(want))
+    };
+    let mut shared = Vec::new();
+    for device in attached {
+        let mut found = Vec::new();
+        for region in regions {
+            if same(device.part_uuid.as_ref(), &region.partuuid) {
+                found.push(format!("partition UUID {}", region.partuuid));
+            }
+            if same(device.fs_uuid.as_ref(), &region.fs_uuid) {
+                found.push(format!("filesystem UUID {}", region.fs_uuid));
+            }
+        }
+        if !found.is_empty() {
+            shared.push(format!(
+                "{} has {}",
+                device.device.display(),
+                found.join(" and ")
+            ));
+        }
+    }
+    if shared.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "the copy carries the source disk's identities, and a disk still attached to this \
+         machine shares them: {}. Before the copy boots with that disk present, detach it or \
+         choose the copy in the firmware's boot menu; with both attached, the next boot may \
+         mount partitions from either disk",
+        shared.join("; ")
+    )]
+}
+
 /// Refuse a device that is in use anywhere, including in another mount
 /// namespace (A1).
 ///
@@ -220,7 +292,7 @@ fn split_dev(dev: u64) -> (u32, u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_dev_id, preflight_target, split_dev};
+    use super::{duplicate_identities, parse_dev_id, preflight_target, split_dev};
 
     #[test]
     fn device_ids_are_parsed_and_encoded_consistently() {
@@ -239,5 +311,69 @@ mod tests {
     #[test]
     fn a_missing_target_is_an_error() {
         assert!(preflight_target(std::path::Path::new("/nonexistent/lr-target")).is_err());
+    }
+
+    /// Risk 13 of the live backup plan: a copy restored next to its source
+    /// shares the source's identities, and the plan says which disk has them
+    /// and what to do before booting.
+    #[test]
+    fn the_plan_names_an_attached_disk_that_shares_the_copys_identities() {
+        use lr_format::disk::{RegionKind, RegionRecord};
+        let mut esp = RegionRecord::new(RegionKind::PartitionFs, 1, 2048, 512 << 20);
+        esp.partuuid = "2F6D523C-6A82-44D4-94E1-73ACD38A0F78".to_owned();
+        esp.fs_uuid = "FD42-714C".to_owned();
+        let mut root = RegionRecord::new(RegionKind::PartitionFs, 2, 1_050_624, 8 << 30);
+        root.partuuid = "76c934af-88c3-4e19-9f65-5da46cb4b0de".to_owned();
+        root.fs_uuid = "28c4d6f3-d623-43f2-9764-26720f256f87".to_owned();
+        let leading = RegionRecord::new(RegionKind::Leading, 0, 0, 1 << 20);
+        let regions = [leading, esp, root];
+        let identity =
+            |device: &str, fs: Option<&str>, part: Option<&str>| lr_core::DeviceIdentity {
+                device: device.into(),
+                fs_uuid: fs.map(str::to_owned),
+                part_uuid: part.map(str::to_owned),
+            };
+
+        // Another machine, or the source detached: nothing to say.
+        let other = [identity(
+            "/dev/sdb1",
+            Some("0b9e3c11-1111-4222-8333-944455556666"),
+            None,
+        )];
+        assert!(duplicate_identities(&regions, &other).is_empty());
+
+        // The source still attached: blkid prints lowercase GUIDs.
+        let source = [
+            identity("/dev/sda", None, None),
+            identity(
+                "/dev/sda1",
+                Some("FD42-714C"),
+                Some("2f6d523c-6a82-44d4-94e1-73acd38a0f78"),
+            ),
+            identity(
+                "/dev/sda2",
+                Some("28c4d6f3-d623-43f2-9764-26720f256f87"),
+                Some("76c934af-88c3-4e19-9f65-5da46cb4b0de"),
+            ),
+        ];
+        let warnings = duplicate_identities(&regions, &source);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let text = &warnings[0];
+        assert!(
+            text.contains(
+                "/dev/sda1 has partition UUID 2F6D523C-6A82-44D4-94E1-73ACD38A0F78 and \
+                 filesystem UUID FD42-714C"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("/dev/sda2 has partition UUID 76c934af-88c3-4e19-9f65-5da46cb4b0de"),
+            "{text}"
+        );
+        assert!(!text.contains("/dev/sda has"), "{text}");
+        assert!(
+            text.contains("detach it or choose the copy in the firmware's boot menu"),
+            "{text}"
+        );
     }
 }

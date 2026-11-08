@@ -10,9 +10,16 @@ submission and on completion, dpkg's lock postpones the final freeze and a
 logind inhibitor blocks sleep, and the VM acceptance passed on Debian 12,
 Debian 13, Ubuntu 22.04 and Ubuntu 24.04, UEFI with Secure Boot and BIOS
 (`docs/live-backup-acceptance.md`: each running system imaged live, restored
-onto another disk, and booted from it alone). Still open: incremental
-members, phase 4 (daemon, GUI, operator guide) and phase 5. It implements spec v2.2 §E.7 and
-Slice 18 (decision D-138).
+onto another disk, and booted from it alone). Phase 4 has begun: the
+restore plan names an attached disk that shares the copy's UUIDs (CLI and
+GUI), the operator guide describes tracked-freeze, and `--freeze-max` is its
+own option (it had been taken from the freeze provider's `--freeze-timeout`,
+whose 300 s default stretched the final-freeze budget to the 30 s cap); only
+passes that do not shrink the dirty set count against `max_passes`, as §E.7
+says. Still open: incremental members, hooks, the daemon's start-up sweep of
+leftover trace instances, the rest of phase 4 (`PlanBackup`, the wizard, the
+GUI acceptance) and phase 5. It implements spec v2.2 §E.7 and Slice 18
+(decision D-138).
 
 ## Goal
 

@@ -836,7 +836,7 @@ fn verify_whole_disk(
     let superblock: Superblock = reader.superblock().clone();
     // The restore plan's checks: counts, kinds, bounds, geometry and complete
     // consumption (R24), and recorded bad sectors (R26).
-    let summary = crate::plan::whole_disk(&mut reader, &keys.meta_key, &superblock)?;
+    let (summary, _disk) = crate::plan::whole_disk(&mut reader, &keys.meta_key, &superblock)?;
     if let Some(recorder) = progress.recorder() {
         recorder.complete_recovery_point(member_index);
         recorder.begin_disk_region_payloads(member_index);

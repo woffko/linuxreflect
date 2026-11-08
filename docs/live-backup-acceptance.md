@@ -64,5 +64,7 @@ destination is checked now (`lr_snapshot::tracked_freeze`).
 - A desktop session: the cloud images have none (the GNOME check of a
   one-second root freeze is in `docs/live-backup-spike.md`).
 - Restoring onto a disk of another size, or onto the same machine with the
-  source disk still attached (the copy carries the source's UUIDs).
+  source disk still attached. The copy carries the source's UUIDs; the
+  restore plan names the attached disk that shares them (root test
+  `a_copy_next_to_its_source_names_the_disk_that_shares_its_uuids`).
 - Encrypted images and remote destinations were not part of these runs.

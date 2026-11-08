@@ -954,11 +954,9 @@ pub(crate) fn restore_whole_disk<R: std::io::Read + std::io::Seek>(
         return Err(Error::NoSpace);
     }
     // The same plan check as `prepare`, before the first write (R24, R26).
-    crate::plan::refuse_bad_sectors(&crate::plan::whole_disk(
-        reader,
-        &keys.meta_key,
-        superblock,
-    )?)?;
+    crate::plan::refuse_bad_sectors(
+        &crate::plan::whole_disk(reader, &keys.meta_key, superblock)?.0,
+    )?;
     let mut buffer = target.buffer(chunk_size as usize)?;
     let mut zeros = target.buffer(chunk_size as usize)?;
     zeros.clear();

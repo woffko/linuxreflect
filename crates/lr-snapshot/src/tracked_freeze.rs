@@ -36,7 +36,8 @@ pub const DEFAULT_FREEZE_MAX: Duration = Duration::from_secs(3);
 pub const HARD_FREEZE_MAX: Duration = Duration::from_secs(30);
 /// Default limit on the bytes read under the final freeze (`final_max`).
 pub const DEFAULT_FINAL_MAX_BYTES: u64 = 256 << 20;
-/// Default number of passes before the copy gives up (`max_passes`).
+/// Default number of passes that do not shrink the dirty set, or only wait
+/// for a package transaction, before the copy gives up (`max_passes`).
 pub const DEFAULT_MAX_PASSES: u32 = 10;
 /// Default per-CPU ring buffer of the trace instance.
 pub const DEFAULT_BUFFER_KB: u32 = 16 << 10;
@@ -391,6 +392,65 @@ struct Limits {
     grace: Duration,
 }
 
+/// What the copy does after a pass (spec §E.7 steps 5 and 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// The rest fits the final freeze.
+    Final,
+    /// Read the dirty chunks again.
+    Again,
+    /// The rest fits, but a package transaction runs: wait, then read again.
+    WaitForPackages,
+    /// `max_passes` passes did not converge: `E_NO_CONVERGENCE`.
+    GiveUp,
+}
+
+/// The convergence rule, kept apart from the tracer.
+#[derive(Debug, Clone, Copy, Default)]
+struct Convergence {
+    /// Dirty bytes the previous pass left, to tell a shrinking pass.
+    last_dirty_bytes: Option<u64>,
+    /// Passes counted against `max_passes`.
+    stalled_passes: u32,
+}
+
+impl Convergence {
+    /// Decide after a pass that read `read_bytes` in `elapsed` and left
+    /// `dirty_bytes` behind. The rest fits when it is at most `final_max`
+    /// and, at the rate this pass reached, can be read in half of
+    /// `freeze_max` (the other half is room for the freeze itself and new
+    /// writes). Only a pass that did not shrink the dirty set, or one that
+    /// only waits for a package transaction, counts against `max_passes`: a
+    /// copy that keeps converging is not given up.
+    fn after_pass(
+        &mut self,
+        limits: &Limits,
+        dirty_bytes: u64,
+        read_bytes: u64,
+        elapsed: Duration,
+        packages: bool,
+    ) -> Verdict {
+        let rate = read_bytes as f64 / elapsed.as_secs_f64().max(1e-3);
+        let estimate = Duration::from_secs_f64(dirty_bytes as f64 / rate.max(1.0));
+        let fits = dirty_bytes <= limits.final_max_bytes && estimate <= limits.freeze_max / 2;
+        if fits && !packages {
+            return Verdict::Final;
+        }
+        let shrank = self.last_dirty_bytes.is_none_or(|last| dirty_bytes < last);
+        self.last_dirty_bytes = Some(dirty_bytes);
+        if !shrank || fits {
+            self.stalled_passes += 1;
+        }
+        if self.stalled_passes >= limits.max_passes {
+            Verdict::GiveUp
+        } else if fits {
+            Verdict::WaitForPackages
+        } else {
+            Verdict::Again
+        }
+    }
+}
+
 /// What a tracked copy did, for the backup report.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TrackedSummary {
@@ -439,6 +499,7 @@ pub struct TrackedCopy {
     engine_chunk_bytes: u64,
     log: FreezeLog,
     summary: TrackedSummary,
+    convergence: Convergence,
     inhibitor: Option<Child>,
 }
 
@@ -532,6 +593,7 @@ impl TrackedCopy {
         if let Some(reason) = job_writes_refusal(&mountpoints, opts) {
             return Err(refused(&reason));
         }
+        let freeze_max = freeze_max(opts)?;
         let holds_dpkg = std::fs::metadata(DPKG_DIR).is_ok_and(|dpkg| {
             mountpoints.iter().any(|mountpoint| {
                 std::fs::metadata(mountpoint).is_ok_and(|metadata| metadata.dev() == dpkg.dev())
@@ -587,10 +649,6 @@ impl TrackedCopy {
             opts.deadman_grace_secs
                 .unwrap_or(crate::freeze::DEFAULT_GRACE_SECS),
         );
-        let freeze_max = opts
-            .freeze_timeout_secs
-            .map_or(DEFAULT_FREEZE_MAX, Duration::from_secs)
-            .min(HARD_FREEZE_MAX);
         let mut copy = Self {
             tracker,
             pending,
@@ -612,6 +670,7 @@ impl TrackedCopy {
             engine_chunk_bytes: 0,
             log: FreezeLog::default(),
             summary: TrackedSummary::default(),
+            convergence: Convergence::default(),
             inhibitor: None,
         };
         copy.summary.frozen_filesystems = u32::try_from(copy.mountpoints.len()).unwrap_or(u32::MAX);
@@ -719,25 +778,23 @@ impl TrackedCopy {
         let chunks = self.pending_engine_chunks();
         let count: u64 = chunks.iter().map(|r| r.chunks.len() as u64).sum();
         let dirty_bytes = count * self.engine_chunk_bytes;
-        // Read time for the rest at the rate the last pass reached; half the
-        // freeze budget leaves room for the freeze itself and new writes.
-        let rate = bytes as f64 / elapsed.as_secs_f64().max(1e-3);
-        let estimate = Duration::from_secs_f64(dirty_bytes as f64 / rate.max(1.0));
-        let fits =
-            dirty_bytes <= self.limits.final_max_bytes && estimate <= self.limits.freeze_max / 2;
-        let waiting_for_packages = fits && self.package_transaction_running();
-        if fits && !waiting_for_packages {
-            return Ok(None);
-        }
-        if self.summary.passes >= self.limits.max_passes {
-            return Err(Error::NoConvergence {
-                dirty_bytes,
-                passes: self.summary.passes,
-            });
-        }
-        if waiting_for_packages {
-            self.summary.package_waits += 1;
-            std::thread::sleep(PACKAGE_WAIT);
+        let packages = self.package_transaction_running();
+        match self
+            .convergence
+            .after_pass(&self.limits, dirty_bytes, bytes, elapsed, packages)
+        {
+            Verdict::Final => return Ok(None),
+            Verdict::GiveUp => {
+                return Err(Error::NoConvergence {
+                    dirty_bytes,
+                    passes: self.summary.passes,
+                });
+            }
+            Verdict::WaitForPackages => {
+                self.summary.package_waits += 1;
+                std::thread::sleep(PACKAGE_WAIT);
+            }
+            Verdict::Again => {}
         }
         self.summary.recopied_chunks += count;
         Ok(Some(chunks))
@@ -927,6 +984,26 @@ impl TrackedCopy {
     }
 }
 
+/// The final-freeze budget a request asks for: `freeze_max` defaults to 3 s
+/// and may not exceed the 30 s hard cap (spec §E.7). An out-of-range value is
+/// refused before tracing starts, never shortened.
+///
+/// # Errors
+/// Returns [`Error::Unsupported`] for zero or more than 30 seconds.
+fn freeze_max(opts: &SnapshotOpts) -> Result<Duration> {
+    let Some(seconds) = opts.tracked.freeze_max_secs else {
+        return Ok(DEFAULT_FREEZE_MAX);
+    };
+    let wanted = Duration::from_secs(seconds);
+    if wanted.is_zero() || wanted > HARD_FREEZE_MAX {
+        return Err(Error::unsupported(format!(
+            "the final freeze may last 1 to {} seconds (--freeze-max), not {seconds}",
+            HARD_FREEZE_MAX.as_secs()
+        )));
+    }
+    Ok(wanted)
+}
+
 /// Hold a logind inhibitor lock (`sleep:shutdown`, block) for the copy, so
 /// the machine is not suspended or shut down in the middle of a freeze. No
 /// logind or no `systemd-inhibit`: nothing to hold.
@@ -1074,5 +1151,103 @@ mod tests {
             }
         );
         assert!(parse_dev("259").is_err());
+    }
+
+    /// The convergence budget (spec §E.7 step 5): the rest must fit both
+    /// `final_max` and half of `freeze_max` at the measured rate, and only
+    /// passes that do not shrink the dirty set, or wait for a package
+    /// transaction, count against `max_passes`.
+    #[test]
+    fn the_convergence_budget_counts_only_passes_that_do_not_converge() {
+        const MIB: u64 = 1 << 20;
+        let limits = Limits {
+            freeze_max: Duration::from_secs(2),
+            final_max_bytes: 64 * MIB,
+            max_passes: 2,
+            grace: Duration::from_secs(1),
+        };
+        let second = Duration::from_secs(1);
+        // 100 MiB/s: 64 MiB needs 0.64 s, inside half of 2 s.
+        let mut copy = Convergence::default();
+        assert_eq!(
+            copy.after_pass(&limits, 64 * MIB, 100 * MIB, second, false),
+            Verdict::Final
+        );
+        // Over final_max, or too slow for half the freeze budget.
+        let mut copy = Convergence::default();
+        assert_eq!(
+            copy.after_pass(&limits, 65 * MIB, 1000 * MIB, second, false),
+            Verdict::Again
+        );
+        let mut copy = Convergence::default();
+        assert_eq!(
+            copy.after_pass(&limits, 32 * MIB, 20 * MIB, second, false),
+            Verdict::Again
+        );
+
+        // Shrinking passes never give up, however many there are.
+        let mut copy = Convergence::default();
+        for dirty in (100..=1000).rev().step_by(100) {
+            assert_eq!(
+                copy.after_pass(&limits, dirty * MIB, 10 * MIB, second, false),
+                Verdict::Again
+            );
+        }
+        // Two passes that do not shrink it do.
+        assert_eq!(
+            copy.after_pass(&limits, 100 * MIB, 10 * MIB, second, false),
+            Verdict::Again
+        );
+        assert_eq!(
+            copy.after_pass(&limits, 120 * MIB, 10 * MIB, second, false),
+            Verdict::GiveUp
+        );
+
+        // A package transaction postpones a final read that would fit, and
+        // those waits count.
+        let mut copy = Convergence::default();
+        assert_eq!(
+            copy.after_pass(&limits, MIB, 100 * MIB, second, true),
+            Verdict::WaitForPackages
+        );
+        assert_eq!(
+            copy.after_pass(&limits, MIB / 2, 100 * MIB, second, true),
+            Verdict::GiveUp
+        );
+        let mut copy = Convergence::default();
+        assert_eq!(
+            copy.after_pass(&limits, MIB, 100 * MIB, second, true),
+            Verdict::WaitForPackages
+        );
+        assert_eq!(
+            copy.after_pass(&limits, MIB, 100 * MIB, second, false),
+            Verdict::Final
+        );
+    }
+
+    /// `freeze_max` is its own budget (3 s by default, at most 30 s); the
+    /// freeze provider's 300 s whole-read timeout never stretches it.
+    #[test]
+    fn the_final_freeze_budget_defaults_to_three_seconds_and_is_capped() {
+        let with = |seconds: Option<u64>| SnapshotOpts {
+            freeze_timeout_secs: Some(300),
+            tracked: lr_core::TrackedTuning {
+                freeze_max_secs: seconds,
+                ..lr_core::TrackedTuning::default()
+            },
+            ..SnapshotOpts::default()
+        };
+        assert_eq!(
+            freeze_max(&with(None)).expect("default"),
+            DEFAULT_FREEZE_MAX
+        );
+        assert_eq!(
+            freeze_max(&with(Some(30))).expect("the cap"),
+            Duration::from_secs(30)
+        );
+        for refused in [0, 31, 300] {
+            let error = freeze_max(&with(Some(refused))).expect_err("out of range");
+            assert!(error.to_string().contains("1 to 30 seconds"), "{error}");
+        }
     }
 }
