@@ -22,8 +22,14 @@ tracked job sweep leftover trace instances of dead processes; and the
 convergence budget uses the reads' own rate; `PlanBackup` predicts a live
 whole-disk copy (provider, `Frozen`, the filesystems frozen, the budget),
 and the wizard offers tracked-freeze with its longest pause. Still open:
-incremental members, the GUI acceptance in a VM (phase 4) and phase 5. It implements spec v2.2 §E.7 and Slice 18
-(decision D-138).
+incremental members, the GUI acceptance in a VM (phase 4), the
+`--allow-inconsistent` exception for a busy ESP, and phase 5. That
+exception (§E.7 quiet-window rule) is not implemented: a write to a region
+that cannot be frozen during its final read always fails the job, the
+stricter outcome. Reporting that partition alone as `None` would change its
+consistency after the image superblock and the disk header have recorded
+it, which the image format cannot do yet. The plan implements spec v2.2 §E.7
+and Slice 18 (decision D-138).
 
 ## Goal
 
