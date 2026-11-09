@@ -7,8 +7,19 @@ LinuxReflect is a Rust implementation of the technical specification at
 do not redesign it. Where the specification is silent, record the decision in
 `docs/decisions.md` and keep it minimal. Only the maintainer amends it: v2.2
 (November 2026, D-138; the file keeps its v2.1 name) adds live ext4 images
-through the tracked-freeze provider (§E.7, Slice 18). Slice 18 is planned in
-`docs/live-backup-plan.md` and not implemented yet.
+through the tracked-freeze provider (§E.7, Slice 18), planned in
+`docs/live-backup-plan.md`. Phase 0 (`docs/live-backup-spike.md`) and phase 1
+(`lr_snapshot::tracking`) are done; phases 2 and 3 copy a running system's whole
+disk (root, `/boot`, ESP) live into a full image with `--snapshot
+tracked-freeze` (root tests `lr-engine/tests/root_tracked.rs`; VM acceptance
+`tools/vm/live_restore_matrix.py`, results in `docs/live-backup-acceptance.md`:
+six distribution and firmware runs imaged live, restored and booted, re-run
+on `1986503` with the 3 s `--freeze-max` default). Phase 4 added the restore
+plan's shared-UUID warning (D-139), `--freeze-max`, the pre-freeze/post-thaw
+hooks (D-140), a sweep of dead jobs' trace instances, a read-only convergence
+rate, a root test of a live job through the daemon, a truthful `PlanBackup`
+for a live whole disk and the wizard's tracked-freeze option. Incremental
+members and the GUI acceptance in a VM are not done yet.
 
 The MVP is slices S1–S11 (spec §K). Slices are landed one pull request each.
 Current state: S1 (workspace, `lr-core`, `lr-unsafe`, capability probe,

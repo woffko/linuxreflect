@@ -86,6 +86,28 @@ pub struct DirectBlockSource {
     size_bytes: u64,
     logical_block_size: u32,
     alignment: usize,
+    reads: ReadStats,
+}
+
+/// What a source has read so far: bytes and the time spent in the reads
+/// themselves, without whatever the caller did with the data.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadStats {
+    /// Bytes returned by reads.
+    pub bytes: u64,
+    /// Time spent reading them.
+    pub time: std::time::Duration,
+}
+
+impl ReadStats {
+    /// What was read between `earlier` and `self`.
+    #[must_use]
+    pub fn since(self, earlier: Self) -> Self {
+        Self {
+            bytes: self.bytes.saturating_sub(earlier.bytes),
+            time: self.time.saturating_sub(earlier.time),
+        }
+    }
 }
 
 enum Handle {
@@ -119,7 +141,15 @@ impl DirectBlockSource {
             size_bytes: device_size(path)?,
             logical_block_size: lr_unsafe::block_device_logical_sector_size(path).unwrap_or(512),
             alignment: alignment_for(path),
+            reads: ReadStats::default(),
         })
+    }
+
+    /// Bytes read so far and the time the reads took (tracked-freeze measures
+    /// its read rate with this, spec §E.7 step 5).
+    #[must_use]
+    pub const fn read_stats(&self) -> ReadStats {
+        self.reads
     }
 
     /// Alignment required for buffers used with this source.
@@ -153,6 +183,18 @@ impl crate::BlockSource for DirectBlockSource {
     }
 
     fn read_at(&mut self, offset: u64, buf: &mut AlignedBuf, len: usize) -> Result<usize> {
+        let started = std::time::Instant::now();
+        let read = self.read_unmeasured(offset, buf, len);
+        if let Ok(bytes) = read {
+            self.reads.bytes += bytes as u64;
+            self.reads.time += started.elapsed();
+        }
+        read
+    }
+}
+
+impl DirectBlockSource {
+    fn read_unmeasured(&mut self, offset: u64, buf: &mut AlignedBuf, len: usize) -> Result<usize> {
         if offset >= self.size_bytes {
             return Ok(0);
         }
@@ -367,6 +409,27 @@ impl DirectBlockTarget {
 mod tests {
     use super::{DirectBlockSource, DirectBlockTarget, IoMode};
     use crate::BlockSource;
+
+    /// Tracked-freeze's convergence budget uses the reads' own rate.
+    #[test]
+    fn a_source_counts_what_it_read_and_for_how_long() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = scratch(dir.path(), "src.img", 3 * 4096 + 100);
+        let mut source = DirectBlockSource::open_buffered(&path).expect("open");
+        let mut buf = source.buffer(4096).expect("buffer");
+        assert_eq!(source.read_stats(), super::ReadStats::default());
+        source.read_at(0, &mut buf, 4096).expect("read");
+        let first = source.read_stats();
+        // A short read at the end counts what it returned; past the end, nothing.
+        source.read_at(3 * 4096, &mut buf, 4096).expect("tail");
+        source
+            .read_at(1 << 20, &mut buf, 4096)
+            .expect("past the end");
+        let pass = source.read_stats().since(first);
+        assert_eq!(first.bytes, 4096);
+        assert_eq!(pass.bytes, 100);
+        assert!(source.read_stats().time >= first.time);
+    }
 
     fn scratch(dir: &std::path::Path, name: &str, size: u64) -> std::path::PathBuf {
         let path = dir.join(name);

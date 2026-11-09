@@ -1,0 +1,22 @@
+#!/bin/sh
+# Runs on the restored copy's first boot: report how it came up, then power off.
+{
+    echo "LR-RESTORED-BOOT-BEGIN"
+    echo "multi_user=$(systemctl is-active multi-user.target)"
+    echo "failed_units=$(systemctl --failed --no-legend --plain | wc -l)"
+    echo "failed=$(systemctl --failed --no-legend --plain | cut -d' ' -f1 | tr '\n' ' ')"
+    echo "root=$(findmnt -n -o SOURCE,FSTYPE,OPTIONS /)"
+    echo "boot_mounts=$(findmnt -n -o TARGET,FSTYPE /boot /boot/efi 2> /dev/null | tr '\n' ' ')"
+    echo "journal_recoveries=$(dmesg | grep -c 'recovery complete')"
+    echo "kernel=$(uname -r)"
+    SB=/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c
+    if [ -e "$SB" ]; then
+        echo "firmware=uefi secure_boot=$(od -An -t u1 -j 4 -N 1 "$SB" | tr -d ' ')"
+    else
+        echo "firmware=bios"
+    fi
+    /usr/local/sbin/lr-chain-check /var/lib/lr-workload/chain.log
+    echo "LR-RESTORED-BOOT-END"
+} > /dev/ttyS1 2>&1
+sync
+systemctl poweroff

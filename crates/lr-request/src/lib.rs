@@ -68,6 +68,8 @@ pub fn backup_job(spec: &BackupSpec) -> Result<BackupJob> {
     request.freeze_timeout_secs =
         (spec.freeze_timeout_secs > 0).then_some(spec.freeze_timeout_secs);
     request.deadman_grace_secs = (spec.deadman_grace_secs > 0).then_some(spec.deadman_grace_secs);
+    request.tracked_tuning.freeze_max_secs =
+        (spec.freeze_max_secs > 0).then_some(spec.freeze_max_secs);
     request.allow_inconsistent = spec.allow_inconsistent;
     request.lvm_cow_size = (!spec.lvm_cow_size.is_empty()).then(|| spec.lvm_cow_size.clone());
     request.break_stale_lock = spec.break_stale_lock;
@@ -188,6 +190,7 @@ mod tests {
             exclude_nested_subvolumes: true,
             one_file_system: true,
             freeze_timeout_secs: 45,
+            freeze_max_secs: 7,
             deadman_grace_secs: 12,
             break_stale_lock: true,
             ..BackupSpec::default()
@@ -218,6 +221,7 @@ mod tests {
         assert_eq!(request.max_incrementals_per_chain, Some(7));
         assert!(request.exclude_nested_subvolumes && request.break_stale_lock);
         assert_eq!(request.freeze_timeout_secs, Some(45));
+        assert_eq!(request.tracked_tuning.freeze_max_secs, Some(7));
         assert_eq!(request.deadman_grace_secs, Some(12));
         let destination = &request.destination_options;
         assert_eq!(destination.set_name, "laptop");

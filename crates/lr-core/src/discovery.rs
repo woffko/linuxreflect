@@ -829,6 +829,100 @@ fn blkid_probe_at(path: &Path, region: Option<(u64, u64)>) -> Result<Option<FsFa
     }))
 }
 
+/// The identities one attached block device carries, as `blkid -p` reports
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceIdentity {
+    /// Device node.
+    pub device: PathBuf,
+    /// Filesystem UUID (also an LVM physical volume's or a swap area's).
+    pub fs_uuid: Option<String>,
+    /// Partition UUID: the GPT partition GUID, or `<disk id>-<index>` on MBR.
+    pub part_uuid: Option<String>,
+}
+
+/// Probe every attached block device except `skip_disk` and its partitions
+/// for the identities it carries, with one read-only `blkid -p` run.
+///
+/// Devices of size zero (an empty optical drive) and devices without a node
+/// in `/dev` are left out.
+///
+/// # Errors
+/// Returns a reason when sysfs cannot be listed or `blkid` cannot be run.
+pub fn attached_identities(skip_disk: Option<&str>) -> Result<Vec<DeviceIdentity>, String> {
+    let devices =
+        sysfs::list_all_block_devices().map_err(|e| format!("cannot list block devices: {e}"))?;
+    let paths: Vec<PathBuf> = devices
+        .into_iter()
+        .filter(|device| {
+            device.size_bytes > 0
+                && skip_disk.is_none_or(|skip| {
+                    device.name != skip && device.parent.as_deref() != Some(skip)
+                })
+                && device.path.exists()
+        })
+        .map(|device| device.path)
+        .collect();
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    // blkid exits non-zero when one device shows nothing; each device it
+    // recognises still gets its own record. A failing disk can keep it in an
+    // uninterruptible read, where no signal ends it, so the wait is bounded
+    // and the probe is left to finish on its own thread.
+    let mut command = Command::new("blkid");
+    command.args(["-p", "-o", "export"]).args(&paths);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(command.output());
+    });
+    let output = receiver
+        .recv_timeout(IDENTITY_PROBE_TIMEOUT)
+        .map_err(|_| {
+            format!(
+                "blkid did not finish within {} s",
+                IDENTITY_PROBE_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|e| format!("cannot run blkid: {e}"))?;
+    Ok(parse_blkid_export_records(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// The longest wait for [`attached_identities`]' probe.
+const IDENTITY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Parse `blkid -o export` output for several devices: one record per
+/// device, separated by blank lines, each starting with `DEVNAME`.
+#[must_use]
+pub fn parse_blkid_export_records(raw: &str) -> Vec<DeviceIdentity> {
+    let mut identities = Vec::new();
+    for record in raw.split("\n\n") {
+        let mut fields: BTreeMap<&str, &str> = BTreeMap::new();
+        for line in record.lines() {
+            if let Some((key, value)) = line.split_once('=') {
+                fields.insert(key.trim(), value.trim());
+            }
+        }
+        let Some(device) = fields.get("DEVNAME") else {
+            continue;
+        };
+        let field = |key: &str| {
+            fields
+                .get(key)
+                .filter(|value| !value.is_empty())
+                .map(|value| (*value).to_owned())
+        };
+        identities.push(DeviceIdentity {
+            device: PathBuf::from(device),
+            fs_uuid: field("UUID"),
+            part_uuid: field("PART_ENTRY_UUID"),
+        });
+    }
+    identities
+}
+
 fn lvm_facts(device: &DeviceFacts, fs: Option<&FsFacts>) -> Option<LvmFacts> {
     let is_pv = fs.is_some_and(|f| f.fs_type.starts_with("LVM2_member"));
     let is_dm = device.dev_type == BlockDeviceType::DeviceMapper;
@@ -942,7 +1036,8 @@ mod tests {
     use std::io::{Seek, SeekFrom, Write};
 
     use super::{
-        PartitionTableKind, parse_btrfs_subvolume_line, read_table, sysfs_start_in_blocks,
+        PartitionTableKind, parse_blkid_export_records, parse_btrfs_subvolume_line, read_table,
+        sysfs_start_in_blocks,
     };
 
     const MIB: u64 = 1024 * 1024;
@@ -1036,5 +1131,32 @@ mod tests {
     fn table_kind_display() {
         assert_eq!(PartitionTableKind::Gpt.to_string(), "gpt");
         assert_eq!(PartitionTableKind::Mbr.to_string(), "mbr");
+    }
+
+    /// `blkid -p -o export` over several devices, as util-linux 2.39 prints
+    /// it: a table-only disk, a partition with a filesystem, an MBR partition
+    /// with no filesystem, and a record without a device name.
+    #[test]
+    fn blkid_export_records_give_each_device_its_identities() {
+        let raw = "DEVNAME=/dev/loop0\nPTUUID=81c7fa5b-c2ba-4adb-b465-2a084cb6df28\nPTTYPE=gpt\n\n\
+                   DEVNAME=/dev/loop0p1\nUUID=28c4d6f3-d623-43f2-9764-26720f256f87\nTYPE=ext4\n\
+                   PART_ENTRY_SCHEME=gpt\nPART_ENTRY_UUID=2f6d523c-6a82-44d4-94e1-73acd38a0f78\n\n\
+                   DEVNAME=/dev/sdb1\nPART_ENTRY_SCHEME=dos\nPART_ENTRY_UUID=4e1c09a2-01\n\n\
+                   UUID=orphan\n";
+        let records = parse_blkid_export_records(raw);
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].device.to_str(), Some("/dev/loop0"));
+        assert_eq!(records[0].fs_uuid, None);
+        assert_eq!(records[0].part_uuid, None);
+        assert_eq!(
+            records[1].fs_uuid.as_deref(),
+            Some("28c4d6f3-d623-43f2-9764-26720f256f87")
+        );
+        assert_eq!(
+            records[1].part_uuid.as_deref(),
+            Some("2f6d523c-6a82-44d4-94e1-73acd38a0f78")
+        );
+        assert_eq!(records[2].fs_uuid, None);
+        assert_eq!(records[2].part_uuid.as_deref(), Some("4e1c09a2-01"));
     }
 }

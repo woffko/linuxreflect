@@ -2021,3 +2021,58 @@ controls, is `docs/live-backup-plan.md`.
 Slice 18 supersedes D-136's "whole-disk reads remain offline-only" for disks
 whose filesystem partitions are all covered by tracked-freeze; every other
 whole-disk source stays offline-only.
+
+## D-139 — How the restore plan finds a disk that shares the copy's UUIDs
+
+Spec §E.7 (Restore) requires the plan to say when a copy restored next to its
+source carries the source's partition and filesystem UUIDs, but not how the
+source is recognised. `restore prepare` of a whole-disk image compares the
+`partuuid` and `fs_uuid` of every region in the image's disk header with what
+one read-only `blkid -p` run reports for every attached block device,
+case-insensitively. The target and its partitions are left out, because what
+they hold is overwritten. Any match becomes one warning that names each device
+and identity, and says to detach that disk or choose the copy in the firmware
+before booting the copy. When the probe cannot run or does not finish within
+15 s (a failing disk can hold `blkid` in an uninterruptible read), the plan
+says that the copy carries the source's UUIDs and that attached disks could
+not be checked, so it is never silent. Block, stream and file images are not
+checked: their headers record no filesystem UUID.
+
+`--freeze-max` takes whole seconds, like `--freeze-timeout`; the spec's
+synopsis writes `3s`. It is separate from `--freeze-timeout`, whose 300 s
+default belongs to the plain freeze provider.
+
+Revisit when the "new identity" restore (`docs/live-backup-plan.md`, later
+work) lands: it would make the warning an offer.
+
+## D-140 — Tracked-freeze hooks: which files run, how, and when
+
+Spec §E.7 names the hook directories, the ownership rule, name order, the
+30 s limit, and that a failed pre-freeze hook aborts while post-thaw hooks
+always run after a pre-freeze hook ran. The rest is decided here, keeping the
+safest choice.
+
+- **What runs.** As with `run-parts`, only names of `[A-Za-z0-9_-]` run, and
+  a file without its owner's execute bit is skipped. A runnable name that is
+  not a regular file (a symlink, a directory), or anything not owned by root
+  or writable by group or others (the hooks directory and each stage
+  directory included), refuses the job before tracing starts. Skipping it
+  would leave out the quiescence the operator relies on.
+- **How.** An empty environment except `PATH`, `LINUXREFLECT_STAGE` and
+  `LINUXREFLECT_FILESYSTEMS` (mount points, one per line, `/` last), so the
+  job's environment does not leak. Working directory `/`, no standard input,
+  standard output discarded, and the last 512 bytes of standard error kept
+  for the message. A hook that overruns is killed.
+- **When.** Only around the final freeze (spec step 6), not the barrier
+  freeze or the frozen used-block-map fallback, which are brief and read
+  nothing into the image. Post-thaw hooks run whenever the pre-freeze stage
+  began, so a service paused by an earlier pre-freeze hook is resumed even
+  when a later one fails. A failed post-thaw hook is a report warning, not a
+  failure: the image is already read.
+- **Errors.** A failed pre-freeze hook is the new `E_HOOK_FAILED` (gRPC
+  `Aborted`). The spec's list has no code for it, and `E_UNSUPPORTED` would
+  mislead.
+
+The directory is fixed at `/etc/linuxreflect/hooks`. Only the engine API can
+point elsewhere (`BackupRequest::hooks_dir`, for tests); requests to the
+daemon cannot.

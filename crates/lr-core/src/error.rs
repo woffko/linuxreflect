@@ -39,6 +39,45 @@ pub enum Error {
     #[error("freeze timeout")]
     FreezeTimeout,
 
+    /// Write tracking lost or could not interpret an event, so a
+    /// tracked-freeze copy cannot be trusted (spec §E.7); nothing is published.
+    #[error("write tracking lost events: {reason}")]
+    TrackingLost {
+        /// What was lost or misread.
+        reason: String,
+    },
+
+    /// A tracked-freeze copy did not converge: the source kept changing
+    /// faster than it could be re-copied (spec §E.7). Nothing is published.
+    #[error(
+        "the source kept changing: {dirty_bytes} bytes still dirty after {passes} passes; \
+         back up at a quieter time, from rescue media, or in file mode"
+    )]
+    NoConvergence {
+        /// Bytes still dirty when the passes ran out.
+        dirty_bytes: u64,
+        /// Passes made.
+        passes: u32,
+    },
+
+    /// A pre-freeze hook failed, so the job stopped before its final freeze
+    /// (spec §E.7). Nothing is published.
+    #[error("the pre-freeze hook {hook} {reason}; the backup stopped before the final freeze")]
+    HookFailed {
+        /// The hook's path.
+        hook: String,
+        /// How it failed.
+        reason: String,
+    },
+
+    /// The source's partition or filesystem changed shape during a
+    /// tracked-freeze copy (spec §E.7). Nothing is published.
+    #[error("the source changed during the backup: {what}")]
+    SourceChanged {
+        /// What changed.
+        what: String,
+    },
+
     /// An incremental Btrfs send needs a parent snapshot that no longer exists
     /// (spec §E.1: the incremental is refused and a new full is required).
     #[error(

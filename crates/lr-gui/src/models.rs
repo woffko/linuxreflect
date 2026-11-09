@@ -20,6 +20,11 @@ pub(crate) fn backup_spec(ui: &MainWindow) -> BackupSpec {
         },
         member_type,
         allow_freeze: snapshot == "freeze" && ui.get_allow_freeze(),
+        freeze_max_secs: if snapshot == "tracked-freeze" {
+            u64::try_from(ui.get_freeze_max()).unwrap_or(0)
+        } else {
+            0
+        },
         allow_inconsistent: snapshot == "none" && ui.get_allow_inconsistent(),
         snapshot: if snapshot == "auto" {
             String::new()

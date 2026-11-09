@@ -148,9 +148,16 @@ fn refusal(src: &SourceLayout, opts: &SnapshotOpts) -> Option<String> {
     if is_running_root(src) {
         return Some(format!("{} holds the running system", mountpoint.display()));
     }
+    frozen_filesystem_refusal(&mountpoint, opts)
+}
+
+/// Why the job's own writes could reach the filesystem at `mountpoint` while
+/// it is frozen, if they could: a path that must stay writable, the working
+/// directory, or the destination lives there (spec §E.4, §E.7).
+pub(crate) fn frozen_filesystem_refusal(mountpoint: &Path, opts: &SnapshotOpts) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
 
-    let mountpoint_dev = std::fs::metadata(&mountpoint).ok().map(|m| m.dev());
+    let mountpoint_dev = std::fs::metadata(mountpoint).ok().map(|m| m.dev());
     let text = mountpoint.to_string_lossy();
     for forbidden in FORBIDDEN_PATHS {
         // The forbidden path lives *inside* the filesystem being frozen.
@@ -196,7 +203,7 @@ fn refusal(src: &SourceLayout, opts: &SnapshotOpts) -> Option<String> {
         .find(|path| path.exists())
         .unwrap_or(destination);
     let (Ok(source_metadata), Ok(destination_metadata)) =
-        (std::fs::metadata(&mountpoint), std::fs::metadata(existing))
+        (std::fs::metadata(mountpoint), std::fs::metadata(existing))
     else {
         return Some(format!(
             "cannot stat {} or {}",
@@ -369,6 +376,34 @@ fn arm_deadman(
         .map_err(Error::Io)?;
     log.record(&format!("armed detached deadman (+{seconds}s)"));
     Ok(())
+}
+
+/// An armed deadman for one mount point, shared with the tracked-freeze
+/// provider (spec §E.7). It stays armed unless [`Deadman::disarm`] is called
+/// after a successful thaw, so a failed thaw is still undone.
+pub(crate) struct Deadman {
+    job: String,
+    marker: PathBuf,
+}
+
+impl Deadman {
+    /// Arm a deadman that thaws `mountpoint` after `after`.
+    pub(crate) fn arm(mountpoint: &Path, after: Duration, log: &FreezeLog) -> Result<Self> {
+        let job = format!(
+            "lr-{}-{}",
+            std::process::id(),
+            JOB_COUNTER.fetch_add(1, Ordering::SeqCst)
+        );
+        let marker = marker_path(&job)?;
+        arm_deadman(&job, mountpoint, &marker, after, log)?;
+        Ok(Self { job, marker })
+    }
+
+    /// The filesystem was thawed: stand the deadman down.
+    pub(crate) fn disarm(self) {
+        remove_marker(&self.marker);
+        disarm_deadman(&self.job);
+    }
 }
 
 fn which(program: &str) -> bool {

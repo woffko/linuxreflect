@@ -1,0 +1,27 @@
+#!/usr/bin/env python3
+"""Keep the root filesystem busy: an fsync'd hash-chained log, random 4 KiB
+overwrites and file churn. Prints `S seq started synced` (CLOCK_MONOTONIC)."""
+import hashlib, os, random, sys, time
+root = sys.argv[1]
+log = os.open(os.path.join(root, "chain.log"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+data = os.open(os.path.join(root, "random.bin"), os.O_RDWR | os.O_CREAT, 0o644)
+os.ftruncate(data, 4096 * 4096)
+prev, seq = b"genesis", 0
+while True:
+    started = time.monotonic()
+    digest = hashlib.sha256(prev + str(seq).encode()).hexdigest()
+    os.write(log, f"{seq} {digest}\n".encode())
+    os.fsync(log)
+    print(f"S {seq} {started:.6f} {time.monotonic():.6f}", flush=True)
+    prev, seq = digest.encode(), seq + 1
+    for _ in range(4):
+        index = random.randrange(4096)
+        os.pwrite(data, (index.to_bytes(8, "little") + seq.to_bytes(8, "little")) * 256, index * 4096)
+    if seq % 25 == 0:
+        os.fdatasync(data)
+        churn = os.path.join(root, f"churn-{seq % 7}.tmp")
+        with open(churn, "wb") as handle:
+            handle.write(os.urandom(48 * 1024))
+        if seq % 3 == 0:
+            os.unlink(churn)
+    time.sleep(0.005)

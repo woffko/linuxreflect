@@ -1,7 +1,35 @@
 # Live backup plan: running Debian and Ubuntu systems on ext4
 
-Status: plan, November 2026. It implements spec v2.2 §E.7 and Slice 18
-(decision D-138). Nothing here is implemented yet.
+Status, 2026-11-08: phase 0 is done (`docs/live-backup-spike.md`: the
+mechanism holds on kernels 5.15 to 6.18), phase 1 is done
+(`lr_snapshot::tracking`), and phase 2 is done except incremental members
+(refused for now), and phase 3 is done: whole disks with the root
+filesystem, a vfat ESP and other unfrozen regions under the quiet-window
+rule are copied live with `--snapshot tracked-freeze`, writes are tracked on
+submission and on completion, dpkg's lock postpones the final freeze and a
+logind inhibitor blocks sleep, and the VM acceptance passed on Debian 12,
+Debian 13, Ubuntu 22.04 and Ubuntu 24.04, UEFI with Secure Boot and BIOS
+(`docs/live-backup-acceptance.md`: each running system imaged live, restored
+onto another disk, and booted from it alone; re-run on `1986503` with the 3 s
+budget). Phase 4 has begun: the
+restore plan names an attached disk that shares the copy's UUIDs (CLI and
+GUI), the operator guide describes tracked-freeze, and `--freeze-max` is its
+own option (it had been taken from the freeze provider's `--freeze-timeout`,
+whose 300 s default stretched the final-freeze budget to the 30 s cap); only
+passes that do not shrink the dirty set count against `max_passes`, as §E.7
+says; the pre-freeze and post-thaw hooks run (D-140); the daemon and every
+tracked job sweep leftover trace instances of dead processes; and the
+convergence budget uses the reads' own rate; `PlanBackup` predicts a live
+whole-disk copy (provider, `Frozen`, the filesystems frozen, the budget),
+and the wizard offers tracked-freeze with its longest pause. Still open:
+incremental members, the GUI acceptance in a VM (phase 4), the
+`--allow-inconsistent` exception for a busy ESP, and phase 5. That
+exception (§E.7 quiet-window rule) is not implemented: a write to a region
+that cannot be frozen during its final read always fails the job, the
+stricter outcome. Reporting that partition alone as `None` would change its
+consistency after the image superblock and the disk header have recorded
+it, which the image format cannot do yet. The plan implements spec v2.2 §E.7
+and Slice 18 (decision D-138).
 
 ## Goal
 

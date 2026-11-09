@@ -230,9 +230,15 @@ pub(crate) enum BackupCommand {
         #[arg(long)]
         allow_freeze: bool,
 
-        /// Freeze timeout in seconds (default 300).
+        /// Freeze provider: longest whole-read freeze in seconds (default
+        /// 300).
         #[arg(long, default_value_t = 300)]
         freeze_timeout: u64,
+
+        /// Tracked-freeze: longest final freeze in seconds, 1 to 30 (default
+        /// 3). A final read that would take longer thaws and fails.
+        #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..=30))]
+        freeze_max: Option<u64>,
 
         /// Read a mounted device as-is and flag the image inconsistent.
         #[arg(long)]
@@ -674,6 +680,9 @@ pub(crate) enum SnapshotChoice {
     Lvm,
     /// `FIFREEZE`/`FITHAW` quiesced read (Slice S8).
     Freeze,
+    /// Write-tracked live copy of a mounted ext4 filesystem, frozen briefly at
+    /// the end (spec v2.2 §E.7, Slice 18).
+    TrackedFreeze,
     /// Read an unmounted, holder-free device.
     Offline,
     /// Live, inconsistent read (Slice S8).

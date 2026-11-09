@@ -64,6 +64,7 @@ pub(crate) fn block_chain(
 /// (R24): the disk header must agree with the superblock and keep its
 /// regions on the disk, every region manifest must be a full manifest with
 /// exactly one valid entry per chunk, and nothing may follow the last one.
+/// Returns the summary and the validated disk header.
 ///
 /// # Errors
 /// Returns [`Error::Corrupt`] naming the first violation.
@@ -71,7 +72,7 @@ pub(crate) fn whole_disk<R: std::io::Read + std::io::Seek>(
     reader: &mut lr_format::ImageReader<R>,
     meta_key: &[u8; 32],
     superblock: &Superblock,
-) -> Result<BlockSummary> {
+) -> Result<(BlockSummary, lr_format::disk::DiskHeader)> {
     use lr_format::disk::DiskHeader;
     use lr_format::{BlockEntry, BlockManifestHeader, StreamId, wire};
     let chunk_size = u64::from(superblock.chunk_size);
@@ -126,7 +127,7 @@ pub(crate) fn whole_disk<R: std::io::Read + std::io::Seek>(
             "the whole-disk manifest continues after its last region",
         ));
     }
-    Ok(summary)
+    Ok((summary, disk))
 }
 
 /// The structural checks a file tree passes before it is restored or called

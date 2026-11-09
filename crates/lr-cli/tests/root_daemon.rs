@@ -692,3 +692,161 @@ fn socket_activation_is_honoured() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// Spec v2.2 §E.7 through the daemon: a mounted ext4 that keeps being written
+/// is imaged live with `--snapshot tracked-freeze` by a daemon job, the
+/// report says `Frozen` with the tracked summary, and the copy restored
+/// through the daemon is clean and holds a whole prefix of the written log.
+#[test]
+#[ignore = "requires root, loop devices, tracefs, fsfreeze and the daemon binary"]
+fn a_mounted_ext4_is_imaged_live_through_the_daemon() {
+    if !root_tests_enabled() {
+        return;
+    }
+    for tool in ["losetup", "mount", "mkfs.ext4", "e2fsck", "dumpe2fs"] {
+        if !have(tool) {
+            lr_testkit::unavailable!("{tool} missing");
+        }
+    }
+    // Where the provider looks for tracefs (lr_snapshot::tracking::tracefs_root).
+    if !["/sys/kernel/tracing", "/sys/kernel/debug/tracing"]
+        .iter()
+        .any(|root| {
+            Path::new(root)
+                .join("events/block/block_bio_queue")
+                .is_dir()
+        })
+    {
+        lr_testkit::unavailable!("tracefs or the block_bio_queue tracepoint is unavailable");
+    }
+    let Some(source) = LoopDisk::ext4(256) else {
+        return;
+    };
+    let Some(target) = LoopDisk::ext4(256) else {
+        return;
+    };
+    assert!(source.mount(), "mounting the source failed");
+    let mounted = source.mount_dir.path().to_path_buf();
+    std::fs::write(mounted.join("hello.txt"), b"hello\n").expect("write");
+
+    // A writer appends numbered, fsync'd lines for the whole backup.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let stop = std::sync::Arc::clone(&stop);
+        let log = mounted.join("sequence.log");
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log)
+                .expect("log");
+            let mut next = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                writeln!(file, "{next}").expect("append");
+                file.sync_data().expect("fsync");
+                next += 1;
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            next
+        })
+    };
+    std::thread::sleep(Duration::from_millis(300));
+
+    let Some(daemon) = Daemon::start(&["--dev-mode", "--auth", "static:0"]) else {
+        lr_testkit::fixture_failed!("the daemon did not start");
+    };
+    let work = tempfile::tempdir().expect("workdir");
+    let dest = work.path().join("out");
+    let created = daemon.cli(&[
+        "backup",
+        "create",
+        "--source",
+        &source.device.display().to_string(),
+        "--dest",
+        &dest.display().to_string(),
+        "--set",
+        "live-set",
+        "--snapshot",
+        "tracked-freeze",
+        "--no-encrypt",
+        "--compress",
+        "none",
+        "--json",
+    ]);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let written = writer.join().expect("writer");
+    assert!(created.status.success(), "{}", text(Some(created)));
+    let report: serde_json::Value =
+        serde_json::from_slice(&created.stdout).expect("backup report json");
+    assert!(
+        report["consistency"]
+            .as_str()
+            .is_some_and(|value| value.eq_ignore_ascii_case("frozen")),
+        "{report}"
+    );
+    assert!(
+        report["tracked"]["passes"]
+            .as_u64()
+            .is_some_and(|passes| passes >= 1),
+        "no tracked summary in the daemon's report: {report}"
+    );
+    let image = report["image_path"]
+        .as_str()
+        .expect("image path")
+        .to_owned();
+    source.unmount();
+
+    let prepared = daemon.cli(&[
+        "restore",
+        "prepare",
+        "--image",
+        &image,
+        "--target",
+        &target.device.display().to_string(),
+        "--json",
+    ]);
+    assert!(prepared.status.success(), "{}", text(Some(prepared)));
+    let plan: serde_json::Value = serde_json::from_slice(&prepared.stdout).expect("plan json");
+    let token = plan["token"].as_str().expect("token").to_owned();
+    let applied = daemon.cli(&["restore", "apply", "--token", &token, "--confirm"]);
+    assert!(applied.status.success(), "{}", text(Some(applied)));
+
+    let device = target.device.display().to_string();
+    let fsck = Command::new("e2fsck")
+        .args(["-fn", &device])
+        .output()
+        .expect("e2fsck");
+    assert!(fsck.status.success(), "e2fsck: {}", text(Some(fsck)));
+    let header = text(Some(
+        Command::new("dumpe2fs")
+            .args(["-h", &device])
+            .output()
+            .expect("dumpe2fs"),
+    ));
+    assert!(
+        !header.contains("needs_recovery"),
+        "the copy needs journal recovery"
+    );
+    assert!(target.mount(), "mounting the restored copy failed");
+    let restored = target.mount_dir.path();
+    assert_eq!(
+        std::fs::read(restored.join("hello.txt")).expect("hello"),
+        b"hello\n"
+    );
+    let log = std::fs::read_to_string(restored.join("sequence.log")).expect("log");
+    assert!(log.is_empty() || log.ends_with('\n'), "a torn last line");
+    let mut count = 0u64;
+    for line in log.lines() {
+        assert_eq!(
+            line.parse::<u64>().ok(),
+            Some(count),
+            "the log is not a prefix"
+        );
+        count += 1;
+    }
+    assert!(
+        count > 0 && count <= written,
+        "{count} lines restored of {written} written"
+    );
+}

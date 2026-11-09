@@ -20,6 +20,10 @@ pub(crate) fn backup_plan(plan: &lr_proto::v1::Plan) -> String {
     let consistency = match plan.consistency.as_str() {
         "point-in-time" => "Planned consistency: a point-in-time snapshot.",
         "offline" => "Planned consistency: the source must remain offline.",
+        "frozen" if plan.provider == "tracked-freeze" => {
+            "Planned consistency: copied while the system runs; filesystem writes pause only \
+             for a final read of the last changes."
+        }
         "frozen" => "Planned consistency: filesystem writes will pause for the backup.",
         "per-file" => {
             "Planned consistency: files will be copied individually, not as one point-in-time snapshot."
@@ -95,9 +99,27 @@ pub(crate) fn describe(operation: &str, raw: &str) -> String {
             text.push_str(&format!("\n{label}: {}", crate::human_size(bytes)));
         }
     }
+    let tracked = value.get("tracked").filter(|tracked| tracked.is_object());
     if let Some(consistency) = value.get("consistency").and_then(serde_json::Value::as_str) {
         text.push('\n');
-        text.push_str(consistency_description(consistency));
+        text.push_str(if tracked.is_some() && consistency == "frozen" {
+            "Copied while the system ran; filesystem writes were paused only for the final read."
+        } else {
+            consistency_description(consistency)
+        });
+    }
+    if let Some(tracked) = tracked {
+        let number = |field: &str| tracked.get(field).and_then(serde_json::Value::as_u64);
+        if let (Some(passes), Some(recopied), Some(freeze_ms)) = (
+            number("passes"),
+            number("recopied_chunks"),
+            number("final_freeze_ms"),
+        ) {
+            text.push_str(&format!(
+                "\nLive copy: {passes} pass(es), {recopied} chunk(s) read again, final pause \
+                 {freeze_ms} ms."
+            ));
+        }
     }
     if let Some(encrypted) = value.get("encrypted").and_then(serde_json::Value::as_bool) {
         text.push_str(if encrypted {
@@ -116,6 +138,35 @@ pub(crate) fn describe(operation: &str, raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_tracked_freeze_plan_and_report_say_writes_pause_only_for_the_final_read() {
+        let plan = lr_proto::v1::Plan {
+            provider: "tracked-freeze".into(),
+            image_kind: "Block".into(),
+            consistency: "frozen".into(),
+            warnings: vec!["freezes / together for at most 3 s".into()],
+            ..Default::default()
+        };
+        let text = super::backup_plan(&plan);
+        assert!(text.contains("copied while the system runs"), "{text}");
+        assert!(text.contains("for at most 3 s"), "{text}");
+        assert!(!text.contains("pause for the backup"), "{text}");
+
+        let report = r#"{"mode":"whole_disk","image_path":"/b/system.lrimg","consistency":"frozen",
+            "tracked":{"passes":2,"recopied_chunks":110,"final_chunks":40,"final_freeze_ms":1262,
+            "barrier_ms":1700,"frozen_filesystems":2,"package_waits":0}}"#;
+        let text = super::describe("backup", report);
+        assert!(text.contains("paused only for the final read"), "{text}");
+        assert!(
+            text.contains("Live copy: 2 pass(es), 110 chunk(s) read again, final pause 1262 ms."),
+            "{text}"
+        );
+        // An offline image says nothing of a live copy.
+        let text = super::describe("backup", r#"{"consistency":"offline","tracked":null}"#);
+        assert!(!text.contains("Live copy"), "{text}");
+        assert!(text.contains("offline while the backup was made"), "{text}");
+    }
+
     #[test]
     fn backup_review_reports_daemon_prediction_and_preserves_warnings() {
         let plan = lr_proto::v1::Plan {

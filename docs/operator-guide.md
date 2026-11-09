@@ -13,6 +13,7 @@ to (`D-…`) are in [`decisions.md`](decisions.md); the specification is
 - [Destinations](#destinations)
 - [Desktop backup review](#desktop-backup-review)
 - [What an image contains](#what-an-image-contains)
+- [Live system images (tracked-freeze)](#live-system-images-tracked-freeze)
 - [Chains: full, incremental, differential](#chains-full-incremental-differential)
 - [Retention](#retention)
 - [Verification](#verification)
@@ -137,10 +138,17 @@ and choose the mounted network folder as Destination. Verify the created image
 in the Restore library, then restore into a new empty local directory.
 This exercises file recovery, not whole-disk boot recovery.
 
-Whole-disk imaging remains offline-only, including every partition and active
-swap. A live running system disk without a suitable partition-level snapshot
-cannot be made consistent by choosing a network destination. Boot rescue media
-for an offline whole-disk image; do not freeze the running root filesystem.
+With the default consistency, the wizard plans whole-disk images offline
+only, including every partition and active swap. A running system disk
+without a suitable partition-level snapshot cannot be made consistent by
+choosing a network destination. On Debian or Ubuntu with ext4, open **Backup
+options** and choose **Consistency: tracked-freeze** to image it while it
+runs ([below](#live-system-images-tracked-freeze)). **Longest pause** is
+`--freeze-max`, and the review names the filesystems the final freeze holds
+(rendered: [the option](screenshots/backup-live-system-1024x768@100-dark.png),
+[the review](screenshots/backup-live-summary-1024x768@100-dark.png)).
+Otherwise boot rescue media for an offline whole-disk image. Never freeze the
+running root filesystem with the plain freeze provider.
 Planning refusals appear in the wizard with expandable technical details.
 The [rendered refusal example](screenshots/backup-planning-refused-1024x768@100-dark.png)
 shows the layout, not acceptance on a physical desktop.
@@ -167,7 +175,8 @@ devices up separately, or avoid these layouts on systems that must be
 restorable from one image.
 
 **Consistency.** Every report states the consistency it achieved: a
-snapshot (`point-in-time`), a frozen filesystem (`frozen`), an unmounted device
+snapshot (`point-in-time`), a frozen filesystem (`frozen`, also for a
+tracked-freeze copy, which is frozen for its final read), an unmounted device
 (`offline`), `per-file` for a live file backup, or `none` for a live block
 read, which needs `--allow-inconsistent` to start and `--accept-inconsistent`
 to restore. A file that keeps changing while read also downgrades the image to
@@ -192,6 +201,148 @@ file (`--passphrase-file`, mode 0600), never from an argument or a prompt.
 **Disks with 4096-byte sectors** (4Kn) are read in their own block size. A
 whole-disk image restores only to a disk with the same logical block size, or
 to an image file (A14).
+
+## Live system images (tracked-freeze)
+
+`--snapshot tracked-freeze` images ext4 filesystems while they are mounted
+and in use, the root filesystem included, and with them the whole disk of a
+running system: `/`, `/boot`, the EFI system partition, the BIOS boot
+partition and the boot area before the first partition (spec §E.7, Slice 18).
+It is opt-in: in the backup wizard, choose **Consistency: tracked-freeze**
+under **Backup options**, or on the command line:
+
+```sh
+sudo linuxreflect backup create --source /dev/nvme0n1 --dest /mnt/backup \
+    --set system --snapshot tracked-freeze
+```
+
+**How it works.** LinuxReflect records every write the kernel's block layer
+issues to the source disk (a private ftrace instance on the
+`block:block_bio_queue` and `block:block_rq_complete` tracepoints), copies the
+used blocks while the system keeps running, then copies again what was written
+meanwhile. When what is left is small, it freezes every ext4 filesystem of the
+disk together, reads the remaining changed blocks into memory, thaws, and only
+then writes them to the image. Programs that write to those filesystems wait
+only during this final freeze. The report gives its length (`tracked`,
+`final_freeze_ms`), the passes and the re-copied chunks. In the acceptance
+runs it lasted 0.6–1.3 s under full emulation and about 0.2 s on loop disks.
+
+**What it guarantees.** Every ext4 filesystem in the image is as the freeze
+left it: journal flushed, clean, and at the same instant for every filesystem
+of the disk. The image is reported `frozen`, never `point-in-time`. Partitions
+that cannot be frozen (the vfat ESP, BIOS boot) and the boot area are read
+under the same final freeze, once no write to them is in flight. If one of
+them is written while it is read, the job fails with `E_SOURCE_CHANGED`
+instead of storing a torn copy; run it again.
+
+**What it does not guarantee.** Application consistency. A database or any
+other program that keeps state in memory, or spread over several files, is
+imaged the way a sudden power cut would leave it at that instant: whatever it
+has written and synced is there, nothing else. Hooks give such a program its
+own pause.
+
+**Hooks.** Executables in `/etc/linuxreflect/hooks/pre-freeze.d/` run in name
+order just before the final freeze, and those in `post-thaw.d/` right after
+the thaw. What a pre-freeze hook writes (a database flush, a dump) is in the
+image; what a post-thaw hook writes is not. A hook can flush a database, so
+the copy needs less recovery, or pause a service that a post-thaw hook
+resumes:
+
+```sh
+#!/bin/sh
+# /etc/linuxreflect/hooks/pre-freeze.d/10-postgres   (root:root, 0755)
+exec runuser -u postgres -- psql -q -c CHECKPOINT
+```
+
+- The hooks directory, each `.d` directory and each hook must be owned by
+  root and not writable by its group or by others, and a hook must be a
+  regular file (not a symlink). Anything else refuses the job before it
+  starts.
+- As with `run-parts`, only names made of letters, digits, `_` and `-` run, so
+  `.dpkg-old` leftovers and `README` files do not. A file without its owner's
+  execute bit is skipped.
+- A hook runs as root with `/` as its working directory, no standard input,
+  and an empty environment except `PATH`, `LINUXREFLECT_STAGE` (`pre-freeze`
+  or `post-thaw`) and `LINUXREFLECT_FILESYSTEMS` (the mount points the freeze
+  covers, one per line, `/` last). Each hook has 30 seconds.
+- A pre-freeze hook that fails or runs out of time stops the job with
+  `E_HOOK_FAILED` before anything is frozen, and nothing is published. Once
+  the pre-freeze hooks have begun, the post-thaw hooks always run, so a
+  paused service is resumed even when the backup fails. A failed post-thaw
+  hook is a warning in the report: the image was already read.
+- Hooks run only around the final freeze. The short barrier freeze at the
+  start does not run them, and neither does the brief freeze that may be
+  needed to map a busy filesystem.
+
+**Requirements.** They are checked before tracing starts, and the job is
+refused with the reason when one is missing:
+
+- root; a kernel with tracefs and both block tracepoints; a blk-mq disk (NVMe,
+  SATA/SAS through SCSI, virtio); a self test of the tracepoints on a private
+  loop device, run in `/run/linuxreflect`, which must be on a tmpfs;
+- ext4 directly on the partitions: no LVM, LUKS, RAID or loop device between
+  the filesystem and the disk (LVM and Btrfs have their own snapshot
+  providers);
+- a destination that is not on any filesystem being imaged: another disk, a
+  mounted share or SFTP;
+- memory for the final read (at most 256 MiB).
+
+**Budgets and waits.**
+
+- `--freeze-max SECONDS` (1 to 30, default 3) limits the final freeze. If the
+  final read takes longer, the filesystems are thawed first and the job then
+  fails with `E_FREEZE_TIMEOUT`. `--freeze-timeout` belongs to the plain
+  freeze provider and does not apply here.
+- The copy takes another pass until what is left can be read in half of
+  `--freeze-max` at the read speed the last pass measured (its reads alone,
+  not the writing to the destination, which the final read does not do), up
+  to 256 MiB. Ten passes that do not shrink what is left end the job with
+  `E_NO_CONVERGENCE`.
+- While a package transaction holds dpkg's lock, the final freeze is put off,
+  because an image taken halfway through an upgrade may not boot. Each wait
+  counts as such a pass.
+- A logind inhibitor blocks sleep and shutdown for the length of the job.
+
+**When it fails, nothing is published.**
+
+| Error | Meaning | What to do |
+|---|---|---|
+| `E_NO_CONVERGENCE` | The disk was written faster than it could be copied, or a package transaction lasted the whole job | Run it at a quieter time (not during upgrades), use rescue media for an offline image, or back up files |
+| `E_TRACKING_LOST` | The kernel dropped trace events, or the self test failed, so a write may have gone unrecorded | Run it at a quieter time; on a failed self test, use rescue media |
+| `E_FREEZE_TIMEOUT` | The final read took longer than `--freeze-max` | Run it at a quieter time, or allow a longer freeze |
+| `E_SOURCE_CHANGED` | The partition table, a filesystem's UUID or size, or a partition that cannot be frozen changed during the job | Finish the change, then back up again |
+| `E_HOOK_FAILED` | A pre-freeze hook failed or ran out of time; the message names it and quotes the end of its error output | Fix the hook or the service it pauses |
+
+**If the process dies during the freeze.** A frozen filesystem stays frozen
+after the process that froze it dies. A separate watchdog thaws it after
+`--freeze-max` plus `--deadman-grace` (default 30 s). Should a filesystem
+ever stay frozen anyway, `fsfreeze --unfreeze <mountpoint>` from a root shell
+thaws it; reading files works while it is frozen, so the shell itself can
+still start. A killed process can also leave its trace instance behind (a
+ring buffer of 16 MiB per CPU that keeps recording). The daemon removes these
+when it starts, and so does every tracked-freeze job before it starts its
+own. Either way, only instances whose process is gone are removed, never a
+running job's.
+
+**Restoring a live image** works like restoring any whole-disk image
+([Restoring](#restoring)), and the restored disk boots like one imaged
+offline. The copy carries the source's partition and filesystem UUIDs. When it
+is restored to a second disk of the same machine, the restore plan names the
+attached disk that shares them. Before booting the copy, detach that disk or
+choose the copy in the firmware's boot menu: with both attached, the boot
+loader and `/etc/fstab` may mount partitions from either disk.
+
+**Tested** on Debian 12, Debian 13, Ubuntu 22.04 and Ubuntu 24.04, under UEFI
+with Secure Boot and under BIOS. Each running system was imaged live under a
+write load, restored to another disk, and booted from that disk alone
+([`live-backup-acceptance.md`](live-backup-acceptance.md)).
+
+**Not done yet:** incremental and differential members (a tracked copy is
+always a full image; other types are refused), the `--allow-inconsistent`
+exception for a busy ESP, and xfs. **Untested so far:** real hardware at
+full speed, a desktop session during the backup, and a backup started from
+the GUI in a VM. Jobs through the daemon are covered by a root test
+on loop disks, not by the VM acceptance, which runs the CLI without a daemon.
 
 ## Chains: full, incremental, differential
 

@@ -90,6 +90,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             snapshot,
             allow_freeze,
             freeze_timeout,
+            freeze_max,
             allow_inconsistent,
             lvm_cow_size,
             deadman_grace,
@@ -119,6 +120,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
                 snapshot: snapshot.map(|choice| snapshot_id(choice).to_owned()),
                 allow_freeze: *allow_freeze,
                 freeze_timeout: *freeze_timeout,
+                freeze_max: *freeze_max,
                 allow_inconsistent: *allow_inconsistent,
                 lvm_cow_size: lvm_cow_size.clone(),
                 deadman_grace: *deadman_grace,
@@ -450,6 +452,7 @@ fn snapshot_id(choice: cli::SnapshotChoice) -> &'static str {
         cli::SnapshotChoice::Btrfs => "btrfs",
         cli::SnapshotChoice::Lvm => "lvm",
         cli::SnapshotChoice::Freeze => "freeze",
+        cli::SnapshotChoice::TrackedFreeze => "tracked-freeze",
         cli::SnapshotChoice::Offline => "offline",
         cli::SnapshotChoice::None => "none",
     }
@@ -468,6 +471,8 @@ fn init_tracing(verbose: u8, quiet: u8) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        // Colours only on a terminal: a log file or journald gets plain text.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .try_init();
 }
 
@@ -491,6 +496,7 @@ struct BackupOptions<'a> {
     snapshot: Option<String>,
     allow_freeze: bool,
     freeze_timeout: u64,
+    freeze_max: Option<u64>,
     allow_inconsistent: bool,
     lvm_cow_size: Option<String>,
     deadman_grace: u64,
@@ -554,6 +560,7 @@ fn backup_spec(options: &BackupOptions<'_>) -> lr_proto::v1::BackupSpec {
         max_incrementals: options.max_incrementals,
         one_file_system: options.one_file_system,
         freeze_timeout_secs: options.freeze_timeout,
+        freeze_max_secs: options.freeze_max.unwrap_or(0),
         deadman_grace_secs: options.deadman_grace,
         break_stale_lock: options.break_stale_lock,
         verify_content: options.verify_content,
@@ -565,9 +572,14 @@ fn backup_spec(options: &BackupOptions<'_>) -> lr_proto::v1::BackupSpec {
 fn backup_create(json: bool, options: &BackupOptions<'_>) -> anyhow::Result<()> {
     let spec = backup_spec(options);
     if let Some(mut client) = client_if_available(options.socket) {
-        let summary = client.create_backup(spec, |progress| {
+        let summary = client.create_backup(spec, move |progress| {
             if let Some(line) = client::progress_line(progress) {
-                println!("{line}");
+                // With --json, standard output carries the report alone.
+                if json {
+                    eprintln!("{line}");
+                } else {
+                    println!("{line}");
+                }
             }
         })?;
         if json {
@@ -854,9 +866,14 @@ fn verify(
                 .unwrap_or_default(),
             insecure_ignore_host_key: options.insecure_ignore_host_key,
         };
-        let summary = client.verify_image(spec, |progress| {
+        let summary = client.verify_image(spec, move |progress| {
             if let Some(line) = client::progress_line(progress) {
-                println!("{line}");
+                // With --json, standard output carries the report alone.
+                if json {
+                    eprintln!("{line}");
+                } else {
+                    println!("{line}");
+                }
             }
         })?;
         if json {
@@ -1998,9 +2015,14 @@ fn restore_apply(
                     .unwrap_or_default(),
                 ..lr_proto::v1::RestoreToken::default()
             },
-            |progress| {
+            move |progress| {
                 if let Some(line) = client::progress_line(progress) {
-                    println!("{line}");
+                    // With --json, standard output carries the report alone.
+                    if json {
+                        eprintln!("{line}");
+                    } else {
+                        println!("{line}");
+                    }
                 }
             },
         )?;

@@ -19,6 +19,8 @@ pub const PROVIDER_OFFLINE: &str = "offline";
 pub const PROVIDER_FREEZE: &str = "freeze";
 /// Provider identifier for the live, inconsistent reader.
 pub const PROVIDER_LIVE_NONE: &str = "live-none";
+/// The tracked-freeze provider (spec v2.2 §E.7).
+pub const PROVIDER_TRACKED_FREEZE: &str = "tracked-freeze";
 
 /// Normalize the documented `none` spelling to the provider's stable ID.
 fn provider_id(name: &str) -> &str {
@@ -116,6 +118,21 @@ pub fn decide(layout: &SourceLayout, opts: &SnapshotOpts) -> Result<Decision> {
             provider: PROVIDER_OFFLINE,
             image_kind: ImageKind::Block,
             consistency: Consistency::Offline,
+            warnings,
+        });
+    }
+    // Tracked-freeze is opt-in until Slice 18 decides the default (spec §M.4):
+    // only an explicit `--snapshot tracked-freeze` selects it.
+    if mounted && forced == Some(PROVIDER_TRACKED_FREEZE) {
+        warnings.push(
+            "writes are tracked while the source is copied live; the filesystem is frozen \
+             briefly at the end (frozen, not a snapshot)"
+                .to_owned(),
+        );
+        return Ok(Decision {
+            provider: PROVIDER_TRACKED_FREEZE,
+            image_kind: ImageKind::Block,
+            consistency: Consistency::Frozen,
             warnings,
         });
     }
@@ -257,6 +274,7 @@ pub fn block_provider(id: &str) -> Result<&'static dyn crate::BlockSnapshotProvi
         PROVIDER_LVM => Ok(crate::lvm::provider()),
         PROVIDER_FREEZE => Ok(crate::freeze::provider()),
         PROVIDER_LIVE_NONE => Ok(crate::live_none::provider()),
+        PROVIDER_TRACKED_FREEZE => Ok(crate::tracked_freeze::provider()),
         other => Err(Error::unsupported(format!("provider {other}"))),
     }
 }

@@ -62,7 +62,11 @@ Linux has no VSS. LinuxReflect uses a real point-in-time snapshot when the
 system allows one (LVM and thin LVM snapshots, Btrfs read-only snapshots),
 freezes the filesystem with a watchdog when you allow that, reads offline
 devices directly, and only makes a live, possibly inconsistent copy when you
-ask for it explicitly. The plan shown before a backup and the report after
+ask for it explicitly. On Debian and Ubuntu's plain ext4, `--snapshot
+tracked-freeze` images the running system disk live: it tracks writes while it
+copies and freezes the filesystems only for a final read of about a second,
+and the copy restores to another disk and boots (opt-in, from the CLI or the
+backup wizard's options; see the operator guide). The plan shown before a backup and the report after
 it state the consistency **actually achieved**; it never claims a snapshot
 it did not make.
 

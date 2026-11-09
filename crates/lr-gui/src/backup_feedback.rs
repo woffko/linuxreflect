@@ -15,7 +15,9 @@ pub(crate) fn failure(error: &anyhow::Error) -> Failure {
     let message = match (code, status.map(tonic::Status::code)) {
         (Some("E_NO_CONSISTENT_METHOD"), _) => {
             "No consistent imaging method is available for this source with the selected settings. \
-             For an image of the running system disk, boot rescue media and back it up offline. \
+             For an image of the running system disk on Debian or Ubuntu with ext4, open Backup \
+             options and choose Consistency: tracked-freeze; otherwise boot rescue media and back \
+             it up offline. \
              To test the GUI now, go Back to Source, choose a small local folder, and keep your \
              network folder as Destination. A second local drive is not required."
         }

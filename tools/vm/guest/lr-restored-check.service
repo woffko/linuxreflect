@@ -1,0 +1,10 @@
+[Unit]
+Description=LinuxReflect Slice 18 restored-boot check
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/lr-restored-check
+
+[Install]
+WantedBy=multi-user.target

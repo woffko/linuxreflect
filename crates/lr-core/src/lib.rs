@@ -21,8 +21,8 @@ pub use caps::{Capabilities, Capability};
 pub use catalog::{Catalog, ChainRecord, MemberKind, MemberRecord};
 pub use consistency::Consistency;
 pub use discovery::{
-    BlockDeviceType, DeviceFacts, FsFacts, LvmFacts, PartitionLayout, PartitionTableInfo,
-    PartitionTableKind, SourceLayout, discover_source,
+    BlockDeviceType, DeviceFacts, DeviceIdentity, FsFacts, LvmFacts, PartitionLayout,
+    PartitionTableInfo, PartitionTableKind, SourceLayout, discover_source,
 };
 pub use error::{Error, Result};
 pub use geometry::Geometry;
@@ -91,6 +91,28 @@ pub struct SnapshotOpts {
     pub destination: Option<std::path::PathBuf>,
     /// `true` when the image is written to another host (SFTP).
     pub destination_remote: bool,
+    /// Tracked-freeze budgets (spec §E.7); unset fields keep the defaults.
+    #[serde(default)]
+    pub tracked: TrackedTuning,
+    /// Tracked-freeze hooks directory; `None` is `/etc/linuxreflect/hooks`.
+    /// Set by tests and embedders only: never taken from a request.
+    #[serde(skip)]
+    pub hooks_dir: Option<std::path::PathBuf>,
+}
+
+/// Tunable budgets of the tracked-freeze provider (spec §E.7).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TrackedTuning {
+    /// Most bytes the final freeze may read (`final_max`, default 256 MiB).
+    pub final_max_bytes: Option<u64>,
+    /// Passes that do not shrink the dirty set (or only wait for a package
+    /// transaction) before the copy gives up (`max_passes`, default 10).
+    pub max_passes: Option<u32>,
+    /// Per-CPU ring buffer of the trace instance in KiB (default 16384).
+    pub buffer_kb: Option<u32>,
+    /// Longest final freeze in seconds (`freeze_max`, default 3, at most
+    /// 30). The freeze provider's `freeze_timeout_secs` does not apply.
+    pub freeze_max_secs: Option<u64>,
 }
 
 /// Result of a provider support query.

@@ -793,6 +793,10 @@ pub(crate) fn classify_error(error: &Error) -> FailureKind {
         Error::BadSector { .. }
         | Error::SnapshotOverflow
         | Error::FreezeTimeout
+        | Error::TrackingLost { .. }
+        | Error::NoConvergence { .. }
+        | Error::SourceChanged { .. }
+        | Error::HookFailed { .. }
         | Error::StreamParentMissing { .. }
         | Error::NoConsistentMethod { .. }
         | Error::SetLocked { .. }

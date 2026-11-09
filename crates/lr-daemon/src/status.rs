@@ -19,6 +19,10 @@ pub fn error_code(error: &Error) -> (String, String) {
         Error::StreamParentMissing { .. } => "E_STREAM_PARENT_MISSING",
         Error::SnapshotOverflow => "E_SNAPSHOT_OVERFLOW",
         Error::FreezeTimeout => "E_FREEZE_TIMEOUT",
+        Error::TrackingLost { .. } => "E_TRACKING_LOST",
+        Error::NoConvergence { .. } => "E_NO_CONVERGENCE",
+        Error::SourceChanged { .. } => "E_SOURCE_CHANGED",
+        Error::HookFailed { .. } => "E_HOOK_FAILED",
         Error::BadSector { .. } => "E_BAD_SECTOR",
         Error::Unsupported { .. } => "E_UNSUPPORTED",
         Error::Corrupt { .. } => "E_CORRUPT",
@@ -50,7 +54,12 @@ pub fn grpc_status(error: &Error) -> Status {
         // `FailedPrecondition` is the honest code (D-089).
         Error::Unsupported { .. } => Code::FailedPrecondition,
         Error::Corrupt { .. } | Error::Aead | Error::BadSector { .. } => Code::DataLoss,
-        Error::SnapshotOverflow | Error::FreezeTimeout => Code::Aborted,
+        Error::SnapshotOverflow
+        | Error::FreezeTimeout
+        | Error::TrackingLost { .. }
+        | Error::NoConvergence { .. }
+        | Error::SourceChanged { .. }
+        | Error::HookFailed { .. } => Code::Aborted,
         // A missing set, image or file is the caller's to fix (A9).
         Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound => Code::NotFound,
         Error::NetworkTimeout(_) | Error::Io(_) => Code::Internal,
@@ -98,6 +107,32 @@ mod tests {
             (Error::TargetChanged, "E_TARGET_CHANGED"),
             (Error::unsupported("btrfs"), "E_UNSUPPORTED"),
             (Error::corrupt("chunk 3"), "E_CORRUPT"),
+            (
+                Error::TrackingLost {
+                    reason: "overrun".to_owned(),
+                },
+                "E_TRACKING_LOST",
+            ),
+            (
+                Error::NoConvergence {
+                    dirty_bytes: 1,
+                    passes: 10,
+                },
+                "E_NO_CONVERGENCE",
+            ),
+            (
+                Error::SourceChanged {
+                    what: "partition table".to_owned(),
+                },
+                "E_SOURCE_CHANGED",
+            ),
+            (
+                Error::HookFailed {
+                    hook: "/etc/linuxreflect/hooks/pre-freeze.d/10-db".to_owned(),
+                    reason: "failed (exit status: 1)".to_owned(),
+                },
+                "E_HOOK_FAILED",
+            ),
         ] {
             assert_eq!(error_code(&error).0, expected, "{error}");
         }

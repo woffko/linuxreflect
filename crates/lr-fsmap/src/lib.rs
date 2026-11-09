@@ -20,7 +20,7 @@ mod raw;
 mod tool;
 mod xfs;
 
-pub use ext4::{Ext4Dump, Ext4Facts, Ext4Provider, GroupFree, parse_dumpe2fs};
+pub use ext4::{Ext4Dump, Ext4Facts, Ext4Provider, GroupFree, live_used_extents, parse_dumpe2fs};
 pub use raw::{FS_TYPE as RAW_FS_TYPE, RawProvider};
 pub use xfs::{XfsFreeSpace, XfsGeometry, XfsProvider, parse_freesp, parse_geometry};
 
