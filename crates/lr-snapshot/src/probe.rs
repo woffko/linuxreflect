@@ -239,12 +239,29 @@ pub fn probe(layout: &SourceLayout, opts: &SnapshotOpts) -> Result<Plan> {
             );
             layout.device_facts.size_bytes
         }
+        // The first pass reads the live map; later passes re-read only what
+        // changes, which the estimate cannot know.
+        PROVIDER_TRACKED_FREEZE => match lr_fsmap::live_used_extents(&layout.device) {
+            Ok(map) => map.covered_bytes(),
+            Err(error) => {
+                warnings.push(format!(
+                    "cannot estimate the used bytes of the mounted filesystem now ({error}); \
+                     assuming the whole device"
+                ));
+                layout.device_facts.size_bytes
+            }
+        },
         other => {
             warnings.push(format!("no size estimate for provider {other}"));
             layout.device_facts.size_bytes
         }
     };
-    if !layout.is_offline() && decision.provider != PROVIDER_FREEZE {
+    // A tracked copy maps the live filesystem on purpose and re-reads what
+    // changes (spec §E.7), so the note does not apply to it.
+    if !layout.is_offline()
+        && decision.provider != PROVIDER_FREEZE
+        && decision.provider != PROVIDER_TRACKED_FREEZE
+    {
         warnings.push(
             "the source is mounted; a used-block map read now may not match the snapshot"
                 .to_owned(),
