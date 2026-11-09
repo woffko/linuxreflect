@@ -195,6 +195,24 @@ fn stage_hooks(root: &Path, stage: Stage) -> Result<Vec<PathBuf>> {
     Ok(hooks)
 }
 
+/// Start `command`, retrying briefly while the kernel reports the program as
+/// busy (`ETXTBSY`): a file is busy while anything holds it open for
+/// writing, which includes the moment a hook is being saved, and a child of
+/// another thread that forked while the file was being written and has not
+/// reached `exec` yet.
+fn spawn_when_not_busy(command: &mut Command) -> std::io::Result<std::process::Child> {
+    let mut tries = 0;
+    loop {
+        match command.spawn() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 20 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Run one hook; the error says what went wrong.
 fn run(
     hook: &Path,
@@ -207,7 +225,8 @@ fn run(
         listed.push_str(&filesystem.display().to_string());
         listed.push('\n');
     }
-    let mut child = Command::new(hook)
+    let mut command = Command::new(hook);
+    command
         .env_clear()
         .env("PATH", HOOK_PATH)
         .env("LINUXREFLECT_STAGE", stage.name())
@@ -215,8 +234,8 @@ fn run(
         .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    let mut child = spawn_when_not_busy(&mut command)
         .map_err(|error| format!("could not be started: {error}"))?;
     // Standard error is read on its own thread, so a chatty hook cannot fill
     // the pipe and stall; only its tail is kept.
@@ -346,6 +365,26 @@ mod tests {
             !env.contains("HOME="),
             "the caller's environment leaked: {env}"
         );
+    }
+
+    /// A hook that is still open for writing (being saved, or inherited by
+    /// a child another thread forked) is busy; it runs once it is free.
+    #[test]
+    fn a_hook_busy_for_a_moment_still_runs() {
+        let dir = tempfile::tempdir().expect("dir");
+        let out = dir.path().join("ran");
+        let hook = script(dir.path(), "busy", &format!("touch {}", out.display()));
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&hook)
+            .expect("hold the hook open for writing");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(writer);
+        });
+        run(&hook, Stage::PreFreeze, &[], DEFAULT_HOOK_TIMEOUT).expect("runs once free");
+        release.join().expect("release");
+        assert!(out.exists());
     }
 
     #[test]
