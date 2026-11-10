@@ -169,6 +169,14 @@ pub(crate) fn run_script(
                 let value = value.clone();
                 set(weak, move |ui| ui.set_member_type(value.into()))?;
             }
+            Step::Snapshot(value) => {
+                let value = value.clone();
+                set(weak, move |ui| ui.set_snapshot(value.into()))?;
+            }
+            Step::FreezeMax(seconds) => {
+                let seconds = *seconds;
+                set(weak, move |ui| ui.set_freeze_max(seconds))?;
+            }
             Step::Pick(index) => {
                 let index = i32::try_from(*index).map_err(|error| error.to_string())?;
                 invoke(weak, move |ui| ui.invoke_history_selected(index))?;
@@ -221,9 +229,13 @@ pub(crate) fn run_script(
                 let status = read(weak, |ui| ui.get_status().to_string())?;
                 let plan = read(weak, |ui| ui.get_plan().to_string())?;
                 let restore_plan = read(weak, |ui| ui.get_restore_plan().to_string())?;
+                let review = read(weak, |ui| ui.get_backup_summary().to_string())?;
+                let result = read(weak, |ui| ui.get_result_text().to_string())?;
                 log.push(format!("status: {status}"));
                 log.push(format!("backup plan: {plan}"));
+                log.push(format!("backup review: {review}"));
                 log.push(format!("restore plan: {restore_plan}"));
+                log.push(format!("result: {result}"));
             }
             Step::Quit => break,
         }

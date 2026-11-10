@@ -341,7 +341,10 @@ write load, restored to another disk, and booted from that disk alone
 always a full image; other types are refused), the `--allow-inconsistent`
 exception for a busy ESP, and xfs. **Untested so far:** real hardware at
 full speed, a desktop session during the backup, and a backup started from
-the GUI in a VM. Jobs through the daemon are covered by a root test
+the GUI inside a VM whose restored disk is then booted. The GUI's own path is
+covered by a root test: a live backup chosen in the wizard, of a mounted
+ext4 under write load, restored through the GUI
+(`a_mounted_ext4_is_imaged_live_through_the_gui_on_x11`). Jobs through the daemon are covered by a root test
 on loop disks, not by the VM acceptance, which runs the CLI without a daemon.
 
 ## Chains: full, incremental, differential

@@ -18,8 +18,9 @@ on `1986503` with the 3 s `--freeze-max` default). Phase 4 added the restore
 plan's shared-UUID warning (D-139), `--freeze-max`, the pre-freeze/post-thaw
 hooks (D-140), a sweep of dead jobs' trace instances, a read-only convergence
 rate, a root test of a live job through the daemon, a truthful `PlanBackup`
-for a live whole disk and the wizard's tracked-freeze option. Incremental
-members and the GUI acceptance in a VM are not done yet.
+for a live whole disk, the wizard's tracked-freeze option and a GUI root test
+of a live backup and restore. Incremental members and a GUI run inside a VM
+that boots the restored disk are not done yet.
 
 The MVP is slices S1–S11 (spec §K). Slices are landed one pull request each.
 Current state: S1 (workspace, `lr-core`, `lr-unsafe`, capability probe,

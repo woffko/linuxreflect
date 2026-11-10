@@ -21,8 +21,11 @@ says; the pre-freeze and post-thaw hooks run (D-140); the daemon and every
 tracked job sweep leftover trace instances of dead processes; and the
 convergence budget uses the reads' own rate; `PlanBackup` predicts a live
 whole-disk copy (provider, `Frozen`, the filesystems frozen, the budget),
-and the wizard offers tracked-freeze with its longest pause. Still open:
-incremental members, the GUI acceptance in a VM (phase 4), the
+and the wizard offers tracked-freeze with its longest pause. A root test
+drives the GUI through a live backup and a restore on loop devices
+(`a_mounted_ext4_is_imaged_live_through_the_gui_on_x11`). Still open:
+incremental members, the GUI acceptance inside a VM with a boot of the
+restored disk (phase 4), the
 `--allow-inconsistent` exception for a busy ESP, and phase 5. That
 exception (§E.7 quiet-window rule) is not implemented: a write to a region
 that cannot be frozen during its final read always fails the job, the

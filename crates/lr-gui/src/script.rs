@@ -22,6 +22,10 @@ pub enum Step {
     SetName(String),
     /// Set the mode field.
     Mode(String),
+    /// Set the consistency method (`snapshot tracked-freeze`, ...).
+    Snapshot(String),
+    /// Set tracked-freeze's longest pause in seconds, 1 to 30.
+    FreezeMax(i32),
     /// Enable backup encryption using an existing protected passphrase file.
     BackupPassphraseFile(String),
     /// Choose the restore passphrase file, invalidating any prepared plan.
@@ -108,6 +112,19 @@ pub fn parse(text: &str) -> Result<Vec<Step>, Error> {
             "dest" => Step::Destination(need(argument)?),
             "set" => Step::SetName(need(argument)?),
             "mode" => Step::Mode(need(argument)?),
+            "snapshot" => Step::Snapshot(need(argument)?),
+            "freeze-max" => Step::FreezeMax(
+                need(argument)?
+                    .parse::<i32>()
+                    .ok()
+                    .filter(|seconds| (1..=30).contains(seconds))
+                    .ok_or_else(|| {
+                        Error::corrupt(format!(
+                            "line {}: freeze-max takes 1 to 30 seconds",
+                            number + 1
+                        ))
+                    })?,
+            ),
             "backup-passphrase-file" => Step::BackupPassphraseFile(need(argument)?),
             "restore-passphrase-file" => Step::RestorePassphraseFile(need(argument)?),
             "image" => Step::Image(need(argument)?),
@@ -286,6 +303,17 @@ mod tests {
         assert!(format!("{error}").contains("needs an argument"), "{error}");
         let error = parse("   \n# nothing\n").expect_err("empty");
         assert!(format!("{error}").contains("empty"), "{error}");
+        assert_eq!(
+            parse("snapshot tracked-freeze\nfreeze-max 7\n").expect("tracked"),
+            vec![
+                Step::Snapshot("tracked-freeze".to_owned()),
+                Step::FreezeMax(7)
+            ]
+        );
+        for wrong in ["freeze-max 0", "freeze-max 31", "freeze-max soon"] {
+            let error = parse(wrong).expect_err("out of range");
+            assert!(format!("{error}").contains("1 to 30 seconds"), "{error}");
+        }
     }
 
     #[test]

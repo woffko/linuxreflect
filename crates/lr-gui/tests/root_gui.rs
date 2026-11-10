@@ -1016,3 +1016,195 @@ fn a_file_restore_into_a_non_empty_folder_needs_the_merge_choice_on_x11() {
         "a file the backup does not contain stays"
     );
 }
+
+/// Spec v2.2 §E.7 through the GUI: with Consistency "tracked-freeze" and a
+/// longest pause of 3 s, a mounted ext4 that keeps being written is imaged
+/// live by the daemon. The review names tracked-freeze, the result shows the
+/// live copy, and the copy restored through the GUI is clean and holds a
+/// whole prefix of the written log.
+#[test]
+#[ignore = "needs root, loop devices, tracefs, Xvfb and e2fsprogs; a live backup through the GUI"]
+fn a_mounted_ext4_is_imaged_live_through_the_gui_on_x11() {
+    if !root_tests_enabled() {
+        return;
+    }
+    for tool in [
+        "Xvfb",
+        "losetup",
+        "sgdisk",
+        "blockdev",
+        "mkfs.ext4",
+        "mount",
+        "e2fsck",
+    ] {
+        assert!(have(tool), "{tool} is required");
+    }
+    // Where the provider looks for tracefs (lr_snapshot::tracking::tracefs_root).
+    if !["/sys/kernel/tracing", "/sys/kernel/debug/tracing"]
+        .iter()
+        .any(|root| {
+            Path::new(root)
+                .join("events/block/block_bio_queue")
+                .is_dir()
+        })
+    {
+        lr_testkit::unavailable!("tracefs or the block_bio_queue tracepoint is unavailable");
+    }
+    let dir = private_test_dir();
+    let Some(daemon) = Daemon::start(dir.path()) else {
+        panic!("the daemon binary is not built next to the GUI");
+    };
+    let mut loops = Loops {
+        devices: Vec::new(),
+        mountpoint: None,
+    };
+    let source_image = dir.path().join("live-source.img");
+    let target_image = dir.path().join("live-target.img");
+    for image in [&source_image, &target_image] {
+        std::fs::File::create(image)
+            .and_then(|file| file.set_len(96 * 1024 * 1024))
+            .expect("sparse image");
+    }
+    let source = attach_loop(&source_image);
+    loops.devices.push(source.clone());
+    run_ok(
+        "sgdisk",
+        &["--clear", "-n", "1:2048:+64M", "-t", "1:8300", &source],
+    );
+    run_ok("blockdev", &["--rereadpt", &source]);
+    let partition = format!("{source}p1");
+    for _ in 0..50 {
+        if Path::new(&partition).exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    run_ok("mkfs.ext4", &["-F", "-q", "-L", "GUILIVE", &partition]);
+    let mountpoint = dir.path().join("live-mnt");
+    std::fs::create_dir(&mountpoint).expect("mountpoint");
+    run_ok("mount", &[&partition, &mountpoint.display().to_string()]);
+    loops.mountpoint = Some(mountpoint.clone());
+    std::fs::write(mountpoint.join("hello.txt"), b"live marker\n").expect("marker");
+    let target = attach_loop(&target_image);
+    loops.devices.push(target.clone());
+
+    // A writer appends numbered, fsync'd lines for the whole backup.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let stop = std::sync::Arc::clone(&stop);
+        let log = mountpoint.join("sequence.log");
+        std::thread::spawn(move || {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log)
+                .expect("log");
+            let mut next = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                writeln!(file, "{next}").expect("append");
+                file.sync_data().expect("fsync");
+                next += 1;
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            next
+        })
+    };
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut reaper = Reaper(Vec::new());
+    let display = start_xvfb(&mut reaper);
+    let backed_up = dir.path().join("backed-up");
+    let script = dir.path().join("live-script.txt");
+    std::fs::write(
+        &script,
+        format!(
+            "refresh-disks\n\
+             source {partition}\n\
+             dest {backups}\n\
+             set gui-live\n\
+             mode block\n\
+             snapshot tracked-freeze\n\
+             freeze-max 3\n\
+             probe\n\
+             print\n\
+             backup\n\
+             print\n\
+             signal {backed_up}\n\
+             image-from-summary\n\
+             target {target}\n\
+             prepare\n\
+             restore\n\
+             print\n\
+             quit\n",
+            backups = dir.path().join("live-backups").display(),
+            backed_up = backed_up.display(),
+        ),
+    )
+    .expect("script");
+    let gui = Command::new(GUI)
+        .env("DISPLAY", &display)
+        .env_remove("WAYLAND_DISPLAY")
+        .env("SLINT_BACKEND", "winit-software")
+        .arg("--socket")
+        .arg(&daemon.socket)
+        .arg("--script")
+        .arg(&script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("GUI run");
+    wait_for_marker(&backed_up, Instant::now(), "finished the live backup");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let written = writer.join().expect("writer");
+    let output = gui.wait_with_output().expect("GUI exit");
+    let log = text(&output);
+    assert!(output.status.success(), "{log}");
+    assert!(
+        log.contains("Planned method: tracked-freeze")
+            && log.contains("copied while the system runs")
+            && log.contains("for at most 3 s"),
+        "the review does not describe the live copy:\n{log}"
+    );
+    assert!(
+        log.contains("Live copy:") && log.contains("final pause"),
+        "the result does not report the live copy:\n{log}"
+    );
+    assert!(
+        !log.contains("may not match the snapshot"),
+        "the plan warns about a map that tracked-freeze keeps up to date:\n{log}"
+    );
+
+    // The restored copy is clean and holds a whole prefix of the log.
+    let fsck = Command::new("e2fsck")
+        .args(["-fn", &target])
+        .output()
+        .expect("e2fsck");
+    assert!(fsck.status.success(), "e2fsck: {}", text(&fsck));
+    run_ok("umount", &[&mountpoint.display().to_string()]);
+    run_ok(
+        "mount",
+        &["-o", "ro", &target, &mountpoint.display().to_string()],
+    );
+    assert_eq!(
+        std::fs::read_to_string(mountpoint.join("hello.txt")).expect("restored marker"),
+        "live marker\n"
+    );
+    let restored = std::fs::read_to_string(mountpoint.join("sequence.log")).expect("log");
+    assert!(
+        restored.is_empty() || restored.ends_with('\n'),
+        "a torn last line"
+    );
+    let mut count = 0u64;
+    for line in restored.lines() {
+        assert_eq!(
+            line.parse::<u64>().ok(),
+            Some(count),
+            "the log is not a prefix"
+        );
+        count += 1;
+    }
+    assert!(
+        count > 0 && count <= written,
+        "{count} lines restored of {written} written"
+    );
+}
