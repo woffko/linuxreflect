@@ -13,8 +13,9 @@
 //! quiet-window rule: it must not be written from its final read until the
 //! thaw. Every frozen filesystem of the copy is frozen together, `/` last.
 //!
-//! The provider is selected only by an explicit `--snapshot tracked-freeze`
-//! until Slice 18 decides the default (spec §M.4).
+//! The provider is opt-in until Slice 18 decides the default (spec §M.4): an
+//! explicit `--snapshot tracked-freeze`, or the automatic choice with
+//! `--allow-freeze` when every precondition holds (spec §E step 4, D-141).
 
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
@@ -73,10 +74,7 @@ impl BlockSnapshotProvider for TrackedFreezeProvider {
     }
 
     fn supports(&self, src: &SourceLayout, opts: &SnapshotOpts) -> Support {
-        match refusal(src, opts) {
-            Some(reason) => Support::No(reason),
-            None => Support::Yes,
-        }
+        support(src, opts, false)
     }
 
     fn create(&self, src: &SourceLayout, opts: &SnapshotOpts) -> Result<BlockSnapshot> {
@@ -128,6 +126,8 @@ pub struct TrackedPlan {
     pub pre_freeze_hooks: usize,
     /// Post-thaw hooks that would run.
     pub post_thaw_hooks: usize,
+    /// Chosen by `auto` with `--allow-freeze` rather than by name.
+    pub automatic: bool,
 }
 
 impl TrackedPlan {
@@ -164,11 +164,15 @@ impl TrackedPlan {
                 self.pre_freeze_hooks, self.post_thaw_hooks
             )
         });
-        notes.push(
+        notes.push(if self.automatic {
+            "the write-tracking self test runs when the backup starts; on a kernel that fails \
+             it, the automatic choice goes on to the next method"
+                .to_owned()
+        } else {
             "the write-tracking self test runs when the backup starts; a kernel that fails it \
              refuses the backup"
-                .to_owned(),
-        );
+                .to_owned()
+        });
         notes
     }
 }
@@ -196,8 +200,35 @@ pub fn plan_disk(disk: &Path, regions: &[RegionSpec], opts: &SnapshotOpts) -> Re
     plan_regions(disk, regions, opts)
 }
 
+/// Whether tracked-freeze can copy whole-disk `regions` of `disk`: the
+/// preconditions of spec §E.7, and with `self_test` the write-tracking self
+/// test (see [`support`]).
+///
+/// # Errors
+/// What no method choice can work around: an out-of-range `--freeze-max`,
+/// an unsafe hook, I/O errors. A precondition that does not hold is
+/// [`Support::No`] with the reason.
+pub fn disk_support(
+    disk: &Path,
+    regions: &[RegionSpec],
+    opts: &SnapshotOpts,
+    self_test: bool,
+) -> Result<Support> {
+    if let Some(reason) = opt_in_refusal(opts).or_else(tracepoint_refusal) {
+        return Ok(Support::No(reason));
+    }
+    match TrackedCopy::check(disk, regions, opts) {
+        Ok(_) => Ok(match self_test.then(self_test_refusal).flatten() {
+            Some(reason) => Support::No(reason),
+            None => Support::Yes,
+        }),
+        Err(Refusal::Precondition(reason)) => Ok(Support::No(reason)),
+        Err(Refusal::Failed(error)) => Err(error),
+    }
+}
+
 fn plan_regions(disk: &Path, regions: &[RegionSpec], opts: &SnapshotOpts) -> Result<TrackedPlan> {
-    let checked = TrackedCopy::check(disk, regions, opts)?;
+    let checked = TrackedCopy::check(disk, regions, opts).map_err(Refusal::into_error)?;
     Ok(TrackedPlan {
         quiet_regions: checked
             .holds
@@ -208,6 +239,7 @@ fn plan_regions(disk: &Path, regions: &[RegionSpec], opts: &SnapshotOpts) -> Res
         freeze_max: checked.freeze_max,
         pre_freeze_hooks: checked.hooks.of(crate::hooks::Stage::PreFreeze).len(),
         post_thaw_hooks: checked.hooks.of(crate::hooks::Stage::PostThaw).len(),
+        automatic: opts.provider.as_deref() != Some(ID),
     })
 }
 
@@ -217,6 +249,43 @@ fn refused(reason: &str) -> Error {
         "unmount the filesystem for offline consistency".to_owned(),
         "boot rescue media for an offline image".to_owned(),
     ])
+}
+
+/// Why [`TrackedCopy::check`] stopped.
+enum Refusal {
+    /// A precondition of spec §E.7 does not hold: the method does not apply
+    /// to this source, and the automatic choice moves on.
+    Precondition(String),
+    /// The request cannot be honoured or the check failed.
+    Failed(Error),
+}
+
+impl From<Error> for Refusal {
+    fn from(error: Error) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl Refusal {
+    fn into_error(self) -> Error {
+        match self {
+            Self::Precondition(reason) => refused(&reason),
+            Self::Failed(error) => error,
+        }
+    }
+}
+
+/// Whether tracked-freeze can copy this partition (or a device with ext4
+/// directly on it): the preconditions of spec §E.7. `self_test` also runs the
+/// write-tracking self test, which needs root and a loop device of its own;
+/// the automatic choice runs it when a backup starts, a plan does not.
+#[must_use]
+pub fn support(src: &SourceLayout, opts: &SnapshotOpts, self_test: bool) -> Support {
+    let refusal = refusal(src, opts).or_else(|| self_test.then(self_test_refusal).flatten());
+    match refusal {
+        Some(reason) => Support::No(reason),
+        None => Support::Yes,
+    }
 }
 
 /// Why this partition (or device) cannot be copied with tracked-freeze.
@@ -240,13 +309,101 @@ fn refusal(src: &SourceLayout, opts: &SnapshotOpts) -> Option<String> {
     if src.mountpoints.is_empty() {
         return Some("the source is not mounted; the offline provider applies".to_owned());
     }
-    job_writes_refusal(&src.mountpoints, opts).or_else(tracepoint_refusal)
+    job_writes_refusal(&src.mountpoints, opts)
+        .or_else(tracepoint_refusal)
+        .or_else(|| match disk_name(&src.device_facts.name) {
+            Ok(disk) => blk_mq_refusal(&disk),
+            Err(error) => Some(format!(
+                "the disk of {} is not in sysfs: {error}",
+                src.device.display()
+            )),
+        })
+}
+
+/// Whether a request opts in to tracked-freeze (spec §E step 4, §M.4): an
+/// explicit `--snapshot tracked-freeze`, or the automatic choice with
+/// `--allow-freeze`.
+#[must_use]
+pub fn opted_in(opts: &SnapshotOpts) -> bool {
+    match opts.provider.as_deref() {
+        Some(ID) => true,
+        None | Some("auto") => opts.allow_freeze,
+        Some(_) => false,
+    }
 }
 
 /// Opt-in check shared by the partition and the whole-disk routes.
 pub fn opt_in_refusal(opts: &SnapshotOpts) -> Option<String> {
-    (opts.provider.as_deref() != Some(ID))
-        .then(|| format!("tracked-freeze is opt-in; pass --snapshot {ID}"))
+    (!opted_in(opts)).then(|| {
+        format!("tracked-freeze is opt-in; pass --snapshot {ID}, or --allow-freeze with auto")
+    })
+}
+
+/// The kernel name of the disk a block device belongs to: its parent for a
+/// partition, itself otherwise.
+fn disk_name(name: &str) -> Result<String> {
+    let class = lr_core::sysfs::sysfs_root().join("class/block").join(name);
+    if !class.join("partition").exists() {
+        return if class.exists() {
+            Ok(name.to_owned())
+        } else {
+            Err(Error::unsupported(format!(
+                "{} is missing",
+                class.display()
+            )))
+        };
+    }
+    let real = std::fs::canonicalize(&class).map_err(Error::Io)?;
+    real.parent()
+        .and_then(Path::file_name)
+        .map(|disk| disk.to_string_lossy().into_owned())
+        .ok_or_else(|| Error::corrupt("a partition without a parent disk in sysfs"))
+}
+
+/// Why a disk cannot report write completions: only a blk-mq (request-based)
+/// device does, and the copy tracks completions (spec §E.7 preconditions).
+fn blk_mq_refusal(disk: &str) -> Option<String> {
+    let mq = lr_core::sysfs::sysfs_root()
+        .join("class/block")
+        .join(disk)
+        .join("mq");
+    (!mq.is_dir()).then(|| {
+        format!("{disk} is not a blk-mq device, so its write completions cannot be tracked")
+    })
+}
+
+/// Why write tracking cannot be trusted on this kernel, found by running the
+/// self test on a private loop device (spec §E.7 preconditions). The
+/// automatic choice runs it before it settles on tracked-freeze.
+#[must_use]
+pub fn self_test_refusal() -> Option<String> {
+    let Some(tracefs) = tracking::tracefs_root() else {
+        return Some("tracefs is not mounted".to_owned());
+    };
+    match run_self_test(&tracefs) {
+        Ok(test) if test.passed() => None,
+        Ok(test) => Some(format!(
+            "the write-tracking self test failed on this kernel: {test:?}"
+        )),
+        Err(error) => Some(format!(
+            "the write-tracking self test could not run: {error}"
+        )),
+    }
+}
+
+/// The self test, with its loop image on a tmpfs: never on a filesystem that
+/// could be a source.
+fn run_self_test(tracefs: &Path) -> Result<tracking::SelfTest> {
+    let workdir = Path::new(RUNTIME_DIR);
+    std::fs::create_dir_all(workdir).map_err(Error::Io)?;
+    let dir = lr_unsafe::open_dir_readonly(workdir).map_err(Error::Io)?;
+    if lr_unsafe::filemeta::filesystem_type(&dir).map_err(Error::Io)? != TMPFS_MAGIC {
+        return Err(Error::unsupported(format!(
+            "{RUNTIME_DIR} is not a tmpfs; the write-tracking self test needs one"
+        )));
+    }
+    drop(dir);
+    tracking::self_test(tracefs, workdir)
 }
 
 /// Why this kernel cannot track writes, if it cannot.
@@ -647,28 +804,22 @@ struct Checked {
 impl TrackedCopy {
     /// Everything `start` checks before anything is traced or frozen; the
     /// backup plan runs the same checks ([`plan_disk`], [`plan_partition`]).
-    fn check(disk: &Path, specs: &[RegionSpec], opts: &SnapshotOpts) -> Result<Checked> {
+    fn check(
+        disk: &Path,
+        specs: &[RegionSpec],
+        opts: &SnapshotOpts,
+    ) -> std::result::Result<Checked, Refusal> {
         use std::os::unix::fs::MetadataExt as _;
         if specs.is_empty() {
-            return Err(Error::unsupported(
-                "a tracked copy needs at least one region",
-            ));
+            return Err(Error::unsupported("a tracked copy needs at least one region").into());
         }
-        let tracefs =
-            tracking::tracefs_root().ok_or_else(|| Error::unsupported("tracefs is not mounted"))?;
+        let tracefs = tracking::tracefs_root()
+            .ok_or_else(|| Refusal::Precondition("tracefs is not mounted".to_owned()))?;
         let whole = device_number(disk)?;
         let disk_name = lr_core::sysfs::device_name(disk).map_err(Error::Io)?;
         // Completions are tracked per request: a bio-based driver reports none.
-        if !lr_core::sysfs::sysfs_root()
-            .join("class/block")
-            .join(&disk_name)
-            .join("mq")
-            .is_dir()
-        {
-            return Err(refused(&format!(
-                "{} is not a blk-mq device, so its write completions cannot be tracked",
-                disk.display()
-            )));
+        if let Some(reason) = blk_mq_refusal(&disk_name) {
+            return Err(Refusal::Precondition(reason));
         }
 
         // How each region is held, and the filesystems to freeze.
@@ -683,7 +834,7 @@ impl TrackedCopy {
                     Hold::Frozen(mountpoints.len() - 1)
                 }
                 (Some(mountpoint), fs_type) => {
-                    return Err(refused(&format!(
+                    return Err(Refusal::Precondition(format!(
                         "{} ({fs_type}) is mounted and tracked-freeze cannot hold it; \
                          unmount it or back it up separately",
                         mountpoint.display()
@@ -713,7 +864,7 @@ impl TrackedCopy {
         }
         let mountpoints = sorted;
         if let Some(reason) = job_writes_refusal(&mountpoints, opts) {
-            return Err(refused(&reason));
+            return Err(Refusal::Precondition(reason));
         }
         let freeze_max = freeze_max(opts)?;
         // Hooks run as root: unsafe ones refuse the job before tracing starts.
@@ -752,20 +903,9 @@ impl TrackedCopy {
             freeze_max,
             hooks,
             holds_dpkg,
-        } = Self::check(disk, &specs, opts)?;
+        } = Self::check(disk, &specs, opts).map_err(Refusal::into_error)?;
 
-        // The self test writes its own loop image; it must live on a tmpfs,
-        // never on a filesystem that could be the source.
-        let workdir = Path::new(RUNTIME_DIR);
-        std::fs::create_dir_all(workdir).map_err(Error::Io)?;
-        let dir = lr_unsafe::open_dir_readonly(workdir).map_err(Error::Io)?;
-        if lr_unsafe::filemeta::filesystem_type(&dir).map_err(Error::Io)? != TMPFS_MAGIC {
-            return Err(Error::unsupported(format!(
-                "{RUNTIME_DIR} is not a tmpfs; the write-tracking self test needs one"
-            )));
-        }
-        drop(dir);
-        let self_test = tracking::self_test(&tracefs, workdir)?;
+        let self_test = run_self_test(&tracefs)?;
         if !self_test.passed() {
             return Err(Error::TrackingLost {
                 reason: format!(
@@ -1268,15 +1408,213 @@ mod tests {
         }
     }
 
+    /// Opt-in (spec §E step 4, §M.4): by name, or `auto` with
+    /// `--allow-freeze`; never `auto` alone or another provider's name.
     #[test]
     fn it_is_opt_in() {
         let reason = refusal(&mounted_ext4(), &SnapshotOpts::default()).expect("refused");
         assert!(reason.contains("opt-in"), "{reason}");
-        let auto = SnapshotOpts {
+        let other = SnapshotOpts {
+            provider: Some("freeze".to_owned()),
             allow_freeze: true,
             ..SnapshotOpts::default()
         };
-        assert!(refusal(&mounted_ext4(), &auto).is_some());
+        assert!(!opted_in(&other));
+        for provider in [None, Some("auto".to_owned())] {
+            let auto = SnapshotOpts {
+                provider,
+                allow_freeze: true,
+                ..SnapshotOpts::default()
+            };
+            assert!(opted_in(&auto));
+            // Opted in, and refused for what it lacks (here a destination).
+            let reason = refusal(&mounted_ext4(), &auto).expect("no destination");
+            assert!(!reason.contains("opt-in"), "{reason}");
+        }
+        assert!(opted_in(&forced()));
+    }
+
+    /// Format files recorded from real kernels (`tests/fixtures/trace`).
+    const QUEUE_FORMAT: &str = include_str!(
+        "../tests/fixtures/trace/block_bio_queue-6.18.58.1-microsoft-standard-WSL2.format"
+    );
+    const COMPLETE_FORMAT: &str =
+        include_str!("../tests/fixtures/trace/block_rq_complete-6.8.0-138-generic.format");
+
+    /// What a fixture kernel's tracefs offers.
+    #[derive(Clone, Copy)]
+    enum Tracefs {
+        Missing,
+        WithoutQueue,
+        WithoutCompletion,
+        UnknownLayout,
+        Complete,
+    }
+
+    /// A fixture kernel: a tracefs tree (`LR_TRACEFS_ROOT`) and a sysfs
+    /// tree (`LR_SYSFS_ROOT`) with the disk `lrfx` and its partition `lrfx2`.
+    fn fixture_kernel(tracefs: Tracefs, blk_mq: bool) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("fixture");
+        let tracing = dir.path().join("tracing");
+        std::fs::create_dir_all(&tracing).expect("tracing");
+        let event = |name: &str, format: &str| {
+            let path = tracing.join("events").join(name);
+            std::fs::create_dir_all(&path).expect("event");
+            std::fs::write(path.join("format"), format).expect("format");
+        };
+        if !matches!(tracefs, Tracefs::Missing) {
+            std::fs::create_dir_all(tracing.join("instances")).expect("instances");
+        }
+        match tracefs {
+            Tracefs::Missing => {}
+            Tracefs::WithoutQueue => event(tracking::COMPLETION_TRACEPOINT, COMPLETE_FORMAT),
+            Tracefs::WithoutCompletion => event(tracking::TRACEPOINT, QUEUE_FORMAT),
+            Tracefs::UnknownLayout => {
+                event(
+                    tracking::TRACEPOINT,
+                    &QUEUE_FORMAT.replace("print fmt: \"", "print fmt: \"queued "),
+                );
+                event(tracking::COMPLETION_TRACEPOINT, COMPLETE_FORMAT);
+            }
+            Tracefs::Complete => {
+                event(tracking::TRACEPOINT, QUEUE_FORMAT);
+                event(tracking::COMPLETION_TRACEPOINT, COMPLETE_FORMAT);
+            }
+        }
+        let sys = dir.path().join("sys");
+        let disk = sys.join("devices/virtual/block/lrfx");
+        std::fs::create_dir_all(disk.join("lrfx2")).expect("partition");
+        std::fs::write(disk.join("lrfx2/partition"), "2\n").expect("partition file");
+        if blk_mq {
+            std::fs::create_dir_all(disk.join("mq/0")).expect("mq");
+        }
+        let class = sys.join("class/block");
+        std::fs::create_dir_all(&class).expect("class");
+        std::os::unix::fs::symlink("../../devices/virtual/block/lrfx", class.join("lrfx"))
+            .expect("disk link");
+        std::os::unix::fs::symlink(
+            "../../devices/virtual/block/lrfx/lrfx2",
+            class.join("lrfx2"),
+        )
+        .expect("partition link");
+        dir
+    }
+
+    /// Slice 18 AC (e): on a kernel without tracefs, without either
+    /// tracepoint, with a tracepoint layout the parser does not know, or with
+    /// a disk that is not blk-mq, the probe says `Support::No` with the
+    /// reason and `auto` with `--allow-freeze` takes the next step instead.
+    /// Each case runs in a child process that sees only its fixture.
+    #[test]
+    fn the_probe_refuses_a_kernel_that_cannot_track_writes() {
+        let cases = [
+            (Tracefs::Missing, true, "tracefs is not mounted"),
+            (
+                Tracefs::WithoutQueue,
+                true,
+                "the block/block_bio_queue tracepoint is unavailable",
+            ),
+            (
+                Tracefs::WithoutCompletion,
+                true,
+                "the block/block_rq_complete tracepoint is unavailable",
+            ),
+            (Tracefs::UnknownLayout, true, "unrecognised print format"),
+            (
+                Tracefs::Complete,
+                false,
+                "lrfx is not a blk-mq device, so its write completions cannot be tracked",
+            ),
+            // The control: the same fixture with nothing missing.
+            (Tracefs::Complete, true, "selected"),
+        ];
+        let exe = std::env::current_exe().expect("test binary");
+        for (tracefs, blk_mq, expect) in cases {
+            let kernel = fixture_kernel(tracefs, blk_mq);
+            let output = std::process::Command::new(&exe)
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "tracked_freeze::tests::fixture_kernel_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("LR_TRACEFS_ROOT", kernel.path().join("tracing"))
+                .env("LR_SYSFS_ROOT", kernel.path().join("sys"))
+                .env("LR_FIXTURE_EXPECT", expect)
+                .output()
+                .expect("child");
+            let log = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.status.success(), "{expect}:\n{log}");
+            assert!(
+                log.contains("1 passed"),
+                "{expect}: the child did not run:\n{log}"
+            );
+        }
+    }
+
+    /// Child process for [`the_probe_refuses_a_kernel_that_cannot_track_writes`].
+    #[test]
+    #[ignore = "internal helper for the fixture-kernel probe test"]
+    fn fixture_kernel_child() {
+        let Ok(expect) = std::env::var("LR_FIXTURE_EXPECT") else {
+            return;
+        };
+        let mut layout = test_layout::offline("/dev/lrfx2");
+        layout.mountpoints = vec![PathBuf::from("/srv/lr-fixture")];
+        // A remote destination: whatever this host mounts at `/`, the job's
+        // own writes never reach a filesystem it would freeze.
+        let named = SnapshotOpts {
+            provider: Some(ID.to_owned()),
+            destination_remote: true,
+            ..SnapshotOpts::default()
+        };
+        let auto = SnapshotOpts {
+            allow_freeze: true,
+            destination_remote: true,
+            ..SnapshotOpts::default()
+        };
+        let support = provider().supports(&layout, &named);
+        let decision = crate::probe::decide(&layout, &auto, crate::probe::Stage::Plan)
+            .expect("a decision for a mounted non-root filesystem");
+        if expect == "selected" {
+            assert_eq!(support, Support::Yes);
+            assert_eq!(decision.provider, ID);
+            assert_eq!(decision.consistency, Consistency::Frozen);
+            assert_eq!(decision.tracked_refusal, None);
+            return;
+        }
+        match support {
+            Support::No(reason) => assert!(reason.contains(&expect), "{reason}"),
+            Support::Yes => panic!("{expect}: the probe accepted the fixture kernel"),
+        }
+        // Not tracked-freeze: the next step, the whole-read freeze, with the
+        // reason among the warnings.
+        assert_eq!(decision.provider, crate::probe::PROVIDER_FREEZE);
+        assert!(
+            decision
+                .tracked_refusal
+                .as_deref()
+                .is_some_and(|reason| reason.contains(&expect)),
+            "{decision:?}"
+        );
+        assert!(
+            decision
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(&expect)),
+            "{decision:?}"
+        );
+        // The root cannot be frozen for the whole read: no method, and the
+        // refusal names the reason.
+        layout.mountpoints = vec![PathBuf::from("/")];
+        let error = crate::probe::decide(&layout, &auto, crate::probe::Stage::Plan)
+            .expect_err("the running root has no other consistent method");
+        assert!(error.to_string().contains(&expect), "{error}");
     }
 
     #[test]
@@ -1427,6 +1765,7 @@ mod tests {
             freeze_max: Duration::from_secs(3),
             pre_freeze_hooks: 0,
             post_thaw_hooks: 0,
+            automatic: false,
         };
         let notes = plan.notes().join("\n");
         assert!(
@@ -1454,6 +1793,16 @@ mod tests {
             "{notes}"
         );
         assert!(!notes.contains("cannot be frozen"), "{notes}");
+        // The automatic choice moves on where the self test fails.
+        let automatic = TrackedPlan {
+            automatic: true,
+            ..hooked
+        };
+        let notes = automatic.notes().join("\n");
+        assert!(
+            notes.contains("the automatic choice goes on to the next method"),
+            "{notes}"
+        );
     }
 
     /// `freeze_max` is its own budget (3 s by default, at most 30 s); the

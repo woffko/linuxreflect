@@ -74,7 +74,8 @@ impl ImageKind {
 pub struct SnapshotOpts {
     /// Explicit provider override from `--snapshot`.
     pub provider: Option<String>,
-    /// Allow the freeze provider (writers are blocked for the whole read).
+    /// Allow a freeze: tracked-freeze under the automatic choice (spec §E
+    /// step 4), or the freeze provider (writers are blocked for the whole read).
     pub allow_freeze: bool,
     /// Freeze timeout in seconds; the provider defaults to 300 s.
     pub freeze_timeout_secs: Option<u64>,

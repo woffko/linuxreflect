@@ -26,6 +26,9 @@ pub enum Step {
     Snapshot(String),
     /// Set tracked-freeze's longest pause in seconds, 1 to 30.
     FreezeMax(i32),
+    /// Consent to a freeze (`allow-freeze on|off`): the freeze provider's, or
+    /// the automatic choice's live copy with tracked-freeze.
+    AllowFreeze(bool),
     /// Enable backup encryption using an existing protected passphrase file.
     BackupPassphraseFile(String),
     /// Choose the restore passphrase file, invalidating any prepared plan.
@@ -125,6 +128,16 @@ pub fn parse(text: &str) -> Result<Vec<Step>, Error> {
                         ))
                     })?,
             ),
+            "allow-freeze" => Step::AllowFreeze(match need(argument)?.as_str() {
+                "on" => true,
+                "off" => false,
+                other => {
+                    return Err(Error::corrupt(format!(
+                        "line {}: allow-freeze takes on or off, not `{other}`",
+                        number + 1
+                    )));
+                }
+            }),
             "backup-passphrase-file" => Step::BackupPassphraseFile(need(argument)?),
             "restore-passphrase-file" => Step::RestorePassphraseFile(need(argument)?),
             "image" => Step::Image(need(argument)?),
@@ -314,6 +327,16 @@ mod tests {
             let error = parse(wrong).expect_err("out of range");
             assert!(format!("{error}").contains("1 to 30 seconds"), "{error}");
         }
+        assert_eq!(
+            parse("snapshot auto\nallow-freeze on\nallow-freeze off\n").expect("consent"),
+            vec![
+                Step::Snapshot("auto".to_owned()),
+                Step::AllowFreeze(true),
+                Step::AllowFreeze(false)
+            ]
+        );
+        let error = parse("allow-freeze yes").expect_err("not on or off");
+        assert!(format!("{error}").contains("on or off"), "{error}");
     }
 
     #[test]

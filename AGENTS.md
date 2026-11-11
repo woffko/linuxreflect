@@ -19,7 +19,11 @@ plan's shared-UUID warning (D-139), `--freeze-max`, the pre-freeze/post-thaw
 hooks (D-140), a sweep of dead jobs' trace instances, a read-only convergence
 rate, a root test of a live job through the daemon, a truthful `PlanBackup`
 for a live whole disk, the wizard's tracked-freeze option and a GUI root test
-of a live backup and restore. Incremental members and a GUI run inside a VM
+of a live backup and restore. The automatic choice follows spec §E step 4
+(`auto` with `--allow-freeze` chooses tracked-freeze when its preconditions
+hold, D-141), and the Slice 18 AC (c) and (e) tests that were missing exist
+(`--freeze-max` exceeded, a partition table changed mid-job, fixture kernels
+without tracking). Incremental members and a GUI run inside a VM
 that boots the restored disk are not done yet.
 
 The MVP is slices S1–S11 (spec §K). Slices are landed one pull request each.

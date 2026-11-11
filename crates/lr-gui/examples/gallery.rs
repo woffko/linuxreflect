@@ -112,18 +112,30 @@ const SCENES: &[Scene] = &[
         ui.set_backup_plan_error(
             "No consistent imaging method is available for this source with the selected settings. \
              For an image of the running system disk on Debian or Ubuntu with ext4, open Backup \
-             options and choose Consistency: tracked-freeze; otherwise boot rescue media and back \
-             it up offline. To test the GUI now, go Back to Source, choose a small local folder, \
-             and keep your network folder as Destination. A second local drive is not required."
+             options and allow a live copy (Consistency: auto), or choose tracked-freeze; \
+             otherwise boot rescue media and back it up offline. To test the GUI now, go Back to \
+             Source, choose a small local folder, and keep your network folder as Destination. A \
+             second local drive is not required."
                 .into(),
         );
         ui.set_backup_plan_error_details(
             "E_NO_CONSISTENT_METHOD: offline read refused: a partition is mounted or in use; \
-             unmount every partition of the disk, then retry; boot rescue media (offline)"
+             unmount every partition of the disk, then retry; boot rescue media (offline); pass \
+             --allow-freeze to copy it live with tracked-freeze"
                 .into(),
         );
         ui.set_show_backup_plan_error_details(true);
         ui.set_status("Backup planning failed. See the message in the wizard.".into());
+    }),
+    // Spec §E step 4: the automatic choice with the live-copy consent.
+    ("backup-live-auto", |ui| {
+        ui.set_current_tab(1);
+        ui.set_backup_step(1);
+        ui.set_source("/dev/nvme0n1".into());
+        ui.set_destination("/media/backup-drive/LinuxReflect".into());
+        ui.set_backup_set("workstation".into());
+        ui.set_advanced_backup(true);
+        ui.set_allow_freeze(true);
     }),
     ("backup-live-system", |ui| {
         ui.set_current_tab(1);

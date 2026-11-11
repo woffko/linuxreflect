@@ -19,7 +19,9 @@ pub(crate) fn backup_spec(ui: &MainWindow) -> BackupSpec {
             "latest".into()
         },
         member_type,
-        allow_freeze: snapshot == "freeze" && ui.get_allow_freeze(),
+        // The consent also lets the automatic choice copy a mounted ext4
+        // live with tracked-freeze (spec §E step 4).
+        allow_freeze: (snapshot == "freeze" || snapshot == "auto") && ui.get_allow_freeze(),
         freeze_max_secs: if snapshot == "tracked-freeze" {
             u64::try_from(ui.get_freeze_max()).unwrap_or(0)
         } else {

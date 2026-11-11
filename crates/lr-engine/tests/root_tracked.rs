@@ -86,14 +86,22 @@ fn prerequisites() -> bool {
     true
 }
 
-/// A GPT loop disk whose second partition holds a mounted ext4.
+/// A GPT loop disk with a mounted ext4 on one of its partitions.
 struct Source {
     dir: tempfile::TempDir,
     device: String,
+    /// The partition that holds the ext4.
+    part: u32,
 }
 
 impl Source {
+    /// A 16 MiB partition without a filesystem, then the ext4.
     fn create() -> Option<Self> {
+        Self::create_with("label: gpt\nstart=2048, size=16MiB\n,\n", 2)
+    }
+
+    /// `layout` for `sfdisk`, with the ext4 on partition `part`.
+    fn create_with(layout: &str, part: u32) -> Option<Self> {
         let dir = tempfile::tempdir().expect("dir");
         let image = dir.path().join("disk.img");
         std::fs::File::create(&image)
@@ -109,7 +117,7 @@ impl Source {
             .stdin
             .take()
             .expect("stdin")
-            .write_all(b"label: gpt\nstart=2048, size=16MiB\n,\n")
+            .write_all(layout.as_bytes())
             .expect("layout");
         if !sfdisk.wait().expect("sfdisk").success() {
             lr_testkit::fixture_failed!("sfdisk failed");
@@ -123,7 +131,7 @@ impl Source {
             lr_testkit::fixture_failed!("losetup failed");
         }
         let device = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let source = Self { dir, device };
+        let source = Self { dir, device, part };
         let _ = run("blockdev", &["--rereadpt", &source.device]);
         for _ in 0..100 {
             if Path::new(&source.partition()).exists() {
@@ -148,7 +156,7 @@ impl Source {
     }
 
     fn partition(&self) -> String {
-        format!("{}p2", self.device)
+        format!("{}p{}", self.device, self.part)
     }
 
     fn mountpoint(&self) -> PathBuf {
@@ -157,11 +165,12 @@ impl Source {
 
     fn partition_bytes(&self) -> u64 {
         let name = format!(
-            "{}p2",
+            "{}p{}",
             Path::new(&self.device)
                 .file_name()
                 .expect("name")
-                .to_string_lossy()
+                .to_string_lossy(),
+            self.part
         );
         let sectors: u64 =
             std::fs::read_to_string(Path::new("/sys/class/block").join(name).join("size"))
@@ -1374,4 +1383,429 @@ fn a_busy_esp_is_copied_consistently_or_refused() {
         Ok(other) => panic!("expected a whole-disk image, got {other:?}"),
     }
     assert_eq!(trace_leftovers(), 0, "a trace instance was left behind");
+}
+
+/// Spec §E step 4 (D-141): `auto` with `--allow-freeze` chooses tracked-freeze
+/// for a mounted ext4 partition and for a disk in use, and the plan says so
+/// first. Without the consent nothing live is chosen and the refusal names
+/// the option; a precondition that does not hold is named in the refusal.
+#[test]
+#[ignore = "requires root, loop devices, tracefs and fsfreeze"]
+fn the_automatic_choice_with_allow_freeze_copies_live() {
+    if !root_tests_enabled() || !prerequisites() {
+        return;
+    }
+    let Some(disk) = SystemDisk::create() else {
+        return;
+    };
+    let work = tempfile::tempdir().expect("work");
+    let automatic = |source: &str, dest: &Path, allow_freeze: bool| {
+        let mut request = request(source, dest);
+        request.snapshot_provider = None;
+        request.allow_freeze = allow_freeze;
+        request.hooks_dir = Some(work.path().join("no-hooks"));
+        request
+    };
+    let plan_of = |request: &BackupRequest| {
+        lr_engine::plan_backup(
+            request,
+            lr_engine::options::Mode::Auto,
+            &lr_engine::FileBackupOptions::default(),
+        )
+    };
+
+    // A mounted ext4 partition.
+    let partition = automatic(&disk.partition(2), &work.path().join("partition"), true);
+    let plan = plan_of(&partition).expect("a plan for the mounted partition");
+    assert_eq!(plan.provider, "tracked-freeze");
+    assert_eq!(plan.consistency, lr_core::Consistency::Frozen);
+    let notes = plan.warnings.join("\n");
+    assert!(
+        notes.contains("the automatic choice goes on to the next method"),
+        "{notes}"
+    );
+    let report = backup_image(&partition).expect("a live partition copy");
+    let ImageReport::Block(report) = &report else {
+        panic!("expected a block image");
+    };
+    assert_eq!(report.consistency, lr_core::Consistency::Frozen);
+    assert!(report.tracked.is_some(), "not copied with tracked-freeze");
+
+    // The whole disk in use.
+    let whole = automatic(&disk.device, &work.path().join("disk"), true);
+    let plan = plan_of(&whole).expect("a plan for the disk in use");
+    assert_eq!(plan.provider, "tracked-freeze");
+    let report = backup_image(&whole).expect("a live whole-disk copy");
+    let ImageReport::WholeDisk(report) = &report else {
+        panic!("expected a whole-disk image");
+    };
+    assert!(report.tracked.is_some(), "not copied with tracked-freeze");
+    for region in &report.regions {
+        assert_eq!(
+            region.consistency,
+            lr_core::Consistency::Frozen,
+            "{region:?}"
+        );
+    }
+
+    // Without the consent: refused before anything is traced or frozen.
+    let refused = work.path().join("refused");
+    for source in [disk.partition(2), disk.device.clone()] {
+        let unconsented = automatic(&source, &refused, false);
+        let error = plan_of(&unconsented).expect_err("no live copy without the consent");
+        assert!(
+            error.to_string().contains("--allow-freeze to copy"),
+            "{error}"
+        );
+        let error = backup_image(&unconsented).expect_err("no live copy without the consent");
+        assert!(
+            matches!(error, lr_core::Error::NoConsistentMethod { .. }),
+            "{error}"
+        );
+    }
+    // A precondition that does not hold is named: the destination on the
+    // filesystem the copy would freeze.
+    let on_root = automatic(&disk.device, &disk.root().join("backups"), true);
+    let error = backup_image(&on_root).expect_err("a destination on a frozen filesystem");
+    assert!(
+        error
+            .to_string()
+            .contains("tracked-freeze cannot copy it live: the destination"),
+        "{error}"
+    );
+    assert!(images_under(&refused).is_empty(), "an image was published");
+    assert_eq!(trace_leftovers(), 0, "a trace instance was left behind");
+    assert!(
+        writable_within(&disk.root(), Duration::from_secs(5)),
+        "the source stayed frozen"
+    );
+}
+
+/// A loop disk whose image lives on an ext4 over `dm-delay`, so a test can
+/// slow the source's reads at a moment it chooses. The loop disk reads its
+/// image with direct I/O, so no page cache hides the delay.
+struct SlowSource {
+    dir: tempfile::TempDir,
+    /// The loop device under the delay target.
+    outer: String,
+    sectors: u64,
+    /// The delay target's name.
+    delay: String,
+    /// The loop disk with the mounted ext4 on its first partition.
+    device: String,
+    mounted_outer: bool,
+    mounted: bool,
+}
+
+impl SlowSource {
+    fn create() -> Option<Self> {
+        if !have("dmsetup") {
+            lr_testkit::unavailable!(return None; "dmsetup missing");
+        }
+        let has_delay = || {
+            Command::new("dmsetup")
+                .arg("targets")
+                .output()
+                .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("delay"))
+        };
+        if !has_delay() {
+            let _ = run("modprobe", &["dm-delay"]);
+            if !has_delay() {
+                lr_testkit::unavailable!(return None; "the dm-delay target is unavailable");
+            }
+        }
+        let mut source = Self {
+            dir: tempfile::tempdir().expect("dir"),
+            outer: String::new(),
+            sectors: 0,
+            delay: format!("lr-delay-{}", std::process::id()),
+            device: String::new(),
+            mounted_outer: false,
+            mounted: false,
+        };
+        let outer_image = source.dir.path().join("outer.img");
+        std::fs::File::create(&outer_image)
+            .and_then(|f| f.set_len(256 << 20))
+            .expect("outer image");
+        source.outer = attach(&["--find", "--show"], &outer_image);
+        let sectors = Command::new("blockdev")
+            .args(["--getsz", &source.outer])
+            .output()
+            .expect("blockdev");
+        source.sectors = String::from_utf8_lossy(&sectors.stdout)
+            .trim()
+            .parse()
+            .expect("sectors");
+        if !run(
+            "dmsetup",
+            &["create", &source.delay, "--table", &source.table(0)],
+        ) {
+            source.delay.clear();
+            lr_testkit::fixture_failed!("dmsetup create failed");
+        }
+        let mapper = format!("/dev/mapper/{}", source.delay);
+        let outer_mnt = source.dir.path().join("outer");
+        std::fs::create_dir(&outer_mnt).expect("outer mountpoint");
+        if !run("mkfs.ext4", &["-q", "-F", &mapper])
+            || !run("mount", &[&mapper, &outer_mnt.display().to_string()])
+        {
+            lr_testkit::fixture_failed!("the delayed filesystem could not be made");
+        }
+        source.mounted_outer = true;
+        let image = outer_mnt.join("disk.img");
+        std::fs::File::create(&image)
+            .and_then(|f| f.set_len(96 << 20))
+            .expect("disk image");
+        let mut sfdisk = Command::new("sfdisk")
+            .arg("--quiet")
+            .arg(&image)
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("sfdisk");
+        sfdisk
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(b"label: gpt\nstart=2048, size=64MiB\n")
+            .expect("layout");
+        if !sfdisk.wait().expect("sfdisk").success() {
+            lr_testkit::fixture_failed!("sfdisk failed");
+        }
+        source.device = attach(
+            &["--find", "--show", "--partscan", "--direct-io=on"],
+            &image,
+        );
+        let name = Path::new(&source.device)
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .into_owned();
+        let dio =
+            std::fs::read_to_string(format!("/sys/block/{name}/loop/dio")).unwrap_or_default();
+        if dio.trim() != "1" {
+            lr_testkit::unavailable!(return None; "loop direct I/O is unavailable");
+        }
+        let _ = run("blockdev", &["--rereadpt", &source.device]);
+        for _ in 0..100 {
+            if Path::new(&source.partition()).exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::fs::create_dir(source.mountpoint()).expect("mountpoint");
+        if !run("mkfs.ext4", &["-q", "-F", &source.partition()])
+            || !run(
+                "mount",
+                &[
+                    &source.partition(),
+                    &source.mountpoint().display().to_string(),
+                ],
+            )
+        {
+            lr_testkit::fixture_failed!("the source filesystem could not be made");
+        }
+        source.mounted = true;
+        Some(source)
+    }
+
+    /// The delay table: reads wait `read_ms`, writes do not wait.
+    fn table(&self, read_ms: u32) -> String {
+        format!(
+            "0 {} delay {} 0 {read_ms} {} 0 0",
+            self.sectors, self.outer, self.outer
+        )
+    }
+
+    fn partition(&self) -> String {
+        format!("{}p1", self.device)
+    }
+
+    fn mountpoint(&self) -> PathBuf {
+        self.dir.path().join("src")
+    }
+}
+
+impl Drop for SlowSource {
+    // Each layer is released only once the one above it is gone: a loop
+    // device detaches asynchronously, and the filesystem under it stays busy
+    // until it has.
+    fn drop(&mut self) {
+        if !self.delay.is_empty() {
+            let _ = run("dmsetup", &["suspend", &self.delay]);
+            let _ = run("dmsetup", &["load", &self.delay, "--table", &self.table(0)]);
+            let _ = run("dmsetup", &["resume", &self.delay]);
+        }
+        if self.mounted {
+            let _ = run("umount", &[&self.mountpoint().display().to_string()]);
+        }
+        if !self.device.is_empty() {
+            let _ = run("losetup", &["--detach", &self.device]);
+            let name = Path::new(&self.device)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let backing = PathBuf::from(format!("/sys/block/{name}/loop/backing_file"));
+            let image = self.dir.path().join("outer/disk.img");
+            until(|| {
+                std::fs::read_to_string(&backing)
+                    .map_or(true, |file| !file.contains(&image.display().to_string()))
+            });
+        }
+        if self.mounted_outer {
+            let outer = self.dir.path().join("outer").display().to_string();
+            until(|| run("umount", &[&outer]));
+        }
+        if !self.delay.is_empty() {
+            until(|| run("dmsetup", &["remove", &self.delay]));
+        }
+        if !self.outer.is_empty() {
+            let _ = run("losetup", &["--detach", &self.outer]);
+        }
+    }
+}
+
+/// Retry `done` for up to ten seconds.
+fn until(mut done: impl FnMut() -> bool) {
+    for _ in 0..100 {
+        if done() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// `losetup` with `args`, attaching `image`; the new device.
+fn attach(args: &[&str], image: &Path) -> String {
+    let output = Command::new("losetup")
+        .args(args)
+        .arg(image)
+        .output()
+        .expect("losetup");
+    if !output.status.success() {
+        lr_testkit::fixture_failed!(
+            "losetup failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+/// Slice 18 AC (c): a final read that outlasts `--freeze-max` thaws first
+/// and then fails with `E_FREEZE_TIMEOUT`, publishing nothing. The
+/// pre-freeze hook writes 8 MiB, which the final read must read, and slows
+/// the source's reads to 250 ms each underneath its loop disk; the
+/// post-thaw hook lifts the delay. The deadman (31 s) never has to act.
+#[test]
+#[ignore = "requires root, loop devices, dm-delay, tracefs and fsfreeze"]
+fn a_final_read_longer_than_freeze_max_thaws_first_and_publishes_nothing() {
+    if !root_tests_enabled() || !prerequisites() {
+        return;
+    }
+    let Some(source) = SlowSource::create() else {
+        return;
+    };
+    let work = tempfile::tempdir().expect("work");
+    let (root, pre, post) = hooks_dir(work.path(), "hooks");
+    let dm = |read_ms: u32| {
+        format!(
+            "dmsetup suspend {name} && dmsetup load {name} --table '{table}' && dmsetup resume {name}",
+            name = source.delay,
+            table = source.table(read_ms)
+        )
+    };
+    hook(
+        &pre,
+        "10-slow-reads",
+        0o755,
+        &format!(
+            "set -e\n\
+             for fs in $LINUXREFLECT_FILESYSTEMS; do\n\
+             dd if=/dev/urandom of=\"$fs/burst\" bs=1M count=8 oflag=direct conv=fsync status=none\n\
+             done\n\
+             {}",
+            dm(250)
+        ),
+    );
+    let lifted = work.path().join("lifted");
+    hook(
+        &post,
+        "10-fast-reads",
+        0o755,
+        &format!("{} && touch {}", dm(0), lifted.display()),
+    );
+    let dest = work.path().join("backups");
+    let mut slow = request(&source.partition(), &dest);
+    slow.hooks_dir = Some(root);
+    slow.tracked_tuning.freeze_max_secs = Some(1);
+    slow.deadman_grace_secs = Some(30);
+    let started = Instant::now();
+    let error = backup_image(&slow).expect_err("a final read past --freeze-max must fail");
+    let failed_after = started.elapsed();
+    // Thawed before the error came back: a write completes at once.
+    assert!(
+        writable_within(&source.mountpoint(), Duration::from_secs(2)),
+        "the source was still frozen when E_FREEZE_TIMEOUT came back"
+    );
+    assert!(
+        matches!(error, lr_core::Error::FreezeTimeout),
+        "expected E_FREEZE_TIMEOUT, got {error}"
+    );
+    assert!(
+        failed_after < Duration::from_secs(31),
+        "the deadman, not the copy, ended the freeze ({failed_after:?})"
+    );
+    assert!(lifted.exists(), "the post-thaw hook did not run");
+    assert!(images_under(&dest).is_empty(), "an image was published");
+    assert_eq!(trace_leftovers(), 0, "a trace instance was left behind");
+}
+
+/// Slice 18 AC (c): a partition table changed mid-job fails the copy with
+/// `E_SOURCE_CHANGED` and publishes nothing. The pre-freeze hook appends a
+/// partition to the disk being copied (the kernel keeps its old view while a
+/// partition is mounted, so only the on-disk table changes).
+#[test]
+#[ignore = "requires root, loop devices, tracefs and fsfreeze"]
+fn a_partition_table_changed_mid_job_publishes_nothing() {
+    if !root_tests_enabled() || !prerequisites() {
+        return;
+    }
+    // One ext4 partition and free space after it.
+    let Some(source) = Source::create_with("label: gpt\nstart=2048, size=128MiB\n", 1) else {
+        return;
+    };
+    let work = tempfile::tempdir().expect("work");
+    let (root, pre, _post) = hooks_dir(work.path(), "hooks");
+    let table_before = layout_of(&source.device);
+    hook(
+        &pre,
+        "10-repartition",
+        0o755,
+        &format!(
+            "echo ',16MiB' | sfdisk --quiet --append --no-reread {} > /dev/null 2>&1 || true",
+            source.device
+        ),
+    );
+    let dest = work.path().join("backups");
+    let mut changing = whole_disk_request(&source.device, &dest);
+    changing.hooks_dir = Some(root);
+    let error = backup_image(&changing).expect_err("a changed partition table must fail");
+    assert_ne!(
+        layout_of(&source.device),
+        table_before,
+        "the hook did not change the partition table"
+    );
+    assert!(
+        matches!(error, lr_core::Error::SourceChanged { .. }),
+        "expected E_SOURCE_CHANGED, got {error}"
+    );
+    assert!(
+        error.to_string().contains("partition table changed"),
+        "{error}"
+    );
+    assert!(images_under(&dest).is_empty(), "an image was published");
+    assert_eq!(trace_leftovers(), 0, "a trace instance was left behind");
+    assert!(
+        writable_within(&source.mountpoint(), Duration::from_secs(5)),
+        "the source stayed frozen"
+    );
 }

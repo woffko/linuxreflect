@@ -667,15 +667,20 @@ fn instance_owner(name: &str) -> Option<u32> {
         .ok()
 }
 
-/// The tracefs mount point: `LR_TRACEFS_ROOT` for tests, else
-/// `/sys/kernel/tracing`, else the legacy `/sys/kernel/debug/tracing`.
+/// The tracefs mount point: `/sys/kernel/tracing`, else the legacy
+/// `/sys/kernel/debug/tracing`, whichever has `instances/`. Tests name a
+/// fixture tree with `LR_TRACEFS_ROOT`; one without `instances/` stands for a
+/// kernel without tracefs.
 pub fn tracefs_root() -> Option<PathBuf> {
-    if let Some(root) = std::env::var_os("LR_TRACEFS_ROOT") {
-        return Some(PathBuf::from(root));
-    }
-    ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"]
+    let candidates = match std::env::var_os("LR_TRACEFS_ROOT") {
+        Some(root) => vec![PathBuf::from(root)],
+        None => vec![
+            PathBuf::from("/sys/kernel/tracing"),
+            PathBuf::from("/sys/kernel/debug/tracing"),
+        ],
+    };
+    candidates
         .into_iter()
-        .map(PathBuf::from)
         .find(|root| root.join("instances").is_dir())
 }
 

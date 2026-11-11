@@ -23,7 +23,18 @@ convergence budget uses the reads' own rate; `PlanBackup` predicts a live
 whole-disk copy (provider, `Frozen`, the filesystems frozen, the budget),
 and the wizard offers tracked-freeze with its longest pause. A root test
 drives the GUI through a live backup and a restore on loop devices
-(`a_mounted_ext4_is_imaged_live_through_the_gui_on_x11`). Still open:
+(`a_mounted_ext4_is_imaged_live_through_the_gui_on_x11`). On 2026-11-11
+the automatic choice was brought in line with spec §E step 4 (D-141): `auto`
+with `--allow-freeze` (in the wizard, Consistency auto with the live-copy
+consent) chooses tracked-freeze when its preconditions hold, the self test
+included at the backup stage, and otherwise the next step with the reason;
+`PlanBackup` predicts the same. The Slice 18 acceptance tests that were
+missing now exist: AC (c) `a_final_read_longer_than_freeze_max_thaws_first_and_publishes_nothing`
+(a `dm-delay` under the loop disk slows the final read) and
+`a_partition_table_changed_mid_job_publishes_nothing`, and AC (e)
+`the_probe_refuses_a_kernel_that_cannot_track_writes` (fixture tracefs and
+sysfs trees: no tracefs, no submission or completion tracepoint, an unknown
+event layout, a disk that is not blk-mq). Still open:
 incremental members, the GUI acceptance inside a VM with a boot of the
 restored disk (phase 4), the
 `--allow-inconsistent` exception for a busy ESP, and phase 5. That

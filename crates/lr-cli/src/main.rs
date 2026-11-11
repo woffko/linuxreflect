@@ -1165,7 +1165,7 @@ fn probe(
         destination: None,
         ..lr_core::SnapshotOpts::default()
     };
-    let plan = lr_snapshot::probe_source(&layout, &options)?;
+    let plan = lr_snapshot::probe_source(&layout, &options, lr_snapshot::Stage::Plan)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&plan)?);
         return Ok(());

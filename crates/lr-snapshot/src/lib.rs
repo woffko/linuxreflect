@@ -24,7 +24,7 @@ pub use freeze::FreezeProvider;
 pub use live_none::LiveNoneProvider;
 pub use lvm::LvmProvider;
 pub use offline::OfflineProvider;
-pub use probe::{Plan, decide, probe as probe_source};
+pub use probe::{Plan, Stage, decide, probe as probe_source};
 pub use tracked_freeze::{TrackedCopy, TrackedFreezeProvider, TrackedSummary};
 
 use std::path::PathBuf;

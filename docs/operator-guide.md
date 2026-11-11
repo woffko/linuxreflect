@@ -142,10 +142,13 @@ With the default consistency, the wizard plans whole-disk images offline
 only, including every partition and active swap. A running system disk
 without a suitable partition-level snapshot cannot be made consistent by
 choosing a network destination. On Debian or Ubuntu with ext4, open **Backup
-options** and choose **Consistency: tracked-freeze** to image it while it
-runs ([below](#live-system-images-tracked-freeze)). **Longest pause** is
-`--freeze-max`, and the review names the filesystems the final freeze holds
-(rendered: [the option](screenshots/backup-live-system-1024x768@100-dark.png),
+options** and either keep **Consistency: auto** and tick **Allow a live copy
+of a mounted filesystem**, or choose **Consistency: tracked-freeze**, to image
+it while it runs ([below](#live-system-images-tracked-freeze)). **Longest
+pause** (tracked-freeze only; `auto` uses the default 3 s) is `--freeze-max`,
+and the review names the filesystems the final freeze holds (rendered:
+[auto with the consent](screenshots/backup-live-auto-1024x768@100-dark.png),
+[tracked-freeze](screenshots/backup-live-system-1024x768@100-dark.png),
 [the review](screenshots/backup-live-summary-1024x768@100-dark.png)).
 Otherwise boot rescue media for an offline whole-disk image. Never freeze the
 running root filesystem with the plain freeze provider.
@@ -208,13 +211,31 @@ to an image file (A14).
 and in use, the root filesystem included, and with them the whole disk of a
 running system: `/`, `/boot`, the EFI system partition, the BIOS boot
 partition and the boot area before the first partition (spec §E.7, Slice 18).
-It is opt-in: in the backup wizard, choose **Consistency: tracked-freeze**
-under **Backup options**, or on the command line:
+It is opt-in, in one of two ways:
+
+- by name: `--snapshot tracked-freeze`, or **Consistency: tracked-freeze**
+  under **Backup options** in the wizard;
+- by the automatic choice with consent: `--allow-freeze` (the default
+  `--snapshot auto`), or **Consistency: auto** with **Allow a live copy of a
+  mounted filesystem** ticked. The automatic choice takes tracked-freeze for a
+  mounted ext4 when every requirement below holds, ahead of the plain freeze
+  provider (spec §E step 4). When one does not hold, it takes the next
+  method instead: the plain freeze provider for a filesystem that is not
+  `/`, `/boot` or the ESP, `live-none` with `--allow-inconsistent`, or else it
+  refuses with the options. The reason is a warning in the plan and in the
+  report (`tracked-freeze cannot copy this source live: …`), or one of the
+  options in the refusal. A whole disk in use has no other live method, so it
+  is refused with the reason.
 
 ```sh
 sudo linuxreflect backup create --source /dev/nvme0n1 --dest /mnt/backup \
     --set system --snapshot tracked-freeze
+sudo linuxreflect backup create --source /dev/nvme0n1 --dest /mnt/backup \
+    --set system --allow-freeze
 ```
+
+Named, tracked-freeze is refused with the reason when a requirement is
+missing; it never falls back to another method.
 
 **How it works.** LinuxReflect records every write the kernel's block layer
 issues to the source disk (a private ftrace instance on the
@@ -274,8 +295,10 @@ exec runuser -u postgres -- psql -q -c CHECKPOINT
   start does not run them, and neither does the brief freeze that may be
   needed to map a busy filesystem.
 
-**Requirements.** They are checked before tracing starts, and the job is
-refused with the reason when one is missing:
+**Requirements.** They are checked before tracing starts; a job that names
+tracked-freeze is refused with the reason when one is missing, and the
+automatic choice moves on. The plan checks all of them but the self test,
+which needs a loop device of its own and runs when the backup starts:
 
 - root; a kernel with tracefs and both block tracepoints; a blk-mq disk (NVMe,
   SATA/SAS through SCSI, virtio); a self test of the tracepoints on a private
