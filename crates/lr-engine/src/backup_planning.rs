@@ -82,8 +82,8 @@ fn plan_source_layout(
 
     if layout.is_whole_disk() {
         validate_mode_selection(mode, ImageKind::Block, true)?;
-        crate::whole_disk::preflight(request, layout)?;
-        if crate::whole_disk::tracked_mode(request) {
+        let route = crate::whole_disk::preflight(request, layout, lr_snapshot::probe::Stage::Plan)?;
+        if route == crate::whole_disk::Route::Tracked {
             let tracked = crate::whole_disk::plan_tracked(request, layout)?;
             return Ok(BackupPlan {
                 provider: lr_snapshot::tracked_freeze::ID.to_owned(),
@@ -103,7 +103,7 @@ fn plan_source_layout(
     }
 
     let opts = snapshot_opts(request);
-    let source_plan = lr_snapshot::probe::probe(layout, &opts)?;
+    let source_plan = lr_snapshot::probe::probe(layout, &opts, lr_snapshot::probe::Stage::Plan)?;
     validate_mode_selection(mode, source_plan.image_kind, false)?;
     match source_plan.image_kind {
         ImageKind::Stream => {

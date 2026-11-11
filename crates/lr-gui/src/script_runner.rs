@@ -177,6 +177,10 @@ pub(crate) fn run_script(
                 let seconds = *seconds;
                 set(weak, move |ui| ui.set_freeze_max(seconds))?;
             }
+            Step::AllowFreeze(allowed) => {
+                let allowed = *allowed;
+                set(weak, move |ui| ui.set_allow_freeze(allowed))?;
+            }
             Step::Pick(index) => {
                 let index = i32::try_from(*index).map_err(|error| error.to_string())?;
                 invoke(weak, move |ui| ui.invoke_history_selected(index))?;

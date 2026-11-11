@@ -483,6 +483,12 @@ export component MainWindow inherits Window {
                                                     SpinBox { max-width: 120px; minimum: 1; maximum: 30; value <=> root.freeze-max; }
                                                 }
                                             }
+                                            // Spec §E step 4: the automatic choice copies a mounted
+                                            // ext4 live (tracked-freeze) only with this consent.
+                                            if root.snapshot == "auto": CheckBox {
+                                                text: "Allow a live copy of a mounted filesystem (writes pause briefly at the end)";
+                                                checked <=> root.allow-freeze;
+                                            }
                                             if root.snapshot == "freeze": CheckBox {
                                                 text: "Allow a temporary filesystem freeze (applications may pause)";
                                                 checked <=> root.allow-freeze;

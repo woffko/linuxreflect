@@ -140,15 +140,29 @@ fn plan_partition(partition: &lr_core::PartitionLayout) -> PartitionPlan {
     }
 }
 
-/// Check the read-only preconditions shared by planning and whole-disk execution.
+/// How a whole disk is read (spec §E, D-138, D-141).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Route {
+    /// Every partition idle: the offline provider, with its exclusive claim.
+    Offline,
+    /// In use: copied live with tracked-freeze.
+    Tracked,
+}
+
+/// Check the read-only preconditions shared by planning and whole-disk
+/// execution, and choose how the disk is read.
 ///
-/// The whole-disk path deliberately uses only the offline provider. In
-/// particular, `allow_inconsistent` never permits a live read of a disk and
-/// its partitions.
+/// An idle disk is read offline. A disk in use is copied live only by
+/// tracked-freeze: when asked for by name, or by the automatic choice with
+/// `--allow-freeze` when its preconditions hold (spec §E step 4; at the
+/// backup stage also its write-tracking self test). No other live method
+/// reads a whole disk; in particular, `allow_inconsistent` never permits a
+/// live read of a disk and its partitions.
 pub(crate) fn preflight(
     request: &crate::backup::BackupRequest,
     layout: &SourceLayout,
-) -> Result<()> {
+    stage: lr_snapshot::probe::Stage,
+) -> Result<Route> {
     if request.member_type != crate::backup::MemberType::Full || request.parent.is_some() {
         return Err(Error::unsupported(
             "whole-disk images are full images only; per-region chain support is not implemented yet",
@@ -160,29 +174,56 @@ pub(crate) fn preflight(
             "this source has no partition table; use a block backup instead",
         ));
     }
+    let named = request
+        .snapshot_provider
+        .as_deref()
+        .filter(|name| *name != "auto");
     // A tracked copy may read a disk that is in use (spec §E.7); its own
     // refusals run when it starts.
-    if tracked_mode(request) {
-        return Ok(());
+    if named == Some(lr_snapshot::tracked_freeze::ID) {
+        return Ok(Route::Tracked);
     }
     let snapshot_opts = SnapshotOpts {
         provider: request.snapshot_provider.clone(),
         ..SnapshotOpts::default()
     };
-    let provider = offline_provider();
-    if let Support::No(reason) = provider.supports(layout, &snapshot_opts) {
-        return Err(Error::no_consistent_method([
-            format!("offline read refused: {reason}"),
-            "unmount every partition of the disk, then retry".to_owned(),
-            "boot rescue media and run the statically linked CLI (offline)".to_owned(),
-        ]));
+    let Support::No(offline_refusal) = offline_provider().supports(layout, &snapshot_opts) else {
+        return Ok(Route::Offline);
+    };
+    let mut options = vec![
+        format!("offline read refused: {offline_refusal}"),
+        "unmount every partition of the disk, then retry".to_owned(),
+        "boot rescue media and run the statically linked CLI (offline)".to_owned(),
+    ];
+    if named.is_none() {
+        if request.allow_freeze {
+            let lbs = layout.device_facts.logical_block_size;
+            let regions = layout_regions(
+                layout,
+                lbs,
+                layout.device_facts.size_bytes,
+                Consistency::Frozen,
+            );
+            match lr_snapshot::tracked_freeze::disk_support(
+                &request.source,
+                &tracked_specs(&regions, layout, lbs),
+                &crate::backup::snapshot_opts(request),
+                stage == lr_snapshot::probe::Stage::Backup,
+            )? {
+                Support::Yes => return Ok(Route::Tracked),
+                Support::No(reason) => {
+                    options.push(format!("tracked-freeze cannot copy it live: {reason}"));
+                }
+            }
+        } else {
+            options.push(
+                "pass --allow-freeze to copy it live with tracked-freeze (ext4 on plain \
+                 partitions; a short freeze at the end)"
+                    .to_owned(),
+            );
+        }
     }
-    Ok(())
-}
-
-/// Whether the whole disk is copied live with tracked-freeze (spec §E.7).
-pub(crate) fn tracked_mode(request: &crate::backup::BackupRequest) -> bool {
-    request.snapshot_provider.as_deref() == Some(lr_snapshot::tracked_freeze::ID)
+    Err(Error::no_consistent_method(options))
 }
 
 /// The regions of a whole disk, without reading it: the leading area, then
@@ -295,8 +336,8 @@ pub(crate) fn backup_whole_disk_with_layout(
     request: &crate::backup::BackupRequest,
     layout: &SourceLayout,
 ) -> Result<WholeDiskReport> {
-    preflight(request, layout)?;
-    let tracked_mode = tracked_mode(request);
+    let tracked_mode =
+        preflight(request, layout, lr_snapshot::probe::Stage::Backup)? == Route::Tracked;
     // Offline: the disk itself and every partition must be idle, and stay
     // idle: the snapshot holds the provider's exclusive claim on the disk
     // until the whole image is written (A2). Tracked: the copy is live, and

@@ -131,7 +131,8 @@ mod tests {
             provider: Some("none".to_owned()),
             ..SnapshotOpts::default()
         };
-        let error = crate::probe::decide(&layout, &alias).expect_err("consent is required");
+        let error = crate::probe::decide(&layout, &alias, crate::probe::Stage::Plan)
+            .expect_err("consent is required");
         assert!(
             error.to_string().contains("--allow-inconsistent"),
             "{error}"
@@ -141,7 +142,8 @@ mod tests {
             allow_inconsistent: true,
             ..alias.clone()
         };
-        let decision = crate::probe::decide(&layout, &consent).expect("live reader decision");
+        let decision = crate::probe::decide(&layout, &consent, crate::probe::Stage::Plan)
+            .expect("live reader decision");
         assert_eq!(decision.provider, super::ID);
         assert_eq!(decision.consistency, Consistency::None);
         assert!(LiveNoneProvider.supports(&layout, &consent).is_yes());

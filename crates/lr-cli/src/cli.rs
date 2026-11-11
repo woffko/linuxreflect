@@ -226,7 +226,9 @@ pub(crate) enum BackupCommand {
         #[arg(long, value_enum)]
         snapshot: Option<SnapshotChoice>,
 
-        /// Allow the freeze provider (writers block for the whole read).
+        /// Allow a freeze: with the automatic choice, tracked-freeze copies a
+        /// mounted ext4 live with a short final freeze (spec §E step 4); the
+        /// freeze provider blocks writers for the whole read.
         #[arg(long)]
         allow_freeze: bool,
 

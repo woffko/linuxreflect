@@ -109,7 +109,8 @@ pub struct BackupRequest {
     pub on_bad_sector: BadSectorPolicy,
     /// Optional `--snapshot <provider>` override.
     pub snapshot_provider: Option<String>,
-    /// Allow the freeze provider (writers block for the whole read).
+    /// Allow a freeze: tracked-freeze under the automatic choice (spec §E
+    /// step 4), or the freeze provider (writers block for the whole read).
     pub allow_freeze: bool,
     /// Freeze timeout in seconds (default 300).
     pub freeze_timeout_secs: Option<u64>,
@@ -1480,13 +1481,26 @@ pub fn backup_image_with_mode(
             crate::whole_disk::backup_whole_disk_with_layout(request, &layout)?,
         ));
     }
-    let plan = lr_snapshot::probe::probe(&layout, &snapshot_opts(request))?;
+    // The backup stage: the automatic choice also runs tracked-freeze's
+    // write-tracking self test before it settles on it (spec §E.7).
+    let plan = lr_snapshot::probe::probe(
+        &layout,
+        &snapshot_opts(request),
+        lr_snapshot::probe::Stage::Backup,
+    )?;
     crate::backup_planning::validate_mode_selection(mode, plan.image_kind, false)?;
     if plan.image_kind == ImageKind::Stream {
         return Ok(ImageReport::Stream(crate::stream::backup_stream(request)?));
     }
     let provider = lr_snapshot::probe::block_provider(&plan.provider)?;
-    Ok(ImageReport::Block(backup_block_with(request, provider)?))
+    let mut report = backup_block_with(request, provider)?;
+    if let Some(reason) = plan.tracked_refusal {
+        report.warnings.insert(
+            0,
+            format!("{}: {reason}", lr_snapshot::probe::TRACKED_REFUSED),
+        );
+    }
+    Ok(ImageReport::Block(report))
 }
 
 /// Minimum image overhead for a chunk count, used by tests and diagnostics.

@@ -2076,3 +2076,40 @@ safest choice.
 The directory is fixed at `/etc/linuxreflect/hooks`. Only the engine API can
 point elsewhere (`BackupRequest::hooks_dir`, for tests); requests to the
 daemon cannot.
+
+## D-141 — The automatic choice of tracked-freeze: which checks, when, and what follows a refusal
+
+Spec §E step 4 lets `auto` with `--allow-freeze` choose tracked-freeze when
+"the tracked-freeze probe passes", and §E.7 lists the preconditions, the
+write-tracking self test among them. Until now only an explicit `--snapshot
+tracked-freeze` selected it. The spec does not say when each precondition is
+checked, nor what the automatic choice does with a check that fails.
+
+- **Opt-in.** `--snapshot tracked-freeze`, or `auto` (no `--snapshot`, or
+  `auto`) with `--allow-freeze`. Another provider's name never reaches step 4.
+- **Plan and probe.** Every precondition that changes nothing: ext4 directly
+  on the partition, not device-mapper, mounted, the destination off every
+  filesystem to be frozen, tracefs with both tracepoints in a layout the
+  parser knows, a blk-mq disk. The self test is left out (it attaches a loop
+  device), and the plan says it runs when the backup starts.
+- **Backup.** The automatic choice also runs the self test before it settles
+  on tracked-freeze, so a kernel that fails it is passed over like one without
+  the tracepoint. The copy runs the self test again when it starts, as it
+  does for an explicit request: a second loop device for a few hundred
+  milliseconds is the price of checking where the copy relies on it.
+- **A precondition that does not hold** sends the automatic choice to the
+  next step (§E steps 5–7), and the reason is a warning in the plan and in
+  the backup report, or one of the options of `E_NO_CONSISTENT_METHOD`.
+  What no other method can repair is an error, not a reason to move on: an
+  out-of-range `--freeze-max`, an unsafe hook, an I/O error. Falling back
+  past an unsafe hook would silently skip the hooks the operator installed.
+- **A whole disk in use** has no other live method (D-136): an idle disk is
+  read offline, a disk in use with tracked-freeze when its preconditions hold,
+  and otherwise the refusal names both the offline and the tracked-freeze
+  reason.
+- **Named,** tracked-freeze still never falls back: its refusal is the error.
+
+The §E step 7 refusal now also names tracked-freeze (`--allow-freeze`) and
+file mode, as the spec lists them. `LR_TRACEFS_ROOT` (tests only) now names a
+tracefs tree the same way the real mount points are found: one without
+`instances/` stands for a kernel without tracefs (Slice 18 AC (e) fixtures).

@@ -847,7 +847,8 @@ impl LinuxReflect for DaemonService {
         }
         let layout = lr_core::discovery::discover_source(&source).map_err(status::status_of)?;
         let opts = lr_core::SnapshotOpts::default();
-        let plan = lr_snapshot::probe_source(&layout, &opts).map_err(status::status_of)?;
+        let plan = lr_snapshot::probe_source(&layout, &opts, lr_snapshot::Stage::Plan)
+            .map_err(status::status_of)?;
         Ok(Response::new(Plan {
             provider: plan.provider,
             image_kind: format!("{:?}", plan.image_kind),

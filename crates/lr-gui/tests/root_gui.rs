@@ -1017,9 +1017,11 @@ fn a_file_restore_into_a_non_empty_folder_needs_the_merge_choice_on_x11() {
     );
 }
 
-/// Spec v2.2 §E.7 through the GUI: with Consistency "tracked-freeze" and a
-/// longest pause of 3 s, a mounted ext4 that keeps being written is imaged
-/// live by the daemon. The review names tracked-freeze, the result shows the
+/// Spec v2.2 §E.7 through the GUI: Consistency "tracked-freeze" with a
+/// longest pause of 7 s is reviewed, then Consistency "auto" with the
+/// live-copy consent, which chooses tracked-freeze (spec §E step 4) with the
+/// default 3 s; with it, a mounted ext4 that keeps being written is imaged
+/// live by the daemon. The reviews name tracked-freeze, the result shows the
 /// live copy, and the copy restored through the GUI is clean and holds a
 /// whole prefix of the written log.
 #[test]
@@ -1124,7 +1126,11 @@ fn a_mounted_ext4_is_imaged_live_through_the_gui_on_x11() {
              set gui-live\n\
              mode block\n\
              snapshot tracked-freeze\n\
-             freeze-max 3\n\
+             freeze-max 7\n\
+             probe\n\
+             print\n\
+             snapshot auto\n\
+             allow-freeze on\n\
              probe\n\
              print\n\
              backup\n\
@@ -1159,11 +1165,20 @@ fn a_mounted_ext4_is_imaged_live_through_the_gui_on_x11() {
     let output = gui.wait_with_output().expect("GUI exit");
     let log = text(&output);
     assert!(output.status.success(), "{log}");
+    // Named, tracked-freeze keeps the longest pause asked for; `auto` with
+    // the live-copy consent chooses it too (spec §E step 4), with the
+    // default budget, and the backup runs that way.
+    let named = log.find("for at most 7 s");
+    let automatic = log.find("for at most 3 s");
     assert!(
-        log.contains("Planned method: tracked-freeze")
+        named.is_some() && automatic.is_some() && named < automatic,
+        "the reviews do not describe both live copies in order:\n{log}"
+    );
+    assert!(
+        log.matches("Planned method: tracked-freeze").count() >= 2
             && log.contains("copied while the system runs")
-            && log.contains("for at most 3 s"),
-        "the review does not describe the live copy:\n{log}"
+            && log.contains("the automatic choice goes on to the next method"),
+        "the review does not describe the automatic live copy:\n{log}"
     );
     assert!(
         log.contains("Live copy:") && log.contains("final pause"),
