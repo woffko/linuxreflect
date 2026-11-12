@@ -687,6 +687,32 @@ fn a_whole_disk_chain_restores_every_member() {
         differential.inherited_chunks
     );
 
+    // The library lists the chain: the catalog the backups wrote.
+    let destination = lr_store::LocalDestination::new(&outcome, "disk-set");
+    let handle =
+        lr_store::Destination::open_set(&destination, &lr_core::SetId::ZERO).expect("open set");
+    let loaded = lr_engine::catalog::load(
+        &destination,
+        &handle,
+        "disk-set",
+        lr_engine::backup::now_unix(),
+    )
+    .expect("catalog");
+    assert!(!loaded.rebuilt, "{:?}", loaded.warnings);
+    assert_eq!(loaded.catalog.chains.len(), 1);
+    assert_eq!(
+        loaded.catalog.chains[0]
+            .members
+            .iter()
+            .map(|member| (member.kind, member.seq_in_chain))
+            .collect::<Vec<_>>(),
+        [
+            (MemberKind::Full, 0),
+            (MemberKind::Incremental, 1),
+            (MemberKind::Differential, 2),
+        ]
+    );
+
     for (label, report, expected) in [
         ("full", &full, &before_full),
         ("incremental", &incremental, &before_incremental),

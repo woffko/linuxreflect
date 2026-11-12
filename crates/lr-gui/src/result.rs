@@ -88,6 +88,27 @@ pub(crate) fn describe(operation: &str, raw: &str) -> String {
     if let Some(files) = value.get("files").and_then(serde_json::Value::as_u64) {
         text.push_str(&format!("\nFiles: {files}"));
     }
+    // A chain member: what it holds itself and what it inherits (D-142).
+    if let (Some(kind), Some(seq)) = (
+        value.get("member_kind").and_then(serde_json::Value::as_str),
+        value
+            .get("seq_in_chain")
+            .and_then(serde_json::Value::as_u64),
+    ) {
+        let number = |field: &str| value.get(field).and_then(serde_json::Value::as_u64);
+        match (kind, number("changed_chunks"), number("inherited_chunks")) {
+            ("full", _, _) => text.push_str("\nBackup type: full (starts a new chain)."),
+            (kind, Some(changed), Some(inherited)) => text.push_str(&format!(
+                "\nBackup type: {kind}, member {} of its chain: {changed} chunk(s) changed, \
+                 {inherited} inherited from earlier backups.",
+                seq + 1
+            )),
+            (kind, _, _) => text.push_str(&format!(
+                "\nBackup type: {kind}, member {} of its chain.",
+                seq + 1
+            )),
+        }
+    }
     for (label, field) in [
         ("Source data", "total_bytes"),
         ("Image size", "image_bytes"),
@@ -234,5 +255,28 @@ mod tests {
         assert!(!report.contains("point-in-time copy"));
         assert!(!report.contains("Files:"));
         assert!(super::describe("backup", "invalid JSON").contains("could not be interpreted"));
+    }
+
+    /// A chain member says what it holds itself and what it inherits.
+    #[test]
+    fn a_chain_member_reports_its_place_and_its_changes() {
+        let text = super::describe(
+            "backup",
+            r#"{"mode":"whole_disk","image_path":"/b/001-incr.lrimg","consistency":"frozen",
+                "member_kind":"incremental","seq_in_chain":1,"changed_chunks":34,
+                "inherited_chunks":477}"#,
+        );
+        assert!(
+            text.contains("Backup type: incremental, member 2 of its chain: 34 chunk(s) changed, 477 inherited"),
+            "{text}"
+        );
+        let text = super::describe(
+            "backup",
+            r#"{"image_path":"/b/000-full.lrimg","member_kind":"full","seq_in_chain":0}"#,
+        );
+        assert!(
+            text.contains("Backup type: full (starts a new chain)."),
+            "{text}"
+        );
     }
 }

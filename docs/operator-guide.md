@@ -347,6 +347,31 @@ when it starts, and so does every tracked-freeze job before it starts its
 own. Either way, only instances whose process is gone are removed, never a
 running job's.
 
+**Incremental and differential live images** (series B, D-142). After a
+full image, `--type incremental` (in the wizard, **Backup type**) copies the
+disk live again but stores only the chunks that changed since the newest
+member of the chain (`--parent latest`, the default); `--type differential`
+does the same with a full manifest that repeats what it inherits. Both work
+for a partition and for a whole disk, live or offline:
+
+```sh
+sudo linuxreflect backup create --source /dev/nvme0n1 --dest /mnt/backup \
+    --set system --allow-freeze --type incremental
+```
+
+- The first pass still reads every used block and compares it with the
+  chain; only what differs is stored. What the copy reads again while the
+  system runs is stored as the member's own data.
+- A whole-disk member needs the disk its parent saw: the same size, the same
+  partition table, and every partition in the same place with the same type
+  and PARTUUID. A table change, a resized or added partition, or a parent of
+  the other kind (a partition image under a whole-disk backup, or the
+  reverse) refuses the member before anything is frozen, with the advice to
+  start a new chain with `--type full`. A boot loader update (the MBR boot
+  code, GRUB's `core.img` in the boot area) is data and stays in the chain.
+- Restoring a member restores the chain up to it; `prepare` names every
+  member it needs. `verify --chain` checks every member's payloads.
+
 **Restoring a live image** works like restoring any whole-disk image
 ([Restoring](#restoring)), and the restored disk boots like one imaged
 offline. The copy carries the source's partition and filesystem UUIDs. When it
@@ -360,9 +385,8 @@ with Secure Boot and under BIOS. Each running system was imaged live under a
 write load, restored to another disk, and booted from that disk alone
 ([`live-backup-acceptance.md`](live-backup-acceptance.md)).
 
-**Not done yet:** incremental and differential members (a tracked copy is
-always a full image; other types are refused), the `--allow-inconsistent`
-exception for a busy ESP, and xfs. **Untested so far:** real hardware at
+**Not done yet:** the `--allow-inconsistent` exception for a busy ESP, and
+xfs. **Untested so far:** real hardware at
 full speed, a desktop session during the backup, and a backup started from
 the GUI inside a VM whose restored disk is then booted. The GUI's own path is
 covered by a root test: a live backup chosen in the wizard, of a mounted
