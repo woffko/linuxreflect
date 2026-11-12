@@ -406,6 +406,7 @@ pub fn backup_block_with(
             &parent.superblock,
             request.chunk_size,
             layout.device_facts.size_bytes,
+            false,
         )?;
     }
 
@@ -1040,12 +1041,12 @@ pub(crate) fn resolve_parent_chain(
 /// Counters for one manifest pass.
 #[derive(Default)]
 pub(crate) struct Counts {
-    stored: u64,
-    zero: u64,
-    bad: u64,
-    changed: u64,
-    inherited: u64,
-    visited: u64,
+    pub(crate) stored: u64,
+    pub(crate) zero: u64,
+    pub(crate) bad: u64,
+    pub(crate) changed: u64,
+    pub(crate) inherited: u64,
+    pub(crate) visited: u64,
 }
 
 impl Counts {
@@ -1502,7 +1503,7 @@ fn write_full_entries(
 ///
 /// The incremental pass only learns how many chunks changed after walking the
 /// parent, and re-reading the source to count first would defeat scan-and-diff.
-fn patch_entry_count(
+pub(crate) fn patch_entry_count(
     spool: &mut BufWriter<&mut File>,
     header_offset: u64,
     entry_count: u64,
@@ -1523,7 +1524,7 @@ fn patch_entry_count(
 }
 
 /// Convert a resolved parent state back into a manifest entry.
-fn entry_of(state: &ChunkState) -> BlockEntry {
+pub(crate) fn entry_of(state: &ChunkState) -> BlockEntry {
     match state {
         ChunkState::Stored {
             member,
@@ -1547,7 +1548,17 @@ pub(crate) fn check_parent_fits(
     parent: &lr_format::Superblock,
     chunk_size: u32,
     source_bytes: u64,
+    whole_disk: bool,
 ) -> Result<()> {
+    if parent.is_whole_disk() != whole_disk {
+        return Err(Error::unsupported(if whole_disk {
+            "the parent image is of a partition, this backup of a whole disk; start a new full \
+             chain"
+        } else {
+            "the parent image is of a whole disk, this backup of a partition; start a new full \
+             chain"
+        }));
+    }
     if parent.chunk_size != chunk_size {
         return Err(Error::unsupported(format!(
             "the parent image uses {}-byte chunks and this backup {chunk_size}-byte ones; \
@@ -1810,13 +1821,15 @@ mod tests {
             wrap_nonce: [0; 12],
             wrapped_chain_key: [0; 48],
         };
-        assert!(check_parent_fits(&parent, 1 << 20, 64 << 20).is_ok());
+        assert!(check_parent_fits(&parent, 1 << 20, 64 << 20, false).is_ok());
         // The same chunk count is the same layout.
-        assert!(check_parent_fits(&parent, 1 << 20, (64 << 20) - 512).is_ok());
-        let error = check_parent_fits(&parent, 4 << 20, 64 << 20).expect_err("chunk size");
+        assert!(check_parent_fits(&parent, 1 << 20, (64 << 20) - 512, false).is_ok());
+        let error = check_parent_fits(&parent, 4 << 20, 64 << 20, false).expect_err("chunk size");
         assert!(error.to_string().contains("chunks"), "{error}");
-        let error = check_parent_fits(&parent, 1 << 20, 128 << 20).expect_err("size");
+        let error = check_parent_fits(&parent, 1 << 20, 128 << 20, false).expect_err("size");
         assert!(error.to_string().contains("new full chain"), "{error}");
+        let error = check_parent_fits(&parent, 1 << 20, 64 << 20, true).expect_err("kind");
+        assert!(error.to_string().contains("of a partition"), "{error}");
     }
 
     /// The CLI and the daemon pass even a local destination as a URI; the

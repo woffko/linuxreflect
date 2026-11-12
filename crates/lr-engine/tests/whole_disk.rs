@@ -548,3 +548,200 @@ fn the_image_file_is_finalized() {
         "temporary files remain: {leftovers:?}"
     );
 }
+
+/// A digest of `len` bytes of `path` from `offset`, read in pieces.
+fn digest(path: &Path, offset: u64, len: u64) -> u64 {
+    use std::hash::Hasher as _;
+    let mut file = std::fs::File::open(path).expect("open");
+    file.seek(SeekFrom::Start(offset)).expect("seek");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut left = len;
+    let mut piece = vec![0u8; 1024 * 1024];
+    while left > 0 {
+        let take = usize::try_from(left.min(piece.len() as u64)).expect("piece");
+        file.read_exact(&mut piece[..take]).expect("read");
+        hasher.write(&piece[..take]);
+        left -= take as u64;
+    }
+    hasher.finish()
+}
+
+/// What a whole-disk restore must reproduce of `build_disk`'s disk: the boot
+/// area after the partition table, the BIOS boot, ESP and ext4 partitions,
+/// and the swap header.
+fn disk_digests(path: &Path, offsets: &[u64; 4]) -> Vec<u64> {
+    vec![
+        digest(path, CORE_IMG_OFFSET, LEADING_BYTES - CORE_IMG_OFFSET),
+        digest(path, offsets[0], 1024 * 1024),
+        digest(path, offsets[1], 32 * 1024 * 1024),
+        digest(path, offsets[2], 64 * 1024 * 1024),
+        digest(path, offsets[3], 4096),
+    ]
+}
+
+fn restore_disk(image: &Path, target: &Path) {
+    sparse(target, SRC_SIZE);
+    let plan = prepare_restore(&PrepareRequest::from_path(
+        image,
+        target,
+        Encryption::NoEncrypt,
+    ))
+    .expect("prepare");
+    apply_restore(&ApplyRequest {
+        token: plan.token,
+        confirm: true,
+        accept_inconsistent: false,
+        encryption: Encryption::NoEncrypt,
+        context: lr_engine::progress::EngineContext::silent(),
+    })
+    .expect("apply");
+}
+
+/// D-142: a whole-disk chain. A full image; an incremental after the ESP and
+/// the ext4 partition changed; a differential after the BIOS boot partition
+/// and the boot area changed. Each member restores the disk as it was at its
+/// own backup, the incremental stores only what changed, a disk whose
+/// partition table changed is refused a member, and verify of the chain
+/// passes and then names a corrupted member.
+#[test]
+fn a_whole_disk_chain_restores_every_member() {
+    use lr_core::catalog::MemberKind;
+    use lr_engine::backup::MemberType;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = dir.path().join("source.img");
+    if !build_disk(&source) {
+        return;
+    }
+    let offsets = partition_offsets(&source);
+    let outcome = dir.path().join("out");
+    let member = |member_type: MemberType| {
+        let mut member = request(&source, &outcome);
+        member.member_type = member_type;
+        if member_type != MemberType::Full {
+            member.parent = Some("latest".to_owned());
+        }
+        match backup_image(&member).expect("backup") {
+            ImageReport::WholeDisk(report) => report,
+            other => panic!("expected a whole-disk image, got {other:?}"),
+        }
+    };
+
+    // 24 MiB of data that never changes: the full stores it, the later
+    // members inherit it.
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let static_data: Vec<u8> = (0..24 * 1024 * 1024 / 8)
+        .flat_map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()
+        })
+        .collect();
+    write_at(&source, offsets[2] + 8 * 1024 * 1024, &static_data);
+    let before_full = disk_digests(&source, &offsets);
+    let full = member(MemberType::Full);
+    write_at(&source, offsets[1] + 5 * 1024 * 1024, &[0xAB; 300_000]);
+    write_at(
+        &source,
+        offsets[2] + 40 * 1024 * 1024,
+        &[0xCD; 2 * 1024 * 1024],
+    );
+    let before_incremental = disk_digests(&source, &offsets);
+    let incremental = member(MemberType::Incremental);
+    write_at(&source, offsets[0] + 4096, &[0x11; 4096]);
+    write_at(&source, CORE_IMG_OFFSET + 1000, &[0x22; 512]);
+    let before_differential = disk_digests(&source, &offsets);
+    let differential = member(MemberType::Differential);
+
+    assert_eq!(
+        [
+            (full.member_kind, full.seq_in_chain),
+            (incremental.member_kind, incremental.seq_in_chain),
+            (differential.member_kind, differential.seq_in_chain),
+        ],
+        [
+            (MemberKind::Full, 0),
+            (MemberKind::Incremental, 1),
+            (MemberKind::Differential, 2),
+        ]
+    );
+    assert_eq!(incremental.parent_uuid, full.image_uuid);
+    // 300 KB and 2 MiB of changes in 256 KiB chunks.
+    assert!(
+        (1..=16).contains(&incremental.changed_chunks),
+        "{} chunks changed",
+        incremental.changed_chunks
+    );
+    assert!(
+        incremental.stored_chunks() * 4 < full.stored_chunks(),
+        "the incremental stored {} chunks, the full {}",
+        incremental.stored_chunks(),
+        full.stored_chunks()
+    );
+    // A differential compares with the chain's latest state (`--parent
+    // latest`) and repeats the inherited entries in a full manifest.
+    assert!(
+        (1..=4).contains(&differential.changed_chunks) && differential.inherited_chunks > 0,
+        "{} changed, {} inherited",
+        differential.changed_chunks,
+        differential.inherited_chunks
+    );
+
+    for (label, report, expected) in [
+        ("full", &full, &before_full),
+        ("incremental", &incremental, &before_incremental),
+        ("differential", &differential, &before_differential),
+    ] {
+        let target = dir.path().join(format!("{label}.img"));
+        restore_disk(&report.image_path, &target);
+        assert_eq!(
+            &disk_digests(&target, &offsets),
+            expected,
+            "the {label} restored another disk"
+        );
+    }
+
+    // A disk whose partition table changed takes no member.
+    assert!(run(
+        "sgdisk",
+        &["-c", "3:RENAMED", &source.display().to_string()]
+    ));
+    let mut changed = request(&source, &outcome);
+    changed.member_type = MemberType::Incremental;
+    changed.parent = Some("latest".to_owned());
+    let error = backup_image(&changed).expect_err("a changed partition table");
+    assert!(
+        error.to_string().contains("partition table changed"),
+        "{error}"
+    );
+
+    // The chain verifies; a corrupted member is named.
+    let verify = |image: &Path| {
+        lr_engine::verify::verify_image(&lr_engine::verify::VerifyRequest {
+            image: image.display().to_string(),
+            encryption: Encryption::NoEncrypt,
+            chain: true,
+            destination_options: lr_store::DestinationOptions::default(),
+            context: lr_engine::progress::EngineContext::silent(),
+        })
+    };
+    let report = verify(&differential.image_path).expect("the chain verifies");
+    assert_eq!(report.members, 3, "{report:?}");
+    let data_end =
+        lr_format::ImageReader::open(std::fs::File::open(&incremental.image_path).expect("open"))
+            .expect("member")
+            .footer()
+            .data_end_offset;
+    let mut bytes = std::fs::read(&incremental.image_path).expect("member");
+    let at = usize::try_from(data_end - 1).expect("offset");
+    bytes[at] ^= 0xFF;
+    std::fs::write(&incremental.image_path, bytes).expect("corrupt");
+    let error = verify(&differential.image_path).expect_err("a corrupted member must fail");
+    let name = incremental
+        .image_path
+        .file_name()
+        .expect("name")
+        .to_string_lossy()
+        .into_owned();
+    assert!(error.to_string().contains(&name), "{error}");
+}

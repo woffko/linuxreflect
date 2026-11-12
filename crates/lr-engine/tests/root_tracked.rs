@@ -1975,3 +1975,295 @@ fn a_partition_table_changed_mid_job_publishes_nothing() {
         "the source stayed frozen"
     );
 }
+
+/// Attach a restored disk image read-only with its partitions.
+fn attach_restored(image: &Path) -> String {
+    let output = Command::new("losetup")
+        .args(["--find", "--show", "--partscan", "--read-only"])
+        .arg(image)
+        .output()
+        .expect("losetup target");
+    let target = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let _ = run("blockdev", &["--rereadpt", &target]);
+    for _ in 0..100 {
+        if Path::new(&format!("{target}p1")).exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    target
+}
+
+/// Series B2 (D-142): a live chain of a busy system disk (ESP + ext4). A
+/// full, an incremental and a differential of the whole disk are each copied
+/// live while the writer runs, and a marker file lands on the ESP before
+/// each. Every member restores to a disk with the source's partition table,
+/// a clean root whose log ends inside that member's backup, the static data
+/// it inherited, and exactly the ESP markers written before it; the chain
+/// verifies.
+#[test]
+#[ignore = "requires root, loop devices, tracefs and fsfreeze"]
+fn a_live_chain_of_a_busy_system_disk_restores_every_member() {
+    use lr_core::catalog::MemberKind;
+    use lr_engine::backup::MemberType;
+    if !root_tests_enabled() || !prerequisites() {
+        return;
+    }
+    let Some(disk) = SystemDisk::create() else {
+        return;
+    };
+    let work = tempfile::tempdir().expect("work");
+    let dest = work.path().join("backups");
+    let static_data = static_payload(128 << 20);
+    std::fs::write(disk.root().join("static.bin"), &static_data).expect("static");
+    let _ = run("sync", &[]);
+    let writer = Writer::start(&disk.root().join("work"));
+    std::thread::sleep(Duration::from_millis(500));
+
+    let labels = ["full", "incremental", "differential"];
+    let mut members = Vec::new();
+    for (position, (label, member_type)) in labels
+        .into_iter()
+        .zip([
+            MemberType::Full,
+            MemberType::Incremental,
+            MemberType::Differential,
+        ])
+        .enumerate()
+    {
+        std::fs::write(
+            disk.esp().join(format!("EFI/marker-{position}")),
+            label.as_bytes(),
+        )
+        .expect("esp marker");
+        let _ = run("sync", &[]);
+        let mut member = whole_disk_request(&disk.device, &dest);
+        member.member_type = member_type;
+        if member_type != MemberType::Full {
+            member.parent = Some("latest".to_owned());
+        }
+        let started = Instant::now();
+        let report = backup_image(&member).unwrap_or_else(|error| panic!("{label}: {error}"));
+        let ended = Instant::now();
+        let ImageReport::WholeDisk(report) = report else {
+            panic!("{label}: expected a whole-disk image");
+        };
+        let tracked = report
+            .tracked
+            .unwrap_or_else(|| panic!("{label}: not copied live"));
+        println!(
+            "{label}: {tracked:?}, changed {}, inherited {}",
+            report.changed_chunks, report.inherited_chunks
+        );
+        for region in &report.regions {
+            assert_eq!(
+                region.consistency,
+                lr_core::Consistency::Frozen,
+                "{label}: {region:?}"
+            );
+        }
+        members.push((label, report, started, ended));
+        std::thread::sleep(Duration::from_millis(700));
+    }
+    let records = writer.stop();
+
+    assert_eq!(
+        members
+            .iter()
+            .map(|(_, report, _, _)| (report.member_kind, report.seq_in_chain))
+            .collect::<Vec<_>>(),
+        [
+            (MemberKind::Full, 0),
+            (MemberKind::Incremental, 1),
+            (MemberKind::Differential, 2),
+        ]
+    );
+    let full_stored = members[0].1.stored_chunks();
+    assert!(
+        members[2].1.changed_chunks < members[2].1.inherited_chunks,
+        "the differential inherits the unchanged data"
+    );
+    assert!(
+        members[1].1.stored_chunks() * 2 < full_stored,
+        "the incremental stored {} chunks of the full's {full_stored}",
+        members[1].1.stored_chunks()
+    );
+
+    for (position, (label, report, started, ended)) in members.iter().enumerate() {
+        let image = work.path().join(format!("{label}.img"));
+        std::fs::File::create(&image)
+            .and_then(|f| f.set_len(DISK_BYTES))
+            .expect("target");
+        let plan = prepare_restore(&PrepareRequest::from_path(
+            &report.image_path,
+            &image,
+            Encryption::NoEncrypt,
+        ))
+        .expect("prepare");
+        assert_eq!(
+            plan.members.len(),
+            position + 1,
+            "{label}: {:?}",
+            plan.members
+        );
+        apply_restore(&ApplyRequest {
+            token: plan.token,
+            confirm: true,
+            accept_inconsistent: false,
+            encryption: Encryption::NoEncrypt,
+            context: lr_engine::progress::EngineContext::silent(),
+        })
+        .unwrap_or_else(|error| panic!("{label}: {error}"));
+        let target = attach_restored(&image);
+        let same_table = layout_of(&target) == layout_of(&disk.device);
+        let esp = work.path().join(format!("esp-{label}"));
+        std::fs::create_dir(&esp).expect("esp dir");
+        let esp_mounted = run(
+            "mount",
+            &[
+                "-o",
+                "ro",
+                &format!("{target}p1"),
+                &esp.display().to_string(),
+            ],
+        );
+        let markers: Vec<bool> = (0..labels.len())
+            .map(|index| esp.join(format!("EFI/marker-{index}")).exists())
+            .collect();
+        let _ = run("umount", &[&esp.display().to_string()]);
+        let root = work.path().join(format!("{label}-root.img"));
+        let copied = Command::new("dd")
+            .arg(format!("if={target}p2"))
+            .arg(format!("of={}", root.display()))
+            .args(["bs=4M", "status=none"])
+            .status()
+            .is_ok_and(|status| status.success());
+        let _ = run("losetup", &["--detach", &target]);
+        assert!(same_table, "{label}: the partition table differs");
+        assert!(esp_mounted, "{label}: the restored ESP does not mount");
+        assert_eq!(
+            markers,
+            (0..labels.len())
+                .map(|index| index <= position)
+                .collect::<Vec<_>>(),
+            "{label}: the ESP is not as it was at this member"
+        );
+        assert!(copied, "{label}: the root partition could not be copied");
+        let restored_static =
+            check_restored(&root, work.path(), label, &records, (*started, *ended));
+        assert!(
+            restored_static.as_deref() == Some(static_data.as_slice()),
+            "{label}: static.bin differs"
+        );
+    }
+
+    let newest = &members[2].1;
+    let report = lr_engine::verify::verify_image(&lr_engine::verify::VerifyRequest {
+        image: newest.image_path.display().to_string(),
+        encryption: Encryption::NoEncrypt,
+        chain: true,
+        destination_options: lr_store::DestinationOptions::default(),
+        context: lr_engine::progress::EngineContext::silent(),
+    })
+    .expect("the chain verifies");
+    assert_eq!(report.members, 3, "{report:?}");
+}
+
+/// Series B2 (D-142): an offline chain of a disk whose ext4 is mapped by its
+/// used blocks. Between the members a file is deleted and another written;
+/// the incremental restores the disk without the deleted file and with the
+/// new one, and the filesystem checks clean.
+#[test]
+#[ignore = "requires root and loop devices"]
+fn an_offline_whole_disk_chain_follows_deleted_and_new_files() {
+    use lr_engine::backup::MemberType;
+    if !root_tests_enabled() || !prerequisites() {
+        return;
+    }
+    let Some(source) = Source::create_with("label: gpt\nstart=2048, size=128MiB\n", 1) else {
+        return;
+    };
+    let work = tempfile::tempdir().expect("work");
+    let dest = work.path().join("backups");
+    let mountpoint = source.mountpoint().display().to_string();
+    let first = static_payload(8 << 20);
+    std::fs::write(source.mountpoint().join("first.bin"), &first).expect("first");
+    assert!(run("umount", &[&mountpoint]));
+    let mut full = whole_disk_request(&source.device, &dest);
+    full.snapshot_provider = None;
+    let ImageReport::WholeDisk(full) = backup_image(&full).expect("full") else {
+        panic!("expected a whole-disk image");
+    };
+    assert_eq!(full.regions[1].consistency, lr_core::Consistency::Offline);
+
+    assert!(run("mount", &[&source.partition(), &mountpoint]));
+    std::fs::remove_file(source.mountpoint().join("first.bin")).expect("delete");
+    let second = static_payload(5 << 20);
+    std::fs::write(source.mountpoint().join("second.bin"), &second[..3 << 20]).expect("second");
+    assert!(run("umount", &[&mountpoint]));
+    let mut incremental = whole_disk_request(&source.device, &dest);
+    incremental.snapshot_provider = None;
+    incremental.member_type = MemberType::Incremental;
+    incremental.parent = Some("latest".to_owned());
+    let ImageReport::WholeDisk(incremental) = backup_image(&incremental).expect("incremental")
+    else {
+        panic!("expected a whole-disk image");
+    };
+    assert!(incremental.inherited_chunks > 0, "{incremental:?}");
+    // Remounted for the source's own teardown.
+    assert!(run("mount", &[&source.partition(), &mountpoint]));
+
+    let image = work.path().join("restored.img");
+    std::fs::File::create(&image)
+        .and_then(|f| f.set_len(DISK_BYTES))
+        .expect("target");
+    let plan = prepare_restore(&PrepareRequest::from_path(
+        &incremental.image_path,
+        &image,
+        Encryption::NoEncrypt,
+    ))
+    .expect("prepare");
+    apply_restore(&ApplyRequest {
+        token: plan.token,
+        confirm: true,
+        accept_inconsistent: false,
+        encryption: Encryption::NoEncrypt,
+        context: lr_engine::progress::EngineContext::silent(),
+    })
+    .expect("apply");
+    let target = attach_restored(&image);
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(format!("{target}p1"))
+        .output()
+        .expect("e2fsck");
+    let check = work.path().join("check");
+    std::fs::create_dir(&check).expect("check dir");
+    let mounted = run(
+        "mount",
+        &[
+            "-o",
+            "ro",
+            &format!("{target}p1"),
+            &check.display().to_string(),
+        ],
+    );
+    let had_first = check.join("first.bin").exists();
+    let second_restored = std::fs::read(check.join("second.bin")).ok();
+    let _ = run("umount", &[&check.display().to_string()]);
+    let _ = run("losetup", &["--detach", &target]);
+    assert!(
+        fsck.status.success(),
+        "e2fsck:\n{}",
+        String::from_utf8_lossy(&fsck.stdout)
+    );
+    assert!(mounted, "the restored filesystem does not mount");
+    assert!(
+        !had_first,
+        "a file deleted before the incremental came back"
+    );
+    assert!(
+        second_restored.as_deref() == Some(&second[..3 << 20]),
+        "the file written before the incremental is not restored"
+    );
+}

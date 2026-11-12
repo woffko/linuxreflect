@@ -836,7 +836,6 @@ fn restore_stream_inner(
             image_name,
             selected_names: &request.images,
             expected_members,
-            whole_disk: false,
             verification: crate::verify::VerifyRequest {
                 image: image_name.clone(),
                 encryption: request.encryption.clone(),
@@ -892,7 +891,6 @@ fn restore_stream_inner(
         image_name,
         &request.images,
         &verified_members,
-        false,
     )?;
     request.context.check_cancel()?;
     let current_target = crate::restore::TargetFacts::read(&request.target)?;

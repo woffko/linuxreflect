@@ -60,74 +60,37 @@ pub(crate) fn block_chain(
     Ok(summary)
 }
 
-/// Read a whole-disk image's manifest completely without reading payloads
-/// (R24): the disk header must agree with the superblock and keep its
-/// regions on the disk, every region manifest must be a full manifest with
-/// exactly one valid entry per chunk, and nothing may follow the last one.
-/// Returns the summary and the validated disk header.
+/// What restoring a whole-disk chain would write (R24, R26, D-142): every
+/// region's merged chunk states. [`crate::chain::DiskWalk`] has checked that
+/// every member's disk header agrees with its superblock and keeps its regions
+/// on the disk, and the walk checks every region manifest's counts, order and
+/// bounds and that nothing follows the last one. Recorded bad sectors are
+/// counted, with the disk offset of the first.
 ///
 /// # Errors
 /// Returns [`Error::Corrupt`] naming the first violation.
-pub(crate) fn whole_disk<R: std::io::Read + std::io::Seek>(
-    reader: &mut lr_format::ImageReader<R>,
-    meta_key: &[u8; 32],
+pub(crate) fn disk_chain(
+    walk: &mut crate::chain::DiskWalk,
     superblock: &Superblock,
-) -> Result<(BlockSummary, lr_format::disk::DiskHeader)> {
-    use lr_format::disk::DiskHeader;
-    use lr_format::{BlockEntry, BlockManifestHeader, StreamId, wire};
+) -> Result<BlockSummary> {
     let chunk_size = u64::from(superblock.chunk_size);
     let lbs = u64::from(superblock.logical_block_size);
-    let stream = reader.stream_reader(StreamId::Manifest, *meta_key, superblock.aead_kind()?)?;
-    let mut wire = wire::Reader::new(stream);
-    let disk = DiskHeader::read(&mut wire)?;
-    disk.validate()?;
-    disk.validate_geometry(superblock.source_size_bytes, superblock.logical_block_size)?;
     let mut summary = BlockSummary::default();
-    for region in disk.regions.iter().filter(|region| region.has_manifest()) {
-        let (header, delta) = BlockManifestHeader::read(&mut wire)?;
-        if delta {
-            return Err(Error::corrupt(format!(
-                "region {} has a delta manifest; a whole-disk image carries full manifests",
-                region.index
-            )));
-        }
-        if u64::from(header.chunk_size) != chunk_size {
-            return Err(Error::corrupt(format!(
-                "region {} declares {}-byte chunks, the image {chunk_size}",
-                region.index, header.chunk_size
-            )));
-        }
-        let expected = region.chunk_count(chunk_size)?;
-        if header.chunk_count != expected || header.entry_count != expected {
-            return Err(Error::corrupt(format!(
-                "region {} needs {expected} entries, its manifest declares {} chunks and {} \
-                 entries",
-                region.index, header.chunk_count, header.entry_count
-            )));
-        }
-        let region_start = region.start_lba * lbs;
-        for index in 0..expected {
-            let entry = BlockEntry::read(&mut wire)?;
-            match ChunkState::from(&entry) {
-                ChunkState::Stored { .. } => summary.stored += 1,
-                ChunkState::Zero => summary.zero += 1,
-                ChunkState::Unused => summary.unused += 1,
-                ChunkState::BadSector => {
-                    summary.bad += 1;
-                    summary
-                        .first_bad
-                        .get_or_insert(region_start + index * chunk_size);
-                }
+    walk.walk(|region, index, state, _| {
+        match state {
+            ChunkState::Stored { .. } => summary.stored += 1,
+            ChunkState::Zero => summary.zero += 1,
+            ChunkState::Unused => summary.unused += 1,
+            ChunkState::BadSector => {
+                summary.bad += 1;
+                summary
+                    .first_bad
+                    .get_or_insert(region.start_lba * lbs + index * chunk_size);
             }
         }
-    }
-    // Complete consumption: the last region manifest ends the stream.
-    if wire.u8().is_ok() {
-        return Err(Error::corrupt(
-            "the whole-disk manifest continues after its last region",
-        ));
-    }
-    Ok((summary, disk))
+        Ok(())
+    })?;
+    Ok(summary)
 }
 
 /// The structural checks a file tree passes before it is restored or called
