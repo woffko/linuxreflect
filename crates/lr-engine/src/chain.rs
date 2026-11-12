@@ -14,8 +14,8 @@ use lr_core::io::ReadSeek;
 use lr_core::{ChainId, Error, ImageId, ImageKind, Result};
 use lr_crypto::aead::AeadKind;
 use lr_format::{
-    BlockEntry, BlockManifestHeader, ChunkReader, ChunkState, DeltaEntry, ImageReader,
-    PageStreamReader, StreamId, Superblock, open_chunk, wire,
+    BlockEntry, BlockManifestHeader, ChunkReader, ChunkState, DeltaEntry, DiskHeader, ImageReader,
+    PageStreamReader, RegionRecord, StreamId, Superblock, open_chunk, wire,
 };
 use lr_store::{Destination, SetHandle};
 
@@ -200,6 +200,68 @@ pub fn is_change(source: &ChunkState, parent: &ChunkState) -> bool {
     }
 }
 
+/// Sort `members` by sequence and check that they form one chain: a full
+/// first, no gaps, each linked to the one before, and all agreeing about the
+/// chunk size, the source size, the image kind and the set.
+fn validate_links(members: &mut [OpenMember]) -> Result<()> {
+    if members.is_empty() {
+        return Err(Error::unsupported("the chain has no members"));
+    }
+    members.sort_by_key(|member| member.seq_in_chain);
+    let first = &members[0];
+    if first.seq_in_chain != 0 || first.kind != MemberKind::Full {
+        return Err(Error::corrupt(format!(
+            "chain {} does not start with a full member",
+            first.superblock.chain_id
+        )));
+    }
+    for (index, member) in members.iter().enumerate() {
+        let expected = u32::try_from(index).unwrap_or(u32::MAX);
+        if member.seq_in_chain != expected {
+            return Err(Error::corrupt(format!(
+                "chain {} has a gap at sequence {}",
+                first.superblock.chain_id, expected
+            )));
+        }
+        if member.seq_in_chain > 0 {
+            let previous = &members[index - 1];
+            if member.superblock.parent_uuid != previous.image_uuid {
+                return Err(Error::corrupt(format!(
+                    "{} does not link to {}",
+                    member.file_name, previous.file_name
+                )));
+            }
+        }
+        for (what, same) in [
+            (
+                "chunk size",
+                member.superblock.chunk_size == first.superblock.chunk_size,
+            ),
+            (
+                "source size",
+                member.superblock.source_size_bytes == first.superblock.source_size_bytes,
+            ),
+            (
+                "image kind",
+                member.superblock.image_kind == first.superblock.image_kind,
+            ),
+            ("set", member.superblock.set_id == first.superblock.set_id),
+            (
+                "whole-disk layout",
+                member.superblock.is_whole_disk() == first.superblock.is_whole_disk(),
+            ),
+        ] {
+            if !same {
+                return Err(Error::corrupt(format!(
+                    "{} disagrees about the {what}",
+                    member.file_name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The merged state of every chunk of a chain.
 pub struct ChainWalk {
     members: Vec<OpenMember>,
@@ -214,58 +276,8 @@ impl ChainWalk {
     /// Returns [`Error::Corrupt`] when the sequence has gaps, the chain links
     /// are broken, or the members disagree about chunking or source size.
     pub fn new(mut members: Vec<OpenMember>) -> Result<Self> {
-        if members.is_empty() {
-            return Err(Error::unsupported("the chain has no members"));
-        }
-        members.sort_by_key(|member| member.seq_in_chain);
+        validate_links(&mut members)?;
         let first = &members[0];
-        if first.seq_in_chain != 0 || first.kind != MemberKind::Full {
-            return Err(Error::corrupt(format!(
-                "chain {} does not start with a full member",
-                first.superblock.chain_id
-            )));
-        }
-        for (index, member) in members.iter().enumerate() {
-            let expected = u32::try_from(index).unwrap_or(u32::MAX);
-            if member.seq_in_chain != expected {
-                return Err(Error::corrupt(format!(
-                    "chain {} has a gap at sequence {}",
-                    first.superblock.chain_id, expected
-                )));
-            }
-            if member.seq_in_chain > 0 {
-                let previous = &members[index - 1];
-                if member.superblock.parent_uuid != previous.image_uuid {
-                    return Err(Error::corrupt(format!(
-                        "{} does not link to {}",
-                        member.file_name, previous.file_name
-                    )));
-                }
-            }
-            for (what, same) in [
-                (
-                    "chunk size",
-                    member.superblock.chunk_size == first.superblock.chunk_size,
-                ),
-                (
-                    "source size",
-                    member.superblock.source_size_bytes == first.superblock.source_size_bytes,
-                ),
-                (
-                    "image kind",
-                    member.superblock.image_kind == first.superblock.image_kind,
-                ),
-                ("set", member.superblock.set_id == first.superblock.set_id),
-            ] {
-                if !same {
-                    return Err(Error::corrupt(format!(
-                        "{} disagrees about the {what}",
-                        member.file_name
-                    )));
-                }
-            }
-        }
-
         let chunk_size = first.superblock.chunk_size;
         let chunk_count = {
             let mut member = members.remove(0);
@@ -416,21 +428,205 @@ impl ChainWalk {
             }
         }
         for cursor in &cursors {
-            if let Some(pending) = &cursor.pending {
-                return Err(Error::corrupt(format!(
-                    "{} has a delta entry for chunk {} outside the image",
-                    cursor.file_name, pending.chunk_no
-                )));
-            }
-            if cursor.remaining != 0 {
-                return Err(Error::corrupt(format!(
-                    "{} has {} unused manifest entries",
-                    cursor.file_name, cursor.remaining
-                )));
-            }
+            cursor.finish_section()?;
         }
         if !cursors[0].is_full {
             return Err(Error::corrupt("the base manifest is not a full manifest"));
+        }
+        Ok(())
+    }
+}
+
+/// The merged state of every chunk of a whole-disk chain (D-142).
+///
+/// Each member's manifest is its disk header, then one block manifest per
+/// region with data, full or delta, in region order. Every member must
+/// describe the same disk; the walk keeps one cursor per member and goes
+/// region by region, so memory stays O(members) (spec §G.2).
+pub struct DiskWalk {
+    members: Vec<OpenMember>,
+    disk: DiskHeader,
+    chunk_size: u32,
+}
+
+impl DiskWalk {
+    /// Validate a whole-disk chain: the links of [`ChainWalk::new`], and every
+    /// member's disk header describing the same disk (geometry, partition
+    /// table and regions).
+    ///
+    /// # Errors
+    /// Returns [`Error::Corrupt`] for a broken chain, a member that is not a
+    /// whole-disk image, or a member whose layout differs.
+    pub fn new(mut members: Vec<OpenMember>) -> Result<Self> {
+        validate_links(&mut members)?;
+        let chunk_size = members[0].superblock.chunk_size;
+        let mut newest: Option<DiskHeader> = None;
+        for member in &mut members {
+            if !member.superblock.is_whole_disk() {
+                return Err(Error::corrupt(format!(
+                    "{} is not a whole-disk image",
+                    member.file_name
+                )));
+            }
+            let kind = member.superblock.aead_kind()?;
+            let meta_key = *member.keys.meta_key;
+            let stream = member
+                .reader
+                .stream_reader(StreamId::Manifest, meta_key, kind)?;
+            let mut wire = wire::Reader::new(stream);
+            let header = DiskHeader::read(&mut wire)?;
+            header.validate()?;
+            header.validate_geometry(
+                member.superblock.source_size_bytes,
+                member.superblock.logical_block_size,
+            )?;
+            if let Some(previous) = &newest
+                && let Some(difference) = crate::whole_disk::layout_difference(previous, &header)
+            {
+                return Err(Error::corrupt(format!(
+                    "{} describes another disk layout than its parent: {difference}",
+                    member.file_name
+                )));
+            }
+            // The newest member's header: its swap headers and consistency.
+            newest = Some(header);
+        }
+        let disk = newest.ok_or_else(|| Error::unsupported("the chain has no members"))?;
+        Ok(Self {
+            members,
+            disk,
+            chunk_size,
+        })
+    }
+
+    /// The disk as the newest member describes it.
+    #[must_use]
+    pub const fn disk(&self) -> &DiskHeader {
+        &self.disk
+    }
+
+    /// The opened members, in sequence order.
+    #[must_use]
+    pub fn members(&self) -> &[OpenMember] {
+        &self.members
+    }
+
+    /// Walk every chunk of every region with data, in disk order, handing
+    /// the region, the chunk's number inside it and its merged state to
+    /// `visit`.
+    ///
+    /// # Errors
+    /// Returns [`Error::Corrupt`] when a region manifest is short, out of
+    /// order or out of range, disagrees about its chunks, or a manifest goes
+    /// on after its last region.
+    pub fn walk<F>(&mut self, visit: F) -> Result<()>
+    where
+        F: FnMut(&RegionRecord, u64, ChunkState, &mut ChunkAccess<'_>) -> Result<()>,
+    {
+        self.walk_with(false, visit)
+    }
+
+    /// Hand every payload each member stores itself to `visit`, superseded
+    /// ones included: each one is a recovery point of its member (R22).
+    ///
+    /// # Errors
+    /// See [`DiskWalk::walk`].
+    pub fn walk_own_payloads<F>(&mut self, visit: F) -> Result<()>
+    where
+        F: FnMut(&RegionRecord, u64, ChunkState, &mut ChunkAccess<'_>) -> Result<()>,
+    {
+        self.walk_with(true, visit)
+    }
+
+    fn walk_with<F>(&mut self, own_payloads: bool, mut visit: F) -> Result<()>
+    where
+        F: FnMut(&RegionRecord, u64, ChunkState, &mut ChunkAccess<'_>) -> Result<()>,
+    {
+        let Self {
+            members,
+            disk,
+            chunk_size,
+        } = self;
+        let chunk_size = *chunk_size;
+        let aead = members[0].superblock.aead_kind()?;
+        let mut cursors: Vec<Cursor<'_, Box<dyn ReadSeek + Send>>> =
+            Vec::with_capacity(members.len());
+        let mut chunk_readers: Vec<&mut ChunkReader> = Vec::with_capacity(members.len());
+        let mut access_keys: Vec<MemberAccessKeys> = Vec::with_capacity(members.len());
+        let mut deltas: Vec<bool> = Vec::with_capacity(members.len());
+        for member in members.iter_mut() {
+            let kind = member.superblock.aead_kind()?;
+            let meta_key = *member.keys.meta_key;
+            access_keys.push(MemberAccessKeys {
+                data_key: member.keys.data_key.as_ref().map(|key| **key),
+                dedup_key: *member.keys.dedup_key,
+            });
+            deltas.push(member.kind == MemberKind::Incremental);
+            let stream = member
+                .reader
+                .stream_reader(StreamId::Manifest, meta_key, kind)?;
+            let mut cursor = Cursor::at(stream, member.file_name.clone());
+            // Already validated by `new`.
+            DiskHeader::read(&mut cursor.wire)?;
+            cursors.push(cursor);
+            chunk_readers.push(&mut member.chunks);
+        }
+        let mut access = ChunkAccess {
+            readers: chunk_readers,
+            keys: &access_keys,
+            aead,
+            image_kind: ImageKind::Block,
+            max_plaintext: usize::try_from(chunk_size).unwrap_or(usize::MAX),
+        };
+
+        for region in disk.regions.iter().filter(|region| region.has_manifest()) {
+            let expected = region.chunk_count(u64::from(chunk_size))?;
+            for (cursor, delta) in cursors.iter_mut().zip(&deltas) {
+                let header = cursor.open_section(*delta)?;
+                if header.chunk_size != chunk_size
+                    || header.chunk_count != expected
+                    || (!delta && header.entry_count != expected)
+                {
+                    return Err(Error::corrupt(format!(
+                        "{}: region {} needs {expected} chunks of {chunk_size} bytes, its \
+                         manifest declares {} of {} with {} entries",
+                        cursor.file_name,
+                        region.index,
+                        header.chunk_count,
+                        header.chunk_size,
+                        header.entry_count
+                    )));
+                }
+            }
+            for index in 0..expected {
+                if own_payloads {
+                    for (position, cursor) in cursors.iter_mut().enumerate() {
+                        let own = u16::try_from(position).unwrap_or(u16::MAX);
+                        let state = cursor.state_at(index, ChunkState::Unused)?;
+                        if matches!(state, ChunkState::Stored { member, .. } if member == own) {
+                            visit(region, index, state, &mut access)?;
+                        }
+                    }
+                } else {
+                    let mut state = ChunkState::Unused;
+                    for cursor in &mut cursors {
+                        state = cursor.state_at(index, state)?;
+                    }
+                    visit(region, index, state, &mut access)?;
+                }
+            }
+            for cursor in &cursors {
+                cursor.finish_section()?;
+            }
+        }
+        // Complete consumption: the last region manifest ends every stream.
+        for cursor in &mut cursors {
+            if cursor.wire.u8().is_ok() {
+                return Err(Error::corrupt(format!(
+                    "{}: the whole-disk manifest continues after its last region",
+                    cursor.file_name
+                )));
+            }
         }
         Ok(())
     }
@@ -449,26 +645,60 @@ struct Cursor<'a, R: Read + Seek> {
 
 impl<'a, R: Read + Seek> Cursor<'a, R> {
     fn open(stream: PageStreamReader<'a, R>, delta: bool, file_name: String) -> Result<Self> {
-        let mut wire = wire::Reader::new(stream);
-        let (header, header_delta) = BlockManifestHeader::read(&mut wire)?;
+        let mut cursor = Self::at(stream, file_name);
+        cursor.open_section(delta)?;
+        Ok(cursor)
+    }
+
+    /// A cursor at the start of a manifest stream, before any section.
+    fn at(stream: PageStreamReader<'a, R>, file_name: String) -> Self {
+        Self {
+            wire: wire::Reader::new(stream),
+            is_full: true,
+            file_name,
+            chunk_count: 0,
+            chunk_size: 0,
+            remaining: 0,
+            pending: None,
+        }
+    }
+
+    /// Read the next block manifest header (a block image has one, a
+    /// whole-disk image one per region with data) and start its entries.
+    fn open_section(&mut self, delta: bool) -> Result<BlockManifestHeader> {
+        let (header, header_delta) = BlockManifestHeader::read(&mut self.wire)?;
         if header_delta != delta {
             return Err(Error::corrupt(format!(
-                "{file_name}: the manifest kind disagrees with the superblock"
+                "{}: the manifest kind disagrees with the superblock",
+                self.file_name
             )));
         }
-        let mut cursor = Self {
-            wire,
-            is_full: !delta,
-            file_name,
-            chunk_count: header.chunk_count,
-            chunk_size: header.chunk_size,
-            remaining: header.entry_count,
-            pending: None,
-        };
+        self.is_full = !delta;
+        self.chunk_count = header.chunk_count;
+        self.chunk_size = header.chunk_size;
+        self.remaining = header.entry_count;
+        self.pending = None;
         if delta {
-            cursor.pending = cursor.read_delta()?;
+            self.pending = self.read_delta()?;
         }
-        Ok(cursor)
+        Ok(header)
+    }
+
+    /// Every entry of the open section was used.
+    fn finish_section(&self) -> Result<()> {
+        if let Some(pending) = &self.pending {
+            return Err(Error::corrupt(format!(
+                "{} has a delta entry for chunk {} outside the image",
+                self.file_name, pending.chunk_no
+            )));
+        }
+        if self.remaining != 0 {
+            return Err(Error::corrupt(format!(
+                "{} has {} unused manifest entries",
+                self.file_name, self.remaining
+            )));
+        }
+        Ok(())
     }
 
     fn read_delta(&mut self) -> Result<Option<DeltaEntry>> {

@@ -999,7 +999,6 @@ fn restore_file_inner(
             image_name,
             selected_names: &request.images,
             expected_members,
-            whole_disk: false,
             verification: crate::verify::VerifyRequest {
                 image: image_name.clone(),
                 encryption: request.encryption.clone(),

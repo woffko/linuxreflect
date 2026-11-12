@@ -475,19 +475,12 @@ pub(super) fn capture_chain(
         headers.push(superblock);
     }
     validate_captured_ancestry(&headers)?;
-    let target = headers.last().ok_or_else(|| {
+    headers.last().ok_or_else(|| {
         CaptureFailure::from_error(
             AttemptStage::IdentityValidation,
             Error::corrupt("captured ancestry is empty"),
         )
     })?;
-    if target.is_whole_disk() && headers.len() != 1 {
-        return Err(CaptureFailure::new(
-            AttemptStage::IdentityValidation,
-            FailureKind::Unsupported,
-            Error::unsupported("captured whole-disk ancestry must contain one member"),
-        ));
-    }
     let captured_destination = CapturedDestination::new(copied_files);
     let captured_set = SetHandle {
         set_id: SetId::ZERO,

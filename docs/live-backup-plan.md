@@ -2,8 +2,8 @@
 
 Status, 2026-11-08: phase 0 is done (`docs/live-backup-spike.md`: the
 mechanism holds on kernels 5.15 to 6.18), phase 1 is done
-(`lr_snapshot::tracking`), and phase 2 is done except incremental members
-(refused for now), and phase 3 is done: whole disks with the root
+(`lr_snapshot::tracking`), and phase 2 is done (incremental members came
+with series B), and phase 3 is done: whole disks with the root
 filesystem, a vfat ESP and other unfrozen regions under the quiet-window
 rule are copied live with `--snapshot tracked-freeze`, writes are tracked on
 submission and on completion, dpkg's lock postpones the final freeze and a
@@ -34,8 +34,11 @@ missing now exist: AC (c) `a_final_read_longer_than_freeze_max_thaws_first_and_p
 `a_partition_table_changed_mid_job_publishes_nothing`, and AC (e)
 `the_probe_refuses_a_kernel_that_cannot_track_writes` (fixture tracefs and
 sysfs trees: no tracefs, no submission or completion tracepoint, an unknown
-event layout, a disk that is not blk-mq). Still open:
-incremental members, the GUI acceptance inside a VM with a boot of the
+event layout, a disk that is not blk-mq). Series B
+(`docs/live-backup-series-b.md`, D-142) added incremental and differential
+live members for partitions and whole disks, whole-disk chains for every
+route, and the VM acceptance of a live incremental. Still open: the GUI
+acceptance inside a VM with a boot of the
 restored disk (phase 4), the
 `--allow-inconsistent` exception for a busy ESP, and phase 5. That
 exception (§E.7 quiet-window rule) is not implemented: a write to a region
