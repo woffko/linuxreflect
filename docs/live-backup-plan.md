@@ -35,7 +35,8 @@ missing now exist: AC (c) `a_final_read_longer_than_freeze_max_thaws_first_and_p
 `the_probe_refuses_a_kernel_that_cannot_track_writes` (fixture tracefs and
 sysfs trees: no tracefs, no submission or completion tracepoint, an unknown
 event layout, a disk that is not blk-mq). Still open:
-incremental members, the GUI acceptance inside a VM with a boot of the
+incremental members (planned as series B in `docs/live-backup-series-b.md`),
+the GUI acceptance inside a VM with a boot of the
 restored disk (phase 4), the
 `--allow-inconsistent` exception for a busy ESP, and phase 5. That
 exception (§E.7 quiet-window rule) is not implemented: a write to a region

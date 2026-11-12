@@ -339,12 +339,24 @@ fn a_busy_ext4_partition_is_copied_live_and_restores_clean() {
 
     // Restore into a file of the partition's size and check it offline.
     let target = work.path().join("restored.img");
-    std::fs::File::create(&target)
-        .and_then(|f| f.set_len(source.partition_bytes()))
+    restore_to_file(&report.image_path, source.partition_bytes(), &target);
+    check_restored(
+        &target,
+        work.path(),
+        "full",
+        &records,
+        (backup_started, backup_ended),
+    );
+}
+
+/// Restore `image` (with its chain) into a new file of `bytes`.
+fn restore_to_file(image: &Path, bytes: u64, target: &Path) {
+    std::fs::File::create(target)
+        .and_then(|f| f.set_len(bytes))
         .expect("target");
     let plan = prepare_restore(&PrepareRequest::from_path(
-        &report.image_path,
-        &target,
+        image,
+        target,
         Encryption::NoEncrypt,
     ))
     .expect("prepare");
@@ -356,31 +368,44 @@ fn a_busy_ext4_partition_is_copied_live_and_restores_clean() {
         context: lr_engine::progress::EngineContext::silent(),
     })
     .expect("apply");
+}
 
+/// Check a restored copy of the writer's filesystem offline: a clean ext4
+/// with no journal left to replay, the writer's log a whole hash chain that
+/// ends inside `window` (everything synced before it began is there, nothing
+/// begun after it ended is), and every 4 KiB block of `random.bin` whole.
+/// Returns `static.bin` from the copy, when there is one.
+fn check_restored(
+    target: &Path,
+    work: &Path,
+    label: &str,
+    records: &[(u64, Instant, Instant)],
+    window: (Instant, Instant),
+) -> Option<Vec<u8>> {
     let fsck = Command::new("e2fsck")
         .arg("-fn")
-        .arg(&target)
+        .arg(target)
         .output()
         .expect("e2fsck");
     assert!(
         fsck.status.success(),
-        "e2fsck:\n{}{}",
+        "{label}: e2fsck:\n{}{}",
         String::from_utf8_lossy(&fsck.stdout),
         String::from_utf8_lossy(&fsck.stderr)
     );
     // e2fsck -n alone does not see a journal left to replay (phase 0).
     let header = Command::new("dumpe2fs")
         .arg("-h")
-        .arg(&target)
+        .arg(target)
         .output()
         .expect("dumpe2fs");
     let header = String::from_utf8_lossy(&header.stdout);
     assert!(
         !header.contains("needs_recovery"),
-        "the copy still needs journal recovery:\n{header}"
+        "{label}: the copy still needs journal recovery:\n{header}"
     );
 
-    let check = work.path().join("check");
+    let check = work.join(format!("check-{}", label.replace(' ', "-")));
     std::fs::create_dir(&check).expect("check dir");
     assert!(run(
         "mount",
@@ -393,10 +418,14 @@ fn a_busy_ext4_partition_is_copied_live_and_restores_clean() {
     ));
     let log = std::fs::read_to_string(check.join("work/chain.log")).expect("log");
     let blocks = std::fs::read(check.join("work/random.bin")).expect("data");
+    let static_data = std::fs::read(check.join("static.bin")).ok();
     let _ = run("umount", &[&check.display().to_string()]);
 
     // The log is a whole, valid chain…
-    assert!(log.ends_with('\n') || log.is_empty(), "torn last record");
+    assert!(
+        log.ends_with('\n') || log.is_empty(),
+        "{label}: torn last record"
+    );
     let mut previous = 0u64;
     let mut count = 0u64;
     for line in log.lines() {
@@ -404,25 +433,29 @@ fn a_busy_ext4_partition_is_copied_live_and_restores_clean() {
         assert_eq!(
             seq.parse::<u64>().expect("seq"),
             count,
-            "records out of order"
+            "{label}: records out of order"
         );
         previous = link(previous, count);
-        assert_eq!(hash, format!("{previous:016x}"), "broken chain at {count}");
+        assert_eq!(
+            hash,
+            format!("{previous:016x}"),
+            "{label}: broken chain at {count}"
+        );
         count += 1;
     }
-    // …that ends inside the backup: everything synced before it started is
-    // there, nothing begun after it ended is.
+    // …that ends inside the backup.
+    let (started, ended) = window;
     let synced_before = records
         .iter()
-        .filter(|(_, _, synced)| *synced < backup_started)
+        .filter(|(_, _, synced)| *synced < started)
         .count() as u64;
     let begun_before_end = records
         .iter()
-        .filter(|(_, started, _)| *started < backup_ended)
+        .filter(|(_, begun, _)| *begun < ended)
         .count() as u64;
     assert!(
         (synced_before..=begun_before_end).contains(&count),
-        "{count} records; expected between {synced_before} and {begun_before_end}"
+        "{label}: {count} records; expected between {synced_before} and {begun_before_end}"
     );
     // Every 4 KiB block is whole: either never written or one version.
     for (index, block) in blocks.chunks_exact(4096).enumerate() {
@@ -431,13 +464,17 @@ fn a_busy_ext4_partition_is_copied_live_and_restores_clean() {
         }
         let stored = u64::from_le_bytes(block[..8].try_into().expect("8 bytes"));
         let version = u64::from_le_bytes(block[8..16].try_into().expect("8 bytes"));
-        assert_eq!(stored, index as u64, "block {index} holds block {stored}");
+        assert_eq!(
+            stored, index as u64,
+            "{label}: block {index} holds block {stored}"
+        );
         assert_eq!(
             block,
             block_bytes(stored, version).as_slice(),
-            "block {index} is torn"
+            "{label}: block {index} is torn"
         );
     }
+    static_data
 }
 
 #[test]
@@ -467,9 +504,30 @@ fn a_destination_on_the_source_filesystem_is_refused_before_tracking() {
     assert_eq!(leftovers, 0, "a trace instance was left behind");
 }
 
+/// Incompressible bytes that never change during a test.
+fn static_payload(len: usize) -> Vec<u8> {
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut bytes = Vec::with_capacity(len);
+    while bytes.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        bytes.extend_from_slice(&state.to_le_bytes());
+    }
+    bytes.truncate(len);
+    bytes
+}
+
+/// Series B1: a live chain of a busy partition. A full, an incremental, a
+/// differential and an incremental through the automatic choice are each
+/// copied live while the writer runs. Each restores to a clean copy whose log
+/// ends inside its own backup; data that never changed is inherited, not
+/// stored again; `verify` passes for the chain and names a corrupted member.
 #[test]
-#[ignore = "requires root, loop devices and tracefs"]
-fn an_incremental_is_refused_in_this_release() {
+#[ignore = "requires root, loop devices, tracefs and fsfreeze"]
+fn a_live_chain_of_a_busy_partition_restores_every_member() {
+    use lr_core::catalog::MemberKind;
+    use lr_engine::backup::MemberType;
     if !root_tests_enabled() || !prerequisites() {
         return;
     }
@@ -478,12 +536,120 @@ fn an_incremental_is_refused_in_this_release() {
     };
     let work = tempfile::tempdir().expect("work");
     let dest = work.path().join("backups");
-    backup_image(&request(&source.partition(), &dest)).expect("full");
-    let mut incremental = request(&source.partition(), &dest);
-    incremental.member_type = lr_engine::backup::MemberType::Incremental;
-    incremental.parent = Some("latest".to_owned());
-    let error = backup_image(&incremental).expect_err("an incremental must be refused");
-    assert!(error.to_string().contains("full images"), "{error}");
+    // 48 MiB that the full stores and every later member inherits.
+    let static_data = static_payload(48 << 20);
+    std::fs::write(source.mountpoint().join("static.bin"), &static_data).expect("static");
+    let _ = run("sync", &[]);
+
+    let writer = Writer::start(&source.mountpoint().join("work"));
+    std::thread::sleep(Duration::from_millis(500));
+    let mut members = Vec::new();
+    for (label, member_type, automatic) in [
+        ("full", MemberType::Full, false),
+        ("incremental", MemberType::Incremental, false),
+        ("differential", MemberType::Differential, false),
+        ("automatic incremental", MemberType::Incremental, true),
+    ] {
+        let mut member = request(&source.partition(), &dest);
+        member.member_type = member_type;
+        if member_type != MemberType::Full {
+            member.parent = Some("latest".to_owned());
+        }
+        if automatic {
+            member.snapshot_provider = None;
+            member.allow_freeze = true;
+        }
+        let started = Instant::now();
+        let report = backup_image(&member).unwrap_or_else(|error| panic!("{label}: {error}"));
+        let ended = Instant::now();
+        let ImageReport::Block(report) = report else {
+            panic!("{label}: expected a block image");
+        };
+        assert_eq!(report.consistency, lr_core::Consistency::Frozen, "{label}");
+        let tracked = report
+            .tracked
+            .unwrap_or_else(|| panic!("{label}: not copied live"));
+        println!("{label}: {tracked:?}, stored {}", report.stored_chunks);
+        members.push((label, report, started, ended));
+        std::thread::sleep(Duration::from_millis(700));
+    }
+    let records = writer.stop();
+
+    let kinds: Vec<(MemberKind, u32)> = members
+        .iter()
+        .map(|(_, report, _, _)| (report.member_kind, report.seq_in_chain))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            (MemberKind::Full, 0),
+            (MemberKind::Incremental, 1),
+            (MemberKind::Differential, 2),
+            (MemberKind::Incremental, 3),
+        ]
+    );
+    let full_stored = members[0].1.stored_chunks;
+    for (label, report, _, _) in &members[1..] {
+        assert!(
+            report.stored_chunks * 2 < full_stored,
+            "{label} stored {} chunks of the full's {full_stored}",
+            report.stored_chunks
+        );
+    }
+
+    for (label, report, started, ended) in &members {
+        let target = work.path().join(format!("{}.img", label.replace(' ', "-")));
+        restore_to_file(&report.image_path, source.partition_bytes(), &target);
+        let restored_static =
+            check_restored(&target, work.path(), label, &records, (*started, *ended));
+        assert!(
+            restored_static.as_deref() == Some(static_data.as_slice()),
+            "{label}: static.bin differs"
+        );
+    }
+
+    // The chain verifies from its newest member; a corrupted member is named.
+    let newest = &members[3].1;
+    let verify = |image: &str| {
+        lr_engine::verify::verify_image(&lr_engine::verify::VerifyRequest {
+            image: image.to_owned(),
+            encryption: Encryption::NoEncrypt,
+            chain: true,
+            destination_options: lr_store::DestinationOptions::default(),
+            context: lr_engine::progress::EngineContext::silent(),
+        })
+    };
+    let report = verify(&newest.image_uri).expect("the chain verifies");
+    assert_eq!(report.members, 4, "{report:?}");
+    let incremental = &members[1].1.image_path;
+    // The last byte of the last chunk record: a chunk of the final read,
+    // which the manifest references (an earlier copy of a chunk read again
+    // is unreferenced, spec §E.7, and verify rightly ignores it).
+    let data_end = lr_format::ImageReader::open(std::fs::File::open(incremental).expect("open"))
+        .expect("member")
+        .footer()
+        .data_end_offset;
+    let mut bytes = std::fs::read(incremental).expect("member");
+    let at = usize::try_from(data_end - 1).expect("offset");
+    bytes[at] ^= 0xFF;
+    std::fs::write(incremental, bytes).expect("corrupt");
+    let error = verify(&newest.image_uri).expect_err("a corrupted member must fail");
+    let name = incremental
+        .file_name()
+        .expect("name")
+        .to_string_lossy()
+        .into_owned();
+    assert!(error.to_string().contains(&name), "{error}");
+
+    // A member chunked differently from its parent is refused before a
+    // snapshot is made, so nothing is frozen or traced.
+    let mut other = request(&source.partition(), &dest);
+    other.member_type = MemberType::Incremental;
+    other.parent = Some("latest".to_owned());
+    other.chunk_size = 2 * CHUNK_SIZE;
+    let error = backup_image(&other).expect_err("another chunk size");
+    assert!(error.to_string().contains("-byte chunks"), "{error}");
+    assert_eq!(trace_leftovers(), 0, "a trace instance was left behind");
 }
 
 fn images_under(dir: &Path) -> Vec<PathBuf> {

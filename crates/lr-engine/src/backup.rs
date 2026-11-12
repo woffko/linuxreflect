@@ -6,6 +6,7 @@
 //! page stream afterwards. That keeps memory bounded (spec §G.2: 4 TB of
 //! entries is 184 MB) without re-reading the source or re-hashing chunks.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -389,12 +390,31 @@ pub fn backup_block_with(
     request.context.phase("snapshot");
     let snapshot_opts = snapshot_opts(request);
     lr_snapshot::probe::confirm(provider, &layout, &snapshot_opts)?;
+
+    // 2. Destination, catalog and set lock: all of backup, catalog rebuild and
+    //    `parent=latest` resolution run under the lock (spec §D.3). They come
+    //    before the snapshot, so a member its parent cannot take is refused
+    //    before anything is snapshotted, frozen or traced.
+    let destination = request.open_destination()?;
+    let set = destination.open_set(&request.set_id)?;
+    let lock = acquire_set_lock(&*destination, &set, request)?;
+    let now = now_unix();
+    let resolved_plan =
+        ResolvedBackupPlan::resolve(request, BackupMode::Block, &*destination, &set, now)?;
+    if let Some(parent) = resolved_plan.parent() {
+        check_parent_fits(
+            &parent.superblock,
+            request.chunk_size,
+            layout.device_facts.size_bytes,
+        )?;
+    }
+
     let mut snapshot = provider.create(&layout, &snapshot_opts)?;
     if let Some(tracked) = snapshot.tracked_mut() {
         tracked.bind(u64::from(request.chunk_size))?;
     }
 
-    // 2. Which blocks must be read? For a tracked copy the map is taken after
+    // 3. Which blocks must be read? For a tracked copy the map is taken after
     //    the provider's barrier freeze (spec §E.7): a block allocated later is
     //    written later, so the tracker sees it.
     let fs_type = layout
@@ -407,7 +427,7 @@ pub fn backup_block_with(
         None => provider_for(&fs_type).used_extents(&snapshot.block_path)?,
     };
 
-    // 3. Open the source for aligned reads.
+    // 4. Open the source for aligned reads.
     let mut source = DirectBlockSource::open(&snapshot.block_path)?;
     let device_size = source.size_bytes();
     let logical_block_size = source.logical_block_size();
@@ -420,26 +440,12 @@ pub fn backup_block_with(
     // the used-block map only decides which of them hold data.
     let chunk_count = plan.chunk_count();
 
-    // 4. Destination, catalog and set lock: all of backup, catalog rebuild and
-    //    `parent=latest` resolution run under the lock (spec §D.3).
-    let destination = request.open_destination()?;
-    let set = destination.open_set(&request.set_id)?;
-    let lock = acquire_set_lock(&*destination, &set, request)?;
-    let now = now_unix();
-    let resolved_plan =
-        ResolvedBackupPlan::resolve(request, BackupMode::Block, &*destination, &set, now)?;
     let parent = resolved_plan.parent();
     let set_id = resolved_plan.set_id();
     let chain_id = resolved_plan.chain_id();
     let seq_in_chain = resolved_plan.seq_in_chain();
     let parent_uuid = resolved_plan.parent_uuid();
     let member_kind = resolved_plan.member_kind();
-    if snapshot.is_tracked() && parent.is_some() {
-        return Err(Error::unsupported(
-            "tracked-freeze makes full images in this release (Slice 18 phase 2); \
-             start a new chain with --type full",
-        ));
-    }
 
     // 5. Keys and superblock. A member reuses the chain key of its parent, so
     //    the whole chain shares one `dedup_key` (spec §G.4).
@@ -526,7 +532,8 @@ pub fn backup_block_with(
     let mut spool_file = crate::spool::scratch_file(&spool_dir)?;
     let mut tracked_summary = None;
     let mut hook_warnings = Vec::new();
-    let counts = {
+    let mut delta_recopies: BTreeMap<u64, BlockEntry> = BTreeMap::new();
+    let mut counts = {
         let mut spool = BufWriter::new(&mut spool_file);
         let header = BlockManifestHeader {
             chunk_size: request.chunk_size,
@@ -579,7 +586,8 @@ pub fn backup_block_with(
                         &mut source,
                         &mut buffer,
                         &mut spool,
-                        entries_start,
+                        &mut Recopies::InPlace { entries_start },
+                        0,
                         &mut counts,
                         request,
                         device_size,
@@ -592,6 +600,8 @@ pub fn backup_block_with(
             Some(parent) => {
                 let delta = resolved_plan.manifest_encoding() == ManifestEncoding::BlockDelta;
                 header.write(&mut spool, delta)?;
+                let entries_start = spool.stream_position().map_err(Error::Io)?;
+                let reads_before = source.read_stats();
                 let member = u16::try_from(seq_in_chain).map_err(|_| {
                     Error::unsupported("chains longer than 65535 members are not supported")
                 })?;
@@ -671,12 +681,48 @@ pub fn backup_block_with(
                 })?;
                 let entries = if delta { counts.changed } else { chunk_count };
                 patch_entry_count(&mut spool, header_offset, entries)?;
+                // A live member converges like a full image (spec §E.7); what
+                // it reads again is this member's own data.
+                if let Some(tracked) = snapshot.tracked_mut() {
+                    reporter.phase("converge");
+                    let first_pass = source.read_stats().since(reads_before);
+                    let mut recopies = if delta {
+                        Recopies::Aside(BTreeMap::new())
+                    } else {
+                        Recopies::InPlace { entries_start }
+                    };
+                    tracked_summary = Some(converge_tracked(
+                        tracked,
+                        &mut image_writer,
+                        options,
+                        &writer_keys,
+                        &mut nonce_seq,
+                        &mut source,
+                        &mut buffer,
+                        &mut spool,
+                        &mut recopies,
+                        member,
+                        &mut counts,
+                        request,
+                        device_size,
+                        first_pass,
+                    )?);
+                    hook_warnings.extend_from_slice(tracked.warnings());
+                    if let Recopies::Aside(recopied) = recopies {
+                        delta_recopies = recopied;
+                    }
+                }
                 counts
             }
         };
         spool.flush().map_err(Error::Io)?;
         counts
     };
+    // A delta manifest lists its chunks in order, so what a live member read
+    // again is merged in rather than appended.
+    if !delta_recopies.is_empty() {
+        spool_file = merge_delta_spool(&mut spool_file, &delta_recopies, &mut counts, &spool_dir)?;
+    }
 
     // Every read is done. The snapshot must still be healthy, or the last
     // read may have run past its deadline (R29); then it is released at
@@ -993,13 +1039,43 @@ pub(crate) fn resolve_parent_chain(
 
 /// Counters for one manifest pass.
 #[derive(Default)]
-struct Counts {
+pub(crate) struct Counts {
     stored: u64,
     zero: u64,
     bad: u64,
     changed: u64,
     inherited: u64,
     visited: u64,
+}
+
+impl Counts {
+    fn counter(&mut self, entry: &BlockEntry) -> Option<&mut u64> {
+        match entry.state {
+            lr_format::STATE_STORED => Some(&mut self.stored),
+            lr_format::STATE_ZERO => Some(&mut self.zero),
+            lr_format::STATE_BAD_SECTOR => Some(&mut self.bad),
+            _ => None,
+        }
+    }
+
+    /// A chunk inherited from the parent became a change of this member.
+    fn add_new(&mut self, entry: &BlockEntry) {
+        if let Some(counter) = self.counter(entry) {
+            *counter += 1;
+        }
+        self.changed += 1;
+        self.inherited = self.inherited.saturating_sub(1);
+    }
+
+    /// A change of this member was replaced by a later read.
+    fn replace(&mut self, old: &BlockEntry, new: &BlockEntry) {
+        if let Some(counter) = self.counter(old) {
+            *counter = counter.saturating_sub(1);
+        }
+        if let Some(counter) = self.counter(new) {
+            *counter += 1;
+        }
+    }
 }
 
 /// What the source holds in one chunk, relative to its parent state.
@@ -1170,7 +1246,8 @@ fn converge_tracked(
     source: &mut DirectBlockSource,
     buffer: &mut lr_unsafe::AlignedBuf,
     spool: &mut BufWriter<&mut File>,
-    entries_start: u64,
+    recopies: &mut Recopies,
+    member: u16,
     counts: &mut Counts,
     request: &BackupRequest,
     device_size: u64,
@@ -1192,7 +1269,7 @@ fn converge_tracked(
                     options,
                     writer_keys,
                     nonce_seq,
-                    0,
+                    member,
                     read,
                     &ChunkState::Unused,
                 )?,
@@ -1204,13 +1281,7 @@ fn converge_tracked(
                 },
                 Err(error) => return Err(error),
             };
-            patch_entry(
-                spool.get_ref(),
-                entries_start,
-                index,
-                &full_entry(state),
-                counts,
-            )?;
+            recopies.record(spool.get_ref(), index, full_entry(state), counts)?;
         }
         pass = source.read_stats().since(reads_before);
     }
@@ -1257,19 +1328,111 @@ fn converge_tracked(
             options,
             writer_keys,
             nonce_seq,
-            0,
+            member,
             &pool[slot].as_slice()[..len],
             &ChunkState::Unused,
         )?;
-        patch_entry(
-            spool.get_ref(),
-            entries_start,
-            index,
-            &full_entry(state),
-            counts,
-        )?;
+        recopies.record(spool.get_ref(), index, full_entry(state), counts)?;
     }
     tracked.finish()
+}
+
+/// Where a tracked copy puts the chunks it reads again (spec §E.7).
+pub(crate) enum Recopies {
+    /// Over their entries in a full manifest whose entries start here.
+    InPlace { entries_start: u64 },
+    /// Aside, the newest entry per chunk, for a delta manifest: its entries
+    /// must stay in chunk order ([`merge_delta_entries`]).
+    Aside(BTreeMap<u64, BlockEntry>),
+}
+
+impl Recopies {
+    pub(crate) fn record(
+        &mut self,
+        spool: &File,
+        index: u64,
+        entry: BlockEntry,
+        counts: &mut Counts,
+    ) -> Result<()> {
+        match self {
+            Self::InPlace { entries_start } => {
+                patch_entry(spool, *entries_start, index, &entry, counts)
+            }
+            Self::Aside(entries) => {
+                entries.insert(index, entry);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Copy `count` delta entries from `from` to `to` with `recopied` merged in,
+/// in chunk order: a chunk read again replaces its entry, or its entry is
+/// inserted where it belongs. Returns how many entries were written.
+pub(crate) fn merge_delta_entries<S: lr_format::wire::ByteSource>(
+    from: &mut lr_format::wire::Reader<S>,
+    count: u64,
+    recopied: &BTreeMap<u64, BlockEntry>,
+    counts: &mut Counts,
+    to: &mut impl Write,
+) -> Result<u64> {
+    let mut added = recopied.iter().peekable();
+    let mut written = 0u64;
+    for _ in 0..count {
+        let old = DeltaEntry::read(from)?;
+        while let Some((&chunk_no, &entry)) =
+            added.next_if(|(chunk_no, _)| **chunk_no < old.chunk_no)
+        {
+            counts.add_new(&entry);
+            DeltaEntry { chunk_no, entry }.write(to)?;
+            written += 1;
+        }
+        let entry = match added.next_if(|(chunk_no, _)| **chunk_no == old.chunk_no) {
+            Some((_, &entry)) => {
+                counts.replace(&old.entry, &entry);
+                entry
+            }
+            None => old.entry,
+        };
+        DeltaEntry {
+            chunk_no: old.chunk_no,
+            entry,
+        }
+        .write(to)?;
+        written += 1;
+    }
+    for (&chunk_no, &entry) in added {
+        counts.add_new(&entry);
+        DeltaEntry { chunk_no, entry }.write(to)?;
+        written += 1;
+    }
+    Ok(written)
+}
+
+/// Rewrite a delta manifest spool (its header, then its entries in chunk
+/// order) with the chunks a live member read again merged in.
+fn merge_delta_spool(
+    spool: &mut File,
+    recopied: &BTreeMap<u64, BlockEntry>,
+    counts: &mut Counts,
+    spool_dir: &std::path::Path,
+) -> Result<File> {
+    spool.rewind().map_err(Error::Io)?;
+    let mut wire = lr_format::wire::Reader::new(BufReader::new(&mut *spool));
+    let (header, delta) = BlockManifestHeader::read(&mut wire)?;
+    if !delta {
+        return Err(Error::corrupt("a delta merge needs a delta manifest"));
+    }
+    let mut merged = crate::spool::scratch_file(spool_dir)?;
+    {
+        let mut out = BufWriter::new(&mut merged);
+        header.write(&mut out, true)?;
+        let written =
+            merge_delta_entries(&mut wire, header.entry_count, recopied, counts, &mut out)?;
+        patch_entry_count(&mut out, 0, written)?;
+        out.flush().map_err(Error::Io)?;
+    }
+    Ok(merged)
 }
 
 /// Write a full manifest: every chunk in order, holes filled with `unused`.
@@ -1375,6 +1538,32 @@ fn entry_of(state: &ChunkState) -> BlockEntry {
         // so a differential never inherits one.
         ChunkState::BadSector => BlockEntry::bad_sector(0, 0),
     }
+}
+
+/// Refuse a member whose parent was chunked differently or describes a source
+/// of another size: their chunk numbers would not line up (spec §D.4). It is
+/// checked before a snapshot is made; the chain walk checks it again.
+pub(crate) fn check_parent_fits(
+    parent: &lr_format::Superblock,
+    chunk_size: u32,
+    source_bytes: u64,
+) -> Result<()> {
+    if parent.chunk_size != chunk_size {
+        return Err(Error::unsupported(format!(
+            "the parent image uses {}-byte chunks and this backup {chunk_size}-byte ones; \
+             start a new full chain or use the parent's chunk size",
+            parent.chunk_size
+        )));
+    }
+    let chunks = |bytes: u64| bytes.div_ceil(u64::from(chunk_size));
+    if chunks(parent.source_size_bytes) != chunks(source_bytes) {
+        return Err(Error::unsupported(format!(
+            "the source has {source_bytes} bytes but the parent image {}; start a new full \
+             chain",
+            parent.source_size_bytes
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_chunk_size(chunk_size: u32) -> Result<()> {
@@ -1528,9 +1717,107 @@ pub fn chain_dir(root: &Path, chain_id: &ChainId) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackupRequest, Compression, backup_block_full, validate_chunk_size};
+    use super::{
+        BackupRequest, Compression, Counts, backup_block_full, check_parent_fits,
+        merge_delta_entries, validate_chunk_size,
+    };
     use crate::keys::Encryption;
     use crate::keystore::Passphrase;
+    use lr_format::{BlockEntry, DeltaEntry};
+    use std::collections::BTreeMap;
+
+    fn stored(byte: u8) -> BlockEntry {
+        BlockEntry::stored(1, [byte; 32], u64::from(byte) * 4096, 100).expect("entry")
+    }
+
+    /// What a live member reads again is merged into its delta manifest in
+    /// chunk order: a chunk read again replaces its entry, a chunk the first
+    /// pass inherited is inserted where it belongs (spec §E.7, §G.2).
+    #[test]
+    fn chunks_read_again_merge_into_a_delta_in_chunk_order() {
+        let first_pass = [(2u64, stored(2)), (5, BlockEntry::zero()), (9, stored(9))];
+        let mut spool = Vec::new();
+        for (chunk_no, entry) in first_pass {
+            DeltaEntry { chunk_no, entry }
+                .write(&mut spool)
+                .expect("write");
+        }
+        let recopied: BTreeMap<u64, BlockEntry> = [
+            (0, stored(40)),
+            (5, stored(50)),
+            (7, stored(70)),
+            (12, stored(120)),
+        ]
+        .into();
+        let mut counts = Counts {
+            stored: 2,
+            zero: 1,
+            changed: 3,
+            inherited: 10,
+            ..Counts::default()
+        };
+        let mut merged = Vec::new();
+        let mut wire = lr_format::wire::Reader::new(spool.as_slice());
+        let written =
+            merge_delta_entries(&mut wire, 3, &recopied, &mut counts, &mut merged).expect("merge");
+        assert_eq!(written, 6);
+        let mut wire = lr_format::wire::Reader::new(merged.as_slice());
+        let entries: Vec<(u64, BlockEntry)> = (0..written)
+            .map(|_| DeltaEntry::read(&mut wire).map(|e| (e.chunk_no, e.entry)))
+            .collect::<lr_core::Result<_>>()
+            .expect("read");
+        assert_eq!(
+            entries,
+            [
+                (0, stored(40)),
+                (2, stored(2)),
+                (5, stored(50)),
+                (7, stored(70)),
+                (9, stored(9)),
+                (12, stored(120)),
+            ]
+        );
+        // Three chunks became changes; the zero chunk became a stored one.
+        assert_eq!((counts.stored, counts.zero), (6, 0));
+        assert_eq!((counts.changed, counts.inherited), (6, 7));
+    }
+
+    /// A parent chunked differently, or of another size, is refused before a
+    /// snapshot is made.
+    #[test]
+    fn a_parent_that_does_not_line_up_is_refused() {
+        let parent = lr_format::Superblock {
+            format_major: lr_format::FORMAT_MAJOR,
+            min_reader: lr_format::MIN_READER,
+            flags: 0,
+            image_kind: lr_core::ImageKind::Block,
+            consistency: lr_core::Consistency::Frozen,
+            image_uuid: lr_core::ImageId::ZERO,
+            chain_id: lr_core::ChainId::new(lr_core::Id::from_bytes([1; 16])),
+            set_id: lr_core::SetId::new(lr_core::Id::from_bytes([2; 16])),
+            parent_uuid: lr_core::ImageId::ZERO,
+            seq_in_chain: 0,
+            created_unix: 1,
+            source_size_bytes: 64 << 20,
+            logical_block_size: 512,
+            chunk_size: 1 << 20,
+            kdf_id: 0,
+            aead_id: lr_crypto::AEAD_ID_AES_256_GCM,
+            kdf_salt: [0; 16],
+            argon2_m_cost_kib: 0,
+            argon2_t_cost: 0,
+            argon2_p_cost: 0,
+            wrap_nonce: [0; 12],
+            wrapped_chain_key: [0; 48],
+        };
+        assert!(check_parent_fits(&parent, 1 << 20, 64 << 20).is_ok());
+        // The same chunk count is the same layout.
+        assert!(check_parent_fits(&parent, 1 << 20, (64 << 20) - 512).is_ok());
+        let error = check_parent_fits(&parent, 4 << 20, 64 << 20).expect_err("chunk size");
+        assert!(error.to_string().contains("chunks"), "{error}");
+        let error = check_parent_fits(&parent, 1 << 20, 128 << 20).expect_err("size");
+        assert!(error.to_string().contains("new full chain"), "{error}");
+    }
 
     /// The CLI and the daemon pass even a local destination as a URI; the
     /// freeze provider must still see it as local and check that it is not
