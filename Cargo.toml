@@ -88,7 +88,7 @@ zbus_polkit = "=5.1.0"
 # Remote destinations (spec §B) - used from S10.
 # No default features: the default `aws-lc-rs` backend needs cmake/bindgen and
 # does not build for the static musl rescue CLI. Members opt in to `ring`.
-russh = { version = "=0.63.3", default-features = false }
+russh = { version = "=0.65.1", default-features = false }
 russh-sftp = "=3.0.0"
 
 # Test / dev
