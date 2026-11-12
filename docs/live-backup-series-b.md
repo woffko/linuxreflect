@@ -1,5 +1,10 @@
 # Live backup series B: incremental and differential live images
 
+Status, 2026-11-12: B1–B4 are done (D-142). The B2 stop point did not
+apply: the format already carries a full or delta manifest per region. The
+VM acceptance of a live incremental passed on Debian 12 and Ubuntu 24.04
+under UEFI with Secure Boot (`docs/live-backup-acceptance.md`).
+
 Slice 18 follow-up to `docs/live-backup-plan.md` (phases 0–4 and the
 automatic choice of D-141 are done). Goal: on a running Debian or Ubuntu
 system, take a full live image of the system disk, keep the system running,
