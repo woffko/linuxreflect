@@ -1,5 +1,9 @@
 # Live backup series C: the Slice 18 release gate and a pre-release
 
+Status, 2026-11-17: C1–C4 are done on `478a6ff` (pull request #6, D-143).
+`v0.2.0-beta.1` is published from the merge commit `a1c20f1`, which has the
+same tree, and its downloaded assets match `SHA256SUMS`.
+
 Slice 18 follow-up to `docs/live-backup-plan.md` and
 `docs/live-backup-series-b.md` (phases 0–4, the automatic choice of D-141
 and the live chains of D-142 are done). Goal: pass the plan's "Release gate

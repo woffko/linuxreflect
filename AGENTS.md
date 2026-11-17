@@ -26,12 +26,15 @@ hold, D-141), and the Slice 18 AC (c) and (e) tests that were missing exist
 without tracking). Series B (`docs/live-backup-series-b.md`, D-142) adds
 incremental and differential live members, for partitions and for whole
 disks, and whole-disk chains for every route (`chain::DiskWalk`). Series C
-(`docs/live-backup-series-c.md`) runs the plan's release gate for the
-pre-release `v0.2.0-beta.1` (workspace version 0.2.0): the VM matrix passed
-on all six configurations with a live incremental restored as a chain, after
-D-143 stopped counting the write-back before the final freeze against
-`--freeze-max`; a 200-member whole-disk chain has its own scale profile. A
-GUI run inside a VM that boots the restored disk is not done yet.
+(`docs/live-backup-series-c.md`) passed the plan's release gate on `478a6ff`
+(workspace version 0.2.0): the VM matrix on all six configurations with a
+live incremental restored as a chain, after D-143 stopped counting the
+write-back before the final freeze against `--freeze-max`; a 200-member
+whole-disk chain has its own scale profile; the tests that need systemd run
+in CI's `root-tests-systemd` job. `v0.2.0-beta.1` is published from its merge
+commit `a1c20f1` as a pre-release with tracked-freeze opt-in: phase 5, the
+field trial, has started (operator guide, "Field trial"). A GUI run inside a
+VM that boots the restored disk is not done yet.
 
 The MVP is slices S1–S11 (spec §K). Slices are landed one pull request each.
 Current state: S1 (workspace, `lr-core`, `lr-unsafe`, capability probe,
