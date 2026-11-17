@@ -394,6 +394,48 @@ ext4 under write load, restored through the GUI
 (`a_mounted_ext4_is_imaged_live_through_the_gui_on_x11`). Jobs through the daemon are covered by a root test
 on loop disks, not by the VM acceptance, which runs the CLI without a daemon.
 
+### Field trial
+
+From `v0.2.0-beta.1`, tracked-freeze is in a pre-release so that it can be
+tried on real machines (Slice 18, phase 5). It stays opt-in. Whether plain
+`auto` should choose it without `--allow-freeze` (spec §M.4) will be decided
+from what the trial shows. To take part:
+
+1. **Opt in and keep the report.** Back up the system disk to a destination on
+   another disk, a share or SFTP:
+
+   ```sh
+   sudo linuxreflect backup create --source /dev/nvme0n1 --dest /mnt/backup \
+       --set system --allow-freeze --json > report.json
+   ```
+
+   After the full image, take an incremental the same way with
+   `--type incremental`.
+2. **Test a restore before relying on the image.** Run `verify --chain`
+   against the image. Then restore it to a spare disk of at least the same
+   size and boot that disk alone, or restore it to an image file of at least
+   the same size (`truncate -s`), attach the file read-only with
+   `losetup --read-only --partscan` and check its filesystems with
+   `e2fsck -fn`.
+3. **Report what happened** in an issue at
+   <https://github.com/woffko/linuxreflect/issues>:
+   - the job's numbers, without paths or names:
+     `jq '{mode, consistency, member_kind, tracked, warnings}' report.json`
+     (`tracked` holds the passes, the re-copied chunks, the chunks read
+     under the final freeze, and the lengths of the barrier and final
+     freezes);
+   - for a refusal or a failure, the error code and its message, such as
+     `E_NO_CONVERGENCE` or the `tracked-freeze cannot copy this source live`
+     warning of the automatic choice;
+   - the kernel (`uname -r`), the distribution, and the source disk's type
+     (`lsblk -d -o TRAN,ROTA,SIZE /dev/nvme0n1`);
+   - what the machine was doing: an idle desktop, a build, a database, a
+     package upgrade;
+   - whether the restored copy booted, or what `e2fsck -fn` reported.
+
+   Leave out anything private: host names, file paths, and the model and
+   serial numbers of your disks.
+
 ## Chains: full, incremental, differential
 
 A chain is one full backup and the members that follow it.
