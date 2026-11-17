@@ -414,7 +414,10 @@ fn killing_the_server_mid_transfer_leaves_nothing_finalized() {
 
     // Let the short lease expire, restart the server on the same tree, and
     // resume: the stale lock is broken and the new job uses a new image UUID.
-    std::thread::sleep(Duration::from_millis(2200));
+    // The lease is kept in whole seconds and is stale once `now > created +
+    // ttl` (lr_store::LockRecord::is_stale), so a refresh early in a second
+    // lasts almost ttl + 1 s: wait that long.
+    std::thread::sleep(Duration::from_millis(3200));
     let work = tempfile::tempdir().expect("workdir");
     let Some(source) = source_image(work.path()) else {
         return;
