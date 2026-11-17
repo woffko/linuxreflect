@@ -1756,10 +1756,27 @@ mod tests {
                 }
             );
         }
-        assert!(matches!(
-            record_with_id(&incomplete_attempt(), &history_options, test_id(0x54), None),
-            RecordingOutcome::Recorded { .. }
-        ));
+        // Another test thread may fork while the fixture's lock is open; its
+        // child shares the open description, and with it the lock, until its
+        // exec closes the CLOEXEC descriptor. Recording rightly answers Busy
+        // meanwhile, so retry Busy briefly: Busy must not outlive that.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let recorded = loop {
+            let outcome =
+                record_with_id(&incomplete_attempt(), &history_options, test_id(0x54), None);
+            let busy = outcome
+                == RecordingOutcome::NotRecorded {
+                    reason: HistoryFailure::Busy,
+                };
+            if !busy || std::time::Instant::now() >= deadline {
+                break outcome;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert!(
+            matches!(recorded, RecordingOutcome::Recorded { .. }),
+            "recording did not recover after the lock was released: {recorded:?}"
+        );
         assert_eq!(
             load_verification_history(&history_options)
                 .expect("load after lock release")
