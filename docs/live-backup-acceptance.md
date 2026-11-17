@@ -111,35 +111,37 @@ incremental's backup.
 Series B3 ran this on 2026-11-12 for Debian 12 and Ubuntu 24.04 under UEFI
 with Secure Boot (static CLI from `eeedcdf`, TCG; both passed). Series C3 ran
 all six configurations on 2026-11-17 with `tools/vm/live_restore_matrix.py
---incremental` and one static CLI built from `ee94511` (SHA-256
-`4e85aca775ad9c2da9b4fba1e363fd771c9bf18da87a87e09d7623742fbbc678`), under
-KVM, with the 3 s `--freeze-max` default:
+--incremental` under KVM, with the 3 s `--freeze-max` default. The final run
+used one static CLI built from `d93ddc7` (SHA-256
+`085cfac6b8bae9625f9be13543ffa3d2fe8067fa4d4fcd9cbdf4fb5f7e912847`):
 
 | Distribution | Firmware | Chunks stored: full / incremental | Final freeze: full / incremental | Regions | Restored boot | Log records (window) |
 |---|---|---|---|---|---|---|
-| Debian 12 | UEFI, Secure Boot on | 959 / 53 | 2754 / 166 ms | leading area, BIOS boot, ESP, `/` | `multi-user`, 0 failed, no recovery | 1790 (1616–1809) |
-| Debian 13 | UEFI, Secure Boot on | 836 / 49 | 321 / 205 ms | same | same | 1497 (1357–1520) |
-| Ubuntu 22.04 | UEFI, Secure Boot on | 1785 / 58 | 231 / 177 ms | same | same | 1464 (1266–1481) |
-| Ubuntu 24.04 | UEFI, Secure Boot on | 1880 / 64 | 1810 / 241 ms | same plus `/boot` | same | 2210 (1875–2232) |
-| Debian 12 | BIOS | 959 / 55 | 183 / 133 ms | leading area, BIOS boot, ESP, `/` | same | 1975 (1793–1999) |
-| Ubuntu 24.04 | BIOS | 1881 / 61 | 221 / 185 ms | same plus `/boot` | same | 2227 (1918–2250) |
+| Debian 12 | UEFI, Secure Boot on | 959 / 55 | 189 / 195 ms | leading area, BIOS boot, ESP, `/` | `multi-user`, 0 failed, no recovery | 1947 (1794–1970) |
+| Debian 13 | UEFI, Secure Boot on | 837 / 56 | 919 / 181 ms | same | same | 1977 (1823–2001) |
+| Ubuntu 22.04 | UEFI, Secure Boot on | 1785 / 61 | 175 / 141 ms | same | same | 2215 (1934–2235) |
+| Ubuntu 24.04 | UEFI, Secure Boot on | 1880 / 64 | 191 / 189 ms | same plus `/boot` | same | 2382 (2077–2410) |
+| Debian 12 | BIOS | 959 / 55 | 168 / 174 ms | leading area, BIOS boot, ESP, `/` | same | 2175 (2016–2200) |
+| Ubuntu 24.04 | BIOS | 1880 / 62 | 186 / 201 ms | same plus `/boot` | same | 2124 (1967–2150) |
 
 All six passed. Every member converged in one pass. The incrementals stored
-3–6 % of what the fulls stored and inherited the rest (8128–8143 chunks of
+3–7 % of what the fulls stored and inherited the rest (8128–8137 chunks of
 1 MiB). Under UEFI the restored system reported Secure Boot on.
 
-The full image's final freeze varied widely: 183–321 ms in four runs, but
-1.8 s and 2.8 s in two. Those two final reads followed a first pass that had
-just written about 1 GB to the destination disk, and the step lengths of
-those runs were not kept. Since D-143 the job log names them
-(`tracked-freeze final freeze write_back_ms … freezing_ms … inside_ms …
-thaw_ms …`), and the field trial should show which step dominates on real
-hardware.
+Two earlier C3 runs led to changes:
 
-The first C3 attempt, on `0a8ab4c` while the host was also running the full
-root suite, failed Debian 12 under both firmwares with `E_FREEZE_TIMEOUT`.
-The final freeze's clock then started before the `syncfs` that precedes the
-freeze, so a slow write-back of dirty pages, which holds no writer, counted
-against `--freeze-max`. D-143 measures from the freeze. Run again with that
-change, both Debian 12 configurations passed with final freezes of
-146–201 ms, and the run above followed.
+- The first, on `0a8ab4c` while the host also ran the full root suite,
+  failed Debian 12 under both firmwares with `E_FREEZE_TIMEOUT`. The final
+  freeze's clock then started before the `syncfs` that precedes the freeze,
+  so a slow write-back of dirty pages, which holds no writer, counted against
+  `--freeze-max`. D-143 measures from the freeze; both Debian 12
+  configurations then passed with final freezes of 146–201 ms.
+- The second, on a CLI built from `ee94511` (D-143 included), passed all
+  six. Two of its full images had final freezes of 1.8 s and 2.8 s, right
+  after a first pass that had written about 1 GB to the destination disk;
+  the other four took 183–321 ms. The run above, after one more change to
+  `schedule remove` that does not touch the copy, stayed below 1 s in every
+  configuration. Since D-143 the job log names each step of the final
+  freeze (`tracked-freeze final freeze write_back_ms … freezing_ms …
+  inside_ms … thaw_ms …`), so the field trial can show which step dominates
+  when a freeze is long.
