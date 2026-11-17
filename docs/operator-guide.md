@@ -246,7 +246,7 @@ disk together, reads the remaining changed blocks into memory, thaws, and only
 then writes them to the image. Programs that write to those filesystems wait
 only during this final freeze. The report gives its length (`tracked`,
 `final_freeze_ms`), the passes and the re-copied chunks. In the acceptance
-runs it lasted 0.6–1.3 s under full emulation and about 0.2 s on loop disks.
+runs it lasted 0.13–2.8 s in virtual machines and about 0.2 s on loop disks.
 
 **What it guarantees.** Every ext4 filesystem in the image is as the freeze
 left it: journal flushed, clean, and at the same instant for every filesystem
@@ -384,7 +384,8 @@ loader and `/etc/fstab` may mount partitions from either disk.
 
 **Tested** on Debian 12, Debian 13, Ubuntu 22.04 and Ubuntu 24.04, under UEFI
 with Secure Boot and under BIOS. Each running system was imaged live under a
-write load, restored to another disk, and booted from that disk alone
+write load, imaged live again as an incremental, restored as a chain to
+another disk, and booted from that disk alone
 ([`live-backup-acceptance.md`](live-backup-acceptance.md)).
 
 **Not done yet:** the `--allow-inconsistent` exception for a busy ESP, and
