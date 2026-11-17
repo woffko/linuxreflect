@@ -245,7 +245,13 @@ impl Writer {
             while !flag.load(Ordering::Relaxed) {
                 let started = Instant::now();
                 previous = link(previous, seq);
-                writeln!(log, "{seq} {previous:016x}").expect("log");
+                // One write(2) per record: a freeze waits for a write in
+                // progress, so it lands between records, never inside one.
+                // `writeln!` on an unbuffered File would issue one write per
+                // formatted piece, and a freeze between them leaves a torn
+                // record in an otherwise correct image.
+                let record = format!("{seq} {previous:016x}\n");
+                log.write_all(record.as_bytes()).expect("log");
                 log.sync_all().expect("fsync log");
                 records.push((seq, started, Instant::now()));
                 for _ in 0..4 {
