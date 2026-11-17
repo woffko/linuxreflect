@@ -38,12 +38,13 @@ event layout, a disk that is not blk-mq). Series B
 (`docs/live-backup-series-b.md`, D-142) added incremental and differential
 live members for partitions and whole disks, whole-disk chains for every
 route, and the VM acceptance of a live incremental. Series C
-(`docs/live-backup-series-c.md`) runs the release gate below and prepares
-the pre-release `v0.2.0-beta.1`, which starts phase 5; its VM matrix passed
-on all six configurations with a live incremental (D-143). Still open: the GUI
-acceptance inside a VM with a boot of the
-restored disk (phase 4), the
-`--allow-inconsistent` exception for a busy ESP, and phase 5. That
+(`docs/live-backup-series-c.md`) passed the release gate below on `478a6ff`
+(its VM matrix on all six configurations with a live incremental, D-143),
+and `v0.2.0-beta.1` is published from its merge commit `a1c20f1`: phase 5,
+the field trial, has started. Still open: the GUI acceptance inside a VM
+with a boot of the restored disk (phase 4), the `--allow-inconsistent`
+exception for a busy ESP, and the rest of phase 5 (the trial's results and
+the §M.4 decision). That
 exception (§E.7 quiet-window rule) is not implemented: a write to a region
 that cannot be frozen during its final read always fails the job, the
 stricter outcome. Reporting that partition alone as `None` would change its
@@ -214,6 +215,11 @@ Ship tracked-freeze as opt-in in a pre-release, collect freeze lengths, pass
 counts and refusals, and decide spec §M.4 (whether plain `auto` selects it).
 
 ## Release gate for Slice 18
+
+Passed on `478a6ff` (series C, 2026-11-17): `cargo xtask ci` 752 passed;
+`cargo xtask root` 92 scenarios, none unavailable, nothing left behind; the
+VM matrix with a live incremental on all six configurations; `cargo xtask
+scale` within its budgets, a 200-member whole-disk chain included.
 
 - `cargo xtask ci` exits 0;
 - `cargo xtask root` passes with no unavailable scenario, including the new
