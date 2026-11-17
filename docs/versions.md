@@ -34,11 +34,11 @@ by Cargo).
 | sha2 | 0.11.0 | Locked, KAT-verified | lr-crypto (S3) |
 | blake3 | 1.8.7 | Locked, official test vectors | lr-crypto (S3) |
 | zeroize | 1.9.0 | Locked | lr-crypto (S3) |
-| fastcdc | 5.0.0 | Declared | lr-format stream/file chunking (S4, S12) |
-| rand | 0.10.2 | Declared | tests only; identifiers use `/dev/urandom` |
+| fastcdc | 5.0.0 | Locked | lr-engine stream chunking (S8) |
+| rand | 0.10.2 | Locked (transitive) | pulled in by `russh`; identifiers use `/dev/urandom` |
 | gpt | 4.1.0 | Locked | lr-core discovery |
 | mbrman | 0.6.1 | Locked | lr-core discovery |
-| nix | 0.31.3 | Declared | reserved for `lr-unsafe` helpers |
+| nix | 0.31.3 | Locked | lr-daemon (socket group lookup) |
 | libc | 0.2.189 | Locked | lr-unsafe |
 | tonic | 0.14.6 | Locked | lr-proto, lr-daemon |
 | prost | 0.14.4 | Locked | lr-proto |
@@ -50,8 +50,8 @@ by Cargo).
 | slint-build | 1.18.0 | Locked | lr-gui build script |
 | hmac | 0.13.0 | Locked | lr-store hashed `known_hosts` (S10) |
 | sha1 | 0.11.0 | Locked | lr-store hashed `known_hosts` (S10) |
-| russh | 0.63.3 | Declared | lr-store SFTP (S10) |
-| russh-sftp | 3.0.0 | Declared | lr-store SFTP (S10) |
+| russh | 0.65.1 | Locked | lr-store SFTP (S10); 0.65.1 is the RUSTSEC-2026-0495 fix |
+| russh-sftp | 3.0.0 | Locked | lr-store SFTP (S10) |
 | proptest | 1.11.0 | Locked | lr-crypto and lr-format dev-dependency |
 | tempfile | 3.27.0 | Locked | tests |
 | hex | 0.4.3 | Locked | lr-crypto and lr-format dev-dependency |
@@ -63,8 +63,9 @@ by Cargo).
   (CVSS 7.3) allows a PID-reuse authorization bypass (spec §B, §I).
 * `rand` is intentionally not used for identifiers: `lr_core::Id::generate()`
   reads `/dev/urandom` directly, so no RNG version can affect on-disk identity.
-* `nix` is pinned but not yet used; block ioctls are implemented directly on
-  `libc` in `lr-unsafe` so that every request number is visible in one place.
+* `nix` is used only by `lr-daemon` to look up the socket's group; block
+  ioctls are implemented directly on `libc` in `lr-unsafe` so that every
+  request number is visible in one place.
 * Versions must be re-verified when their slice lands, and any change recorded
   here in the same pull request.
 
