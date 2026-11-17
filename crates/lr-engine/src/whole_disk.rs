@@ -7,27 +7,30 @@
 //! spec's 16 MiB cap. Gaps and the backup GPT are not imaged; restore
 //! regenerates the GPT for the target size.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use lr_blocksource::{BlockSource, DirectBlockSource, DirectBlockTarget, UsedChunks, is_all_zero};
+use lr_blocksource::{BlockSource, DirectBlockSource, DirectBlockTarget, UsedChunks};
+use lr_core::catalog::MemberKind;
 use lr_core::{
     Consistency, Error, ImageId, ImageKind, Result, SnapshotOpts, SourceLayout, Support,
     discovery::discover_source,
 };
 use lr_crypto::nonce::NonceSeq;
 use lr_format::{
-    BlockEntry, BlockManifestHeader, ChainMember, ChunkOptions, DiskHeader, EXTRAS_IMAGE_METADATA,
-    FORMAT_MAJOR, ImageWriter, MAX_LEADING_BYTES, MIN_READER, PtType, RegionKind, RegionRecord,
-    SWAP_HEADER_BYTES, StreamId, Superblock, WriterKeys, flags, wire, write_chain_members,
-    write_extras_record,
+    BlockEntry, BlockManifestHeader, ChainMember, ChunkOptions, ChunkState, DeltaEntry, DiskHeader,
+    EXTRAS_IMAGE_METADATA, FORMAT_MAJOR, ImageWriter, MAX_LEADING_BYTES, MIN_READER, PtType,
+    RegionKind, RegionRecord, SWAP_HEADER_BYTES, StreamId, Superblock, WriterKeys, flags, wire,
+    write_chain_members, write_extras_record,
 };
 use lr_fsmap::provider_for;
 use lr_snapshot::{BlockSnapshotProvider, offline_provider};
 
-use crate::backup::{BadSectorPolicy, Compression, now_unix, validate_chunk_size};
-use crate::keys::{self, ImageKeys};
+use crate::backup::{BadSectorPolicy, Compression, SourceState, now_unix, validate_chunk_size};
+use crate::backup_plan::{BackupMode, ManifestEncoding, ResolvedBackupPlan};
+use crate::keys;
 use crate::restore::{RestoreReport, RestoreToken};
 
 /// Per-region outcome of a whole-disk backup.
@@ -80,9 +83,29 @@ pub struct WholeDiskReport {
     pub regions: Vec<RegionReport>,
     /// Whether chunks are encrypted.
     pub encrypted: bool,
+    /// The member's role in its chain (D-142).
+    #[serde(default = "full_member")]
+    pub member_kind: MemberKind,
+    /// Position in the chain; 0 is the full.
+    #[serde(default)]
+    pub seq_in_chain: u32,
+    /// Parent image UUID; zero for a full.
+    #[serde(default)]
+    pub parent_uuid: ImageId,
+    /// Chunks of every region that changed since the parent (all of them
+    /// for a full image).
+    #[serde(default)]
+    pub changed_chunks: u64,
+    /// Chunks inherited unchanged from an ancestor.
+    #[serde(default)]
+    pub inherited_chunks: u64,
     /// What a tracked-freeze copy did (spec §E.7); `None` for an offline image.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tracked: Option<lr_snapshot::TrackedSummary>,
+}
+
+const fn full_member() -> MemberKind {
+    MemberKind::Full
 }
 
 impl WholeDiskReport {
@@ -140,6 +163,85 @@ fn plan_partition(partition: &lr_core::PartitionLayout) -> PartitionPlan {
     }
 }
 
+/// How `current` differs from `parent` in what a whole-disk chain relies on
+/// (D-142): the disk's geometry, its partition table ([`table_bytes`]), and each
+/// region's kind, number, place, type and PARTUUID. Contents may differ (a
+/// filesystem re-created in place is a change of data, not of layout), and
+/// so may the swap headers and each region's consistency.
+pub(crate) fn layout_difference(parent: &DiskHeader, current: &DiskHeader) -> Option<String> {
+    if parent.disk_size != current.disk_size {
+        return Some(format!(
+            "the disk has {} bytes, its parent {}",
+            current.disk_size, parent.disk_size
+        ));
+    }
+    if parent.logical_block_size != current.logical_block_size {
+        return Some(format!(
+            "the disk has {}-byte sectors, its parent {}",
+            current.logical_block_size, parent.logical_block_size
+        ));
+    }
+    if parent.pt_type != current.pt_type
+        || table_bytes(parent.pt_type, &parent.pt_raw, parent.logical_block_size)
+            != table_bytes(current.pt_type, &current.pt_raw, current.logical_block_size)
+    {
+        return Some("the partition table changed".to_owned());
+    }
+    if parent.regions.len() != current.regions.len() {
+        return Some(format!(
+            "the disk has {} regions, its parent {}",
+            current.regions.len(),
+            parent.regions.len()
+        ));
+    }
+    for (old, new) in parent.regions.iter().zip(&current.regions) {
+        if old.kind != new.kind
+            || old.index != new.index
+            || old.start_lba != new.start_lba
+            || old.size_bytes != new.size_bytes
+            || old.type_guid != new.type_guid
+            || old.partuuid != new.partuuid
+        {
+            return Some(format!(
+                "region {} ({}) at sector {} changed",
+                new.index,
+                region_kind_name(new.kind),
+                new.start_lba
+            ));
+        }
+    }
+    None
+}
+
+/// The bytes of a captured partition table that describe the partitions:
+/// the MBR's four entries and its signature (bytes 446..512), and for GPT the
+/// GPT header and its entry array. The MBR boot code and the rest of the
+/// boot area are a boot loader's data, imaged as the leading region (D-142).
+fn table_bytes(pt_type: PtType, pt_raw: &[u8], lbs: u32) -> Vec<u8> {
+    let slice = |start: usize, len: usize| {
+        let end = start.saturating_add(len).min(pt_raw.len());
+        pt_raw.get(start..end).unwrap_or(&[])
+    };
+    let mut bytes = slice(446, 66).to_vec();
+    if pt_type == PtType::Gpt {
+        let lbs = usize::try_from(lbs).unwrap_or(usize::MAX);
+        let header = slice(lbs, 92);
+        bytes.extend_from_slice(header);
+        let field = |at: usize, len: usize| {
+            header.get(at..at + len).map_or(0, |raw| {
+                raw.iter()
+                    .rev()
+                    .fold(0u64, |value, byte| value << 8 | u64::from(*byte))
+            })
+        };
+        let entries_lba = usize::try_from(field(72, 8)).unwrap_or(usize::MAX);
+        let entries =
+            usize::try_from(field(80, 4).saturating_mul(field(84, 4))).unwrap_or(usize::MAX);
+        bytes.extend_from_slice(slice(entries_lba.saturating_mul(lbs), entries));
+    }
+    bytes
+}
+
 /// How a whole disk is read (spec §E, D-138, D-141).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Route {
@@ -163,11 +265,6 @@ pub(crate) fn preflight(
     layout: &SourceLayout,
     stage: lr_snapshot::probe::Stage,
 ) -> Result<Route> {
-    if request.member_type != crate::backup::MemberType::Full || request.parent.is_some() {
-        return Err(Error::unsupported(
-            "whole-disk images are full images only; per-region chain support is not implemented yet",
-        ));
-    }
     validate_chunk_size(request.chunk_size)?;
     if !layout.is_whole_disk() {
         return Err(Error::unsupported(
@@ -403,12 +500,62 @@ pub(crate) fn backup_whole_disk_with_layout(
     disk_header.pt_raw = read_pt_raw(&request.source, lbs, disk_header.pt_type)?;
     disk_header.validate()?;
 
-    // Keys and superblock, exactly as for a block image.
-    let new_keys = keys::new_chain_keys(
-        &request.encryption,
-        &request.chain_id,
-        request.image_uuid.inner(),
-    )?;
+    // The set lock and the chain (spec §D.3), before anything is traced: a
+    // member whose parent describes another disk layout is refused first
+    // (D-142).
+    let destination = request.open_destination()?;
+    let set = destination.open_set(&request.set_id)?;
+    let lock = crate::backup::acquire_set_lock(&*destination, &set, request)?;
+    let (set_root, spool_dir) = crate::backup::spool_location(&*destination, &set)?;
+    let now = now_unix();
+    let resolved_plan =
+        ResolvedBackupPlan::resolve(request, BackupMode::Block, &*destination, &set, now)?;
+    let parent = resolved_plan.parent();
+    let delta = resolved_plan.manifest_encoding() == ManifestEncoding::BlockDelta;
+    let member = u16::try_from(resolved_plan.seq_in_chain())
+        .map_err(|_| Error::unsupported("chains longer than 65535 members are not supported"))?;
+    // The parent's merged entries, every region with data in order, so the
+    // regions below are compared with them positionally (spec §D.4).
+    let mut parent_entries = match parent {
+        Some(parent) => {
+            crate::backup::check_parent_fits(
+                &parent.superblock,
+                request.chunk_size,
+                disk_size,
+                true,
+            )?;
+            let members =
+                crate::chain::open_chain(&*destination, &set, &parent.files, &request.encryption)?;
+            let mut walk = crate::chain::DiskWalk::new(members)?;
+            if let Some(difference) = layout_difference(walk.disk(), &disk_header) {
+                return Err(Error::unsupported(format!(
+                    "{difference} since the parent image; start a new full chain"
+                )));
+            }
+            let mut entries = crate::spool::scratch_file(&spool_dir)?;
+            {
+                let mut out = BufWriter::new(&mut entries);
+                walk.walk(|_, _, state, _| crate::backup::entry_of(&state).write(&mut out))?;
+                out.flush().map_err(Error::Io)?;
+            }
+            entries.rewind().map_err(Error::Io)?;
+            Some(wire::Reader::new(BufReader::new(entries)))
+        }
+        None => None,
+    };
+
+    // Keys and superblock, exactly as for a block image. A member reuses its
+    // parent's chain key (spec §G.4).
+    let chain_id = resolved_plan.chain_id();
+    let new_keys = match parent {
+        Some(parent) => keys::member_chain_keys(
+            &request.encryption,
+            &parent.superblock,
+            &chain_id,
+            request.image_uuid.inner(),
+        )?,
+        None => keys::new_chain_keys(&request.encryption, &chain_id, request.image_uuid.inner())?,
+    };
     let meta_key = *new_keys.keys.meta_key;
     let mac_key = new_keys.encrypted.then_some(&meta_key);
     let mut sb_flags = flags::WHOLE_DISK;
@@ -418,6 +565,9 @@ pub(crate) fn backup_whole_disk_with_layout(
     if matches!(request.compression, Compression::Zstd { .. }) {
         sb_flags |= flags::COMPRESSED;
     }
+    if delta {
+        sb_flags |= flags::DELTA_MANIFEST;
+    }
     let mut superblock = Superblock {
         format_major: FORMAT_MAJOR,
         min_reader: MIN_READER,
@@ -425,11 +575,11 @@ pub(crate) fn backup_whole_disk_with_layout(
         image_kind: ImageKind::Block,
         consistency,
         image_uuid: request.image_uuid,
-        chain_id: request.chain_id,
-        set_id: request.set_id,
-        parent_uuid: ImageId::ZERO,
-        seq_in_chain: 0,
-        created_unix: now_unix(),
+        chain_id,
+        set_id: resolved_plan.set_id(),
+        parent_uuid: resolved_plan.parent_uuid(),
+        seq_in_chain: resolved_plan.seq_in_chain(),
+        created_unix: now,
         source_size_bytes: disk_size,
         logical_block_size: lbs,
         chunk_size: request.chunk_size,
@@ -460,11 +610,12 @@ pub(crate) fn backup_whole_disk_with_layout(
     let mut tracked_regions: Vec<TrackedRegionSpool> = Vec::new();
     let reads_before = source.read_stats();
 
-    let destination = request.open_destination()?;
-    let set = destination.open_set(&request.set_id)?;
-    let lock = crate::backup::acquire_set_lock(&*destination, &set, request)?;
-    let (set_root, spool_dir) = crate::backup::spool_location(&*destination, &set)?;
-    let image_name = format!("{}/000-full-{}.lrimg", request.chain_id, request.image_uuid);
+    let image_name = format!(
+        "{chain_id}/{:03}-{}-{}.lrimg",
+        resolved_plan.seq_in_chain(),
+        resolved_plan.file_tag(),
+        request.image_uuid
+    );
     let mut guard = crate::backup::TempGuard::new(std::sync::Arc::clone(&destination), set.clone());
 
     let writer_keys = WriterKeys {
@@ -496,6 +647,8 @@ pub(crate) fn backup_whole_disk_with_layout(
     let mut spool_file = crate::spool::scratch_file(&spool_dir)?;
     let mut tracked_summary = None;
     let mut hook_warnings = Vec::new();
+    let mut changed_chunks = 0u64;
+    let mut inherited_chunks = 0u64;
     // Filesystems whose map came back incomplete (D-124).
     let mut map_warnings: Vec<String> = Vec::new();
     // Phase A: chunk records plus the spooled manifest.
@@ -523,6 +676,7 @@ pub(crate) fn backup_whole_disk_with_layout(
             // entries so the reader can stream it.
             let chunk_size = u64::from(request.chunk_size);
             let chunk_count = region.chunk_count(chunk_size)?;
+            let header_offset = spool.stream_position().map_err(Error::Io)?;
             BlockManifestHeader {
                 chunk_size: request.chunk_size,
                 chunk_count,
@@ -533,7 +687,7 @@ pub(crate) fn backup_whole_disk_with_layout(
                 fs_uuid: region.fs_uuid.clone(),
                 label: region.fs_label.clone(),
             }
-            .write(&mut spool, false)?;
+            .write(&mut spool, delta)?;
             let report_index = reports.len();
             if tracked.is_some() {
                 tracked_regions.push(TrackedRegionSpool {
@@ -541,6 +695,7 @@ pub(crate) fn backup_whole_disk_with_layout(
                     start_byte: region.start_lba * u64::from(lbs),
                     size_bytes: region.size_bytes,
                     report: report_index,
+                    aside: delta.then(BTreeMap::new),
                 });
             }
 
@@ -586,61 +741,93 @@ pub(crate) fn backup_whole_disk_with_layout(
                 complete: regions_of_source.complete,
             };
             let mut plan = UsedChunks::new(&region_map, chunk_size, region.size_bytes)?;
-            let mut next_index = 0u64;
             let mut stored_chunks = 0u64;
             let mut zero_chunks = 0u64;
             let mut bad_chunks = 0u64;
+            let mut changed = 0u64;
             reporter.phase(&format!("region {}", region.index));
             reporter.report(region.start_lba * u64::from(lbs))?;
-            while let Some(chunk) = plan.next_chunk() {
-                reporter.report(region.start_lba * u64::from(lbs) + chunk.offset)?;
-                while next_index < chunk.index {
-                    BlockEntry::unused().write(&mut spool)?;
-                    next_index += 1;
-                }
-                let absolute = lr_blocksource::ChunkPlan {
-                    index: chunk.index,
-                    offset: region_start + chunk.offset,
-                    len: chunk.len,
+            // Every chunk of the region in order, compared with the parent's
+            // merged state (none for a full image).
+            let mut next_chunk = plan.next_chunk();
+            for index in 0..chunk_count {
+                let parent_state = match parent_entries.as_mut() {
+                    Some(entries) => ChunkState::from(&BlockEntry::read(entries)?),
+                    None => ChunkState::Unused,
                 };
-                let entry = match lr_blocksource::read_chunk(&mut source, &absolute, &mut buffer) {
-                    Ok(bytes) => {
-                        if is_all_zero(bytes) {
-                            zero_chunks += 1;
-                            BlockEntry::zero()
-                        } else {
-                            let reference = image_writer.append_chunk(
-                                options,
-                                &writer_keys,
-                                ImageKind::Block,
-                                &mut nonce_seq,
-                                bytes,
-                            )?;
-                            stored_chunks += 1;
-                            BlockEntry::stored(
-                                0,
-                                reference.hash,
-                                reference.offset,
-                                reference.stored_len,
-                            )?
-                        }
+                let source_state = if next_chunk.is_some_and(|chunk| chunk.index == index) {
+                    let chunk = next_chunk.take().expect("checked");
+                    next_chunk = plan.next_chunk();
+                    reporter.report(region_start + chunk.offset)?;
+                    let absolute = lr_blocksource::ChunkPlan {
+                        index: chunk.index,
+                        offset: region_start + chunk.offset,
+                        len: chunk.len,
+                    };
+                    match lr_blocksource::read_chunk(&mut source, &absolute, &mut buffer) {
+                        Ok(bytes) => crate::backup::store_bytes(
+                            &mut image_writer,
+                            options,
+                            &writer_keys,
+                            &mut nonce_seq,
+                            member,
+                            bytes,
+                            &parent_state,
+                        )?,
+                        Err(error @ Error::BadSector { .. }) => match request.on_bad_sector {
+                            BadSectorPolicy::Abort => return Err(error),
+                            BadSectorPolicy::Record => SourceState::BadSector(
+                                BlockEntry::bad_sector(absolute.offset, absolute.len),
+                            ),
+                        },
+                        Err(error) => return Err(error),
                     }
-                    Err(error @ Error::BadSector { .. }) => match request.on_bad_sector {
-                        BadSectorPolicy::Abort => return Err(error),
-                        BadSectorPolicy::Record => {
-                            bad_chunks += 1;
-                            BlockEntry::bad_sector(absolute.offset, absolute.len)
-                        }
-                    },
-                    Err(error) => return Err(error),
+                } else if matches!(parent_state, ChunkState::Unused) {
+                    SourceState::Unchanged
+                } else {
+                    SourceState::Missing
                 };
-                entry.write(&mut spool)?;
-                next_index = chunk.index + 1;
+                let entry = match source_state {
+                    // Inherited: a full region manifest repeats the parent's
+                    // entry, a delta leaves it out; either way no change.
+                    SourceState::Unchanged if parent_entries.is_some() => {
+                        inherited_chunks += 1;
+                        if !delta {
+                            crate::backup::entry_of(&parent_state).write(&mut spool)?;
+                        }
+                        continue;
+                    }
+                    // A full image: nothing is stored for this chunk.
+                    SourceState::Unchanged => BlockEntry::unused(),
+                    SourceState::Stored(entry) => {
+                        stored_chunks += 1;
+                        entry
+                    }
+                    SourceState::Zero => {
+                        zero_chunks += 1;
+                        BlockEntry::zero()
+                    }
+                    SourceState::BadSector(entry) => {
+                        bad_chunks += 1;
+                        entry
+                    }
+                    SourceState::Missing => BlockEntry::unused(),
+                };
+                changed += 1;
+                if delta {
+                    DeltaEntry {
+                        chunk_no: index,
+                        entry,
+                    }
+                    .write(&mut spool)?;
+                } else {
+                    entry.write(&mut spool)?;
+                }
             }
-            while next_index < chunk_count {
-                BlockEntry::unused().write(&mut spool)?;
-                next_index += 1;
+            if delta {
+                crate::backup::patch_entry_count(&mut spool, header_offset, changed)?;
             }
+            changed_chunks += changed;
             reports.push(RegionReport {
                 index: region.index,
                 kind: region_kind_name(region.kind),
@@ -666,8 +853,9 @@ pub(crate) fn backup_whole_disk_with_layout(
                 &mut source,
                 &mut buffer,
                 &mut spool,
-                &tracked_regions,
+                &mut tracked_regions,
                 &mut reports,
+                member,
                 request,
                 first_pass,
             )?;
@@ -681,6 +869,19 @@ pub(crate) fn backup_whole_disk_with_layout(
             hook_warnings.extend_from_slice(copy.warnings());
         }
         spool.flush().map_err(Error::Io)?;
+    }
+
+    // A delta region lists its chunks in order, so what a live member read
+    // again is merged in rather than appended.
+    if tracked_regions
+        .iter()
+        .any(|region| region.aside.as_ref().is_some_and(|aside| !aside.is_empty()))
+    {
+        let (merged, newly_changed) =
+            merge_disk_spool(&mut spool_file, &tracked_regions, &mut reports, &spool_dir)?;
+        spool_file = merged;
+        changed_chunks += newly_changed;
+        inherited_chunks = inherited_chunks.saturating_sub(newly_changed);
     }
 
     reporter.phase("manifest");
@@ -704,13 +905,23 @@ pub(crate) fn backup_whole_disk_with_layout(
     // Extras: chain members and a small metadata record.
     {
         let mut extras = image_writer.page_stream(StreamId::Extras, request.aead, meta_key);
-        write_chain_members(
-            &mut extras,
-            &[ChainMember {
-                index: 0,
-                image_uuid: request.image_uuid,
-            }],
-        )?;
+        let mut members: Vec<ChainMember> = parent
+            .map(|parent| {
+                parent
+                    .prefix
+                    .iter()
+                    .map(|(index, image_uuid)| ChainMember {
+                        index: *index,
+                        image_uuid: *image_uuid,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        members.push(ChainMember {
+            index: u8::try_from(resolved_plan.seq_in_chain()).unwrap_or(u8::MAX),
+            image_uuid: request.image_uuid,
+        });
+        write_chain_members(&mut extras, &members)?;
         let mut metadata = format!(
             "source={}\ndisk_size={disk_size}\npt_type={}\n",
             request.source.display(),
@@ -738,14 +949,23 @@ pub(crate) fn backup_whole_disk_with_layout(
     // A failed flush publishes nothing (R19); an unconfirmed one is reported.
     let durability = destination.publish_new(&set, &tmp_name, &image_name)?;
     guard.disarm();
+    // The catalog, still under the lock (spec §D.3).
+    let catalog_warning =
+        crate::catalog::record_published(&*destination, &set, &request.set_name, &lock, now_unix());
 
     Ok(WholeDiskReport {
         warnings: durability
             .warning("the image")
             .into_iter()
+            .chain(catalog_warning)
             .chain(map_warnings)
             .chain(hook_warnings)
             .collect(),
+        member_kind: resolved_plan.member_kind(),
+        seq_in_chain: resolved_plan.seq_in_chain(),
+        parent_uuid: resolved_plan.parent_uuid(),
+        changed_chunks,
+        inherited_chunks,
         image_path: crate::backup::local_image_path(&set_root, &image_name),
         image_uuid: request.image_uuid,
         disk_size_bytes: disk_size,
@@ -774,6 +994,86 @@ struct TrackedRegionSpool {
     size_bytes: u64,
     /// Index into the region reports.
     report: usize,
+    /// For a delta region manifest, what the copy read again, newest per
+    /// chunk; merged in chunk order once the copy ends ([`merge_disk_spool`]).
+    /// `None` for a full region manifest, patched in place.
+    aside: Option<BTreeMap<u64, BlockEntry>>,
+}
+
+/// Record what a tracked copy read again for chunk `index` of `region`.
+fn record_region_entry(
+    spool: &File,
+    region: &mut TrackedRegionSpool,
+    index: u64,
+    entry: BlockEntry,
+    report: &mut RegionReport,
+) -> Result<()> {
+    match region.aside.as_mut() {
+        Some(aside) => {
+            aside.insert(index, entry);
+            Ok(())
+        }
+        None => patch_region_entry(spool, region, index, &entry, report),
+    }
+}
+
+/// Rewrite a whole-disk manifest spool with what a live member read again
+/// merged into its delta region manifests, in chunk order
+/// ([`crate::backup::merge_delta_entries`]); full region manifests were
+/// patched in place and are copied as they are. Returns the new spool and
+/// how many inherited chunks became changes.
+fn merge_disk_spool(
+    spool: &mut File,
+    regions: &[TrackedRegionSpool],
+    reports: &mut [RegionReport],
+    spool_dir: &Path,
+) -> Result<(File, u64)> {
+    spool.rewind().map_err(Error::Io)?;
+    let mut input = wire::Reader::new(BufReader::new(&mut *spool));
+    let disk = DiskHeader::read(&mut input)?;
+    let mut newly_changed = 0u64;
+    let mut merged = crate::spool::scratch_file(spool_dir)?;
+    {
+        let mut out = BufWriter::new(&mut merged);
+        disk.write(&mut out)?;
+        let mut tracked = regions.iter();
+        let empty = BTreeMap::new();
+        for _ in disk.regions.iter().filter(|region| region.has_manifest()) {
+            let region = tracked
+                .next()
+                .ok_or_else(|| Error::corrupt("a region manifest without its tracked region"))?;
+            let (header, delta) = BlockManifestHeader::read(&mut input)?;
+            let header_offset = out.stream_position().map_err(Error::Io)?;
+            header.write(&mut out, delta)?;
+            if delta {
+                let report = &mut reports[region.report];
+                let mut counts = crate::backup::Counts {
+                    stored: report.stored_chunks,
+                    zero: report.zero_chunks,
+                    bad: report.bad_chunks,
+                    ..crate::backup::Counts::default()
+                };
+                let written = crate::backup::merge_delta_entries(
+                    &mut input,
+                    header.entry_count,
+                    region.aside.as_ref().unwrap_or(&empty),
+                    &mut counts,
+                    &mut out,
+                )?;
+                report.stored_chunks = counts.stored;
+                report.zero_chunks = counts.zero;
+                report.bad_chunks = counts.bad;
+                newly_changed += counts.changed;
+                crate::backup::patch_entry_count(&mut out, header_offset, written)?;
+            } else {
+                for _ in 0..header.entry_count {
+                    BlockEntry::read(&mut input)?.write(&mut out)?;
+                }
+            }
+        }
+        out.flush().map_err(Error::Io)?;
+    }
+    Ok((merged, newly_changed))
 }
 
 /// Replace chunk `index`'s entry of a tracked region and keep its report's
@@ -820,8 +1120,9 @@ fn converge_disk(
     source: &mut DirectBlockSource,
     buffer: &mut lr_unsafe::AlignedBuf,
     spool: &mut BufWriter<&mut File>,
-    regions: &[TrackedRegionSpool],
+    regions: &mut [TrackedRegionSpool],
     reports: &mut [RegionReport],
+    member: u16,
     request: &crate::backup::BackupRequest,
     first_pass: lr_blocksource::ReadStats,
 ) -> Result<lr_snapshot::TrackedSummary> {
@@ -843,7 +1144,7 @@ fn converge_disk(
     while let Some(dirty) = copy.next_pass(pass.bytes, pass.time)? {
         let reads_before = source.read_stats();
         for group in dirty {
-            let region = &regions[group.region];
+            let region = &mut regions[group.region];
             for index in group.chunks {
                 let plan = absolute(region, index);
                 let state = match lr_blocksource::read_chunk(source, &plan, buffer) {
@@ -852,7 +1153,7 @@ fn converge_disk(
                         options,
                         writer_keys,
                         nonce_seq,
-                        0,
+                        member,
                         read,
                         &ChunkState::Unused,
                     )?,
@@ -864,12 +1165,13 @@ fn converge_disk(
                     },
                     Err(error) => return Err(error),
                 };
-                patch_region_entry(
+                let report = region.report;
+                record_region_entry(
                     spool.get_ref(),
                     region,
                     index,
-                    &full_entry(state),
-                    &mut reports[region.report],
+                    full_entry(state),
+                    &mut reports[report],
                 )?;
             }
         }
@@ -914,22 +1216,23 @@ fn converge_disk(
         Ok(done)
     })?;
     for (region_index, index, slot, len) in read_back {
-        let region = &regions[region_index];
+        let region = &mut regions[region_index];
         let state = store_bytes(
             writer,
             options,
             writer_keys,
             nonce_seq,
-            0,
+            member,
             &pool[slot].as_slice()[..len],
             &ChunkState::Unused,
         )?;
-        patch_region_entry(
+        let report = region.report;
+        record_region_entry(
             spool.get_ref(),
             region,
             index,
-            &full_entry(state),
-            &mut reports[region.report],
+            full_entry(state),
+            &mut reports[report],
         )?;
     }
     copy.finish()
@@ -1028,110 +1331,76 @@ fn read_pt_raw(source: &Path, lbs: u32, pt_type: PtType) -> Result<Vec<u8>> {
 /// Returns [`Error::TargetChanged`] when the target changed since `prepare`,
 /// [`Error::NoSpace`] when it is smaller than the image's disk, and propagates
 /// I/O and format errors.
-pub(crate) fn restore_whole_disk<R: std::io::Read + std::io::Seek>(
-    reader: &mut lr_format::ImageReader<R>,
-    chunks: &mut lr_format::ChunkReader,
-    keys: &ImageKeys,
+pub(crate) fn restore_whole_disk(
+    mut walk: crate::chain::DiskWalk,
     superblock: &Superblock,
     token: &RestoreToken,
     mut target: DirectBlockTarget,
     reporter: &mut crate::progress::Reporter,
 ) -> Result<RestoreReport> {
-    let kind = superblock.aead_kind()?;
     let lbs = u64::from(superblock.logical_block_size);
     let chunk_size = u64::from(superblock.chunk_size);
     if target.size_bytes() < superblock.source_size_bytes {
         return Err(Error::NoSpace);
     }
-    // The same plan check as `prepare`, before the first write (R24, R26).
-    crate::plan::refuse_bad_sectors(
-        &crate::plan::whole_disk(reader, &keys.meta_key, superblock)?.0,
-    )?;
     let mut buffer = target.buffer(chunk_size as usize)?;
     let mut zeros = target.buffer(chunk_size as usize)?;
     zeros.clear();
-
-    let manifest = reader.stream_reader(StreamId::Manifest, *keys.meta_key, kind)?;
-    let mut wire = wire::Reader::new(manifest);
-    let disk_header = DiskHeader::read(&mut wire)?;
-    disk_header.validate()?;
+    // The newest member's view of the disk: its swap headers too.
+    let disk_header = walk.disk().clone();
 
     let mut stored_chunks_written = 0u64;
     let mut zero_chunks_written = 0u64;
     let mut skipped_chunks = 0u64;
     let mut bytes_written = 0u64;
 
-    for region in &disk_header.regions {
+    for region in disk_header
+        .regions
+        .iter()
+        .filter(|region| region.kind == RegionKind::Swap)
+    {
         reporter.phase(&format!("region {}", region.index));
-        reporter.report(region.start_lba * lbs)?;
-        if region.kind == RegionKind::Swap {
-            write_swap(&mut target, region, lbs)?;
-            continue;
+        write_swap(&mut target, region, lbs)?;
+    }
+    let mut current = None;
+    walk.walk(|region, index, state, access| {
+        if current != Some(region.index) {
+            current = Some(region.index);
+            reporter.phase(&format!("region {}", region.index));
         }
-        if !region.has_manifest() {
-            continue;
-        }
-        let (header, delta) = BlockManifestHeader::read(&mut wire)?;
-        if delta {
-            return Err(Error::unsupported(
-                "delta manifests arrive in Slice S9; this image needs its chain",
-            ));
-        }
-        let expected = region.chunk_count(chunk_size)?;
-        if header.chunk_count != expected || header.entry_count != expected {
-            return Err(Error::corrupt(format!(
-                "region {} needs {expected} entries, its manifest declares {} chunks and {} \
-                 entries",
-                region.index, header.chunk_count, header.entry_count
-            )));
-        }
-        let region_start = region.start_lba * lbs;
-        for index in 0..header.entry_count {
-            let entry = BlockEntry::read(&mut wire)?;
-            let offset = region_start + index * chunk_size;
-            let chunk_len = chunk_size.min(region.size_bytes - index * chunk_size) as usize;
-            match entry.state {
-                lr_format::STATE_STORED => {
-                    let record = chunks.read_record(entry.offset)?;
-                    let plaintext = lr_format::open_chunk(
-                        kind,
-                        keys.data_key.as_deref(),
-                        &keys.dedup_key,
-                        ImageKind::Block,
-                        &entry.hash,
-                        chunk_len,
-                        &record,
-                    )?;
-                    if plaintext.len() != chunk_len {
-                        return Err(Error::corrupt(format!(
-                            "chunk {index} of region {} restored to {} bytes, expected {chunk_len}",
-                            region.index,
-                            plaintext.len()
-                        )));
-                    }
-                    buffer.as_mut_slice()[..chunk_len].copy_from_slice(&plaintext);
-                    target.write_at(offset, &buffer, chunk_len)?;
-                    stored_chunks_written += 1;
-                    bytes_written += chunk_len as u64;
+        let offset = region.start_lba * lbs + index * chunk_size;
+        reporter.report(offset)?;
+        let chunk_len = chunk_size.min(region.size_bytes - index * chunk_size) as usize;
+        match state {
+            ChunkState::Stored { .. } => {
+                let plaintext = access.read(&state)?;
+                if plaintext.len() != chunk_len {
+                    return Err(Error::corrupt(format!(
+                        "chunk {index} of region {} restored to {} bytes, expected {chunk_len}",
+                        region.index,
+                        plaintext.len()
+                    )));
                 }
-                lr_format::STATE_ZERO => {
-                    target.write_at(offset, &zeros, chunk_len)?;
-                    zero_chunks_written += 1;
-                    bytes_written += chunk_len as u64;
-                }
-                lr_format::STATE_UNUSED => skipped_chunks += 1,
-                lr_format::STATE_BAD_SECTOR => {
-                    return Err(Error::BadSector {
-                        offset,
-                        len: chunk_len as u64,
-                    });
-                }
-                other => {
-                    return Err(Error::corrupt(format!("unknown chunk state {other}")));
-                }
+                buffer.as_mut_slice()[..chunk_len].copy_from_slice(&plaintext);
+                target.write_at(offset, &buffer, chunk_len)?;
+                stored_chunks_written += 1;
+                bytes_written += chunk_len as u64;
+            }
+            ChunkState::Zero => {
+                target.write_at(offset, &zeros, chunk_len)?;
+                zero_chunks_written += 1;
+                bytes_written += chunk_len as u64;
+            }
+            ChunkState::Unused => skipped_chunks += 1,
+            ChunkState::BadSector => {
+                return Err(Error::BadSector {
+                    offset,
+                    len: chunk_len as u64,
+                });
             }
         }
-    }
+        Ok(())
+    })?;
 
     // Regenerate the GPT for the target size (spec §H.1): the crate computes a
     // fresh backup LBA and rewrites both headers with valid CRCs.

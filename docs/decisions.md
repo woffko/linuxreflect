@@ -423,7 +423,8 @@ after the full is an incremental whose send parent is the snapshot recorded in
 `.linuxreflect/<set>/latest`. Whole-disk images have a region layout that a
 delta would have to match per region; `--type` other than `full` is refused
 there until that design exists (per-region delta with region identity matching),
-which is recorded here rather than silently approximated.
+which is recorded here rather than silently approximated. (Whole-disk chains
+exist since D-142.)
 
 ## D-043 — The set lock is local, leased and refreshed
 
@@ -2113,3 +2114,49 @@ The §E step 7 refusal now also names tracked-freeze (`--allow-freeze`) and
 file mode, as the spec lists them. `LR_TRACEFS_ROOT` (tests only) now names a
 tracefs tree the same way the real mount points are found: one without
 `instances/` stands for a kernel without tracefs (Slice 18 AC (e) fixtures).
+
+## D-142 — Whole-disk chains: region identity, per-region deltas, and verification
+
+D-042 deferred incremental and differential members of a whole disk until a
+per-region delta with region identity matching existed. Series B of Slice 18
+needs them: a running system disk is imaged live every day, and storing it in
+full each time is the cost this removes. The image format already allows it:
+a whole-disk manifest is the disk header followed by one block manifest per
+region with data, and each of those carries its own full/delta flag; the
+superblock carries the chain (`parent_uuid`, `seq_in_chain`,
+`DELTA_MANIFEST`). No format change is needed.
+
+- **Identity.** A member's disk must match its parent's in geometry (size,
+  logical block size), in its partition table, and in every region's kind,
+  number, start, size, type GUID and PARTUUID. The partition table is
+  compared as the bytes that describe partitions: the MBR's four entries and
+  signature (bytes 446..512), and for GPT the header and its entry array.
+  `pt_raw` holds the whole first MiB, but the MBR boot code and the area
+  after the GPT entries (GRUB's `core.img`) are a boot loader's data, which
+  the leading region images and compares chunk by chunk; a GRUB update must
+  not end a chain. A difference refuses the member with the advice to start
+  a new full chain. Contents may change (a filesystem re-created in place is
+  a change of data), and so may swap headers and each region's consistency.
+- **Order.** The chain is resolved under the set lock before the offline
+  claim's first read of data and before tracking starts, so a member that
+  cannot take its parent is refused before anything is traced or frozen.
+  The same holds for a partition (series B1). A parent of the other kind (a
+  partition image under a whole-disk member, or the reverse) is refused.
+- **Manifests.** Each region with data is compared positionally with the
+  parent chain's merged state (spec §D.4): an incremental writes delta
+  entries with region-relative chunk numbers, a differential a full manifest
+  that repeats the inherited entries. What a live member reads again is
+  stored as its own data; in a delta region it is merged in chunk order once
+  the copy ends, since delta entries must stay ordered.
+- **Restore** walks the chain region by region with one cursor per member
+  (memory O(members), spec §G.2) and writes the newest member's swap
+  headers. `prepare` and `apply` both validate every member before the
+  first write, as for a partition chain.
+- **Verification.** `WholeDiskRegionsAndLayout` covers the selected recovery
+  point: every member's layout and every chunk the point references,
+  wherever it is stored. With `--chain` and more than one member, every
+  payload every member stores is also re-hashed and recorded as the
+  `every_stored_payload` stage, as for a block chain; a single member keeps
+  the observation it had.
+- The catalog now records a published whole-disk member, as the other image
+  kinds do.

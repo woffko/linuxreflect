@@ -91,3 +91,30 @@ unknown. The harness now keeps it, and the case passed when run again.
   were not part of these runs. Hooks and the daemon route are covered by the
   root suites (`hooks_run_around_the_final_freeze`,
   `a_mounted_ext4_is_imaged_live_through_the_daemon`).
+
+## Series B3: a live incremental, restored as a chain
+
+Run on 2026-11-12 with `tools/vm/live_restore_matrix.py --incremental`, the
+static CLI built from `eeedcdf` (series B2, D-142), TCG, the 3 s
+`--freeze-max` default. After the full live image the writer keeps running
+for 20 s, then the running disk is imaged live again as an incremental:
+
+```sh
+linuxreflect backup create --source /dev/vda --dest /mnt/dest --set system \
+    --type incremental --snapshot tracked-freeze --no-encrypt --compress none --json -v
+```
+
+and the incremental is restored onto `/dev/vdc`, which needs the full and
+the incremental. Only `/dev/vdc` is booted. A run passes as above, and the
+member must be an incremental of the full (sequence 1) that stores less than
+it, every region `Frozen`, with the restored log ending inside the
+incremental's backup.
+
+| Distribution | Firmware | Chunks stored: full / incremental | Incremental: passes, final freeze | Regions | Restored boot | Log records (window) |
+|---|---|---|---|---|---|---|
+| Debian 12 | UEFI, Secure Boot on | 964 / 67 | 1, 641 ms | leading area, BIOS boot, ESP, `/` | `multi-user`, 0 failed, no recovery | 4711 (3467–4928) |
+| Ubuntu 24.04 | UEFI, Secure Boot on | 1884 / 82 | 1, 1524 ms | same plus `/boot` | `multi-user`, 0 failed, no recovery | 6265 (4295–6478) |
+
+Both runs passed. The incremental stored 7 % and 4 % of what the full
+stored, and inherited the rest (8125 and 8110 chunks of 1 MiB). The other
+four configurations of the matrix were not run with `--incremental`.

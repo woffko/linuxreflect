@@ -14,6 +14,11 @@ Spec v2.2 §K S18 AC (d). For each distribution and firmware:
    recovery, and holds an exact prefix of the writer's log that ends inside
    the backup.
 
+With `--incremental` (series B3, D-142) the writer keeps running after the
+full image, a live incremental image of the disk follows, and the chain (the
+full plus the incremental) is restored; the log must end inside the
+incremental's backup.
+
 Runs as an ordinary user. Images are verified downloads (tools/spike/
 vm_matrix.py); every disk lives in a run directory that is removed at the end.
 
@@ -62,7 +67,7 @@ def load_vm_matrix():
     return module
 
 
-def seed_disk(run: Path, name: str, cli: Path) -> Path:
+def seed_disk(run: Path, name: str, cli: Path, mode: str) -> Path:
     command = "mkdir -p /mnt/seed && mount -o ro LABEL=CIDATA /mnt/seed && sh /mnt/seed/run.sh"
     (run / "user-data").write_text(
         "#cloud-config\nruncmd:\n" f"  - [sh, -c, {json.dumps(command)}]\n"
@@ -70,11 +75,12 @@ def seed_disk(run: Path, name: str, cli: Path) -> Path:
     (run / "meta-data").write_text(
         f"instance-id: lr-s18-{name}-{int(time.time())}\nlocal-hostname: lr-s18\n"
     )
+    (run / "mode").write_text(mode)
     disk = run / "seed.img"
     with open(disk, "wb") as handle:
         handle.truncate(64 * 1024 * 1024)
     subprocess.run(["mkfs.vfat", "-n", "CIDATA", str(disk)], check=True, capture_output=True)
-    files = [run / "user-data", run / "meta-data", cli]
+    files = [run / "user-data", run / "meta-data", run / "mode", cli]
     files += [GUEST / item for item in
               ("run.sh", "lr-writer", "lr-chain-check", "lr-restored-check",
                "lr-restored-check.service")]
@@ -149,26 +155,60 @@ def first_boot_results(text: str, console: str) -> dict:
     return files
 
 
-def judge(files: dict, restored: str | None) -> dict:
+def member_report(files: dict, name: str) -> dict:
+    """What the backup `name` (`lr-backup` or `lr-incremental`) reported."""
+    try:
+        report = json.loads(files.get(f"{name}.json", "{}"))
+    except json.JSONDecodeError:
+        report = {}
+    rc = files.get(f"{name}.rc", "").strip()
+    return {
+        "rc": rc,
+        "member_kind": report.get("member_kind"),
+        "seq_in_chain": report.get("seq_in_chain"),
+        "stored_chunks": sum(region.get("stored_chunks", 0)
+                             for region in report.get("regions", [])),
+        "changed_chunks": report.get("changed_chunks"),
+        "inherited_chunks": report.get("inherited_chunks"),
+        "tracked": report.get("tracked"),
+        "regions": [(region.get("index"), region.get("fs_type"), region.get("consistency"))
+                    for region in report.get("regions", [])],
+        "error": files.get(f"{name}.err", "")[-1500:] if rc != "0" else "",
+        # The pass log (`-v`): dirty bytes, read rate and verdict per pass.
+        "passes": [line[line.find("tracked-freeze pass"):].strip()
+                   for line in files.get(f"{name}.err", "").splitlines()
+                   if "tracked-freeze pass" in line][-30:],
+    }
+
+
+def judge(files: dict, restored: str | None, incremental: bool) -> dict:
     verdict: dict = {}
-    backup_rc = files.get("lr-backup.rc", "").strip()
+    full = member_report(files, "lr-backup")
+    backup_rc = full["rc"]
     apply_rc = files.get("lr-apply.rc", "").strip()
     verdict["backup_rc"] = backup_rc
     verdict["apply_rc"] = apply_rc
-    try:
-        report = json.loads(files.get("lr-backup.json", "{}"))
-    except json.JSONDecodeError:
-        report = {}
-    verdict["tracked"] = report.get("tracked")
-    verdict["regions"] = [
-        (region.get("index"), region.get("fs_type"), region.get("consistency"))
-        for region in report.get("regions", [])
-    ]
-    verdict["backup_error"] = files.get("lr-backup.err", "")[-1500:] if backup_rc != "0" else ""
-    # The pass log (`-v`): dirty bytes, read rate and verdict per pass.
-    verdict["passes"] = [line[line.find("tracked-freeze pass"):].strip()
-                         for line in files.get("lr-backup.err", "").splitlines()
-                         if "tracked-freeze pass" in line][-30:]
+    verdict["tracked"] = full["tracked"]
+    verdict["regions"] = full["regions"]
+    verdict["backup_error"] = full["error"]
+    verdict["passes"] = full["passes"]
+    window = "lr-backup"
+    member_ok = True
+    if incremental:
+        member = member_report(files, "lr-incremental")
+        verdict["full"] = {key: full[key] for key in
+                           ("member_kind", "seq_in_chain", "stored_chunks", "changed_chunks")}
+        verdict["incremental"] = member
+        window = "lr-incremental"
+        # The member is an incremental of the full, stores less than it, and
+        # every region was copied live.
+        member_ok = (
+            member["rc"] == "0"
+            and member["seq_in_chain"] == 1
+            and str(member["member_kind"]).lower() == "incremental"
+            and 0 < member["stored_chunks"] < full["stored_chunks"]
+            and all(consistency == "frozen" for _, _, consistency in member["regions"])
+        )
     verdict["apply_error"] = files.get("lr-apply.err", "")[-1500:] if apply_rc != "0" else ""
     if restored is None:
         verdict["restored_boot"] = "no report from the restored disk"
@@ -181,10 +221,10 @@ def judge(files: dict, restored: str | None) -> dict:
             if sep:
                 facts[key] = value
     verdict["restored"] = facts
-    # The log window: everything synced before the backup started, nothing
-    # begun after it ended.
-    start = float(files.get("lr-backup.start", "0") or 0)
-    end = float(files.get("lr-backup.end", "0") or 0)
+    # The log window: everything synced before the restored member's backup
+    # started, nothing begun after it ended.
+    start = float(files.get(f"{window}.start", "0") or 0)
+    end = float(files.get(f"{window}.end", "0") or 0)
     synced_before = begun_before_end = 0
     for line in files.get("lr-writer.timeline", "").splitlines():
         parts = line.split()
@@ -196,6 +236,7 @@ def judge(files: dict, restored: str | None) -> dict:
     verdict["log_window"] = [synced_before, count, begun_before_end]
     verdict["passed"] = (
         backup_rc == "0"
+        and member_ok
         and apply_rc == "0"
         and facts.get("multi_user") == "active"
         and facts.get("journal_recoveries") == "0"
@@ -216,6 +257,8 @@ def main() -> int:
                         help="distribution:firmware, e.g. debian-12:uefi-sb")
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--keep", action="store_true", help="keep the run directories")
+    parser.add_argument("--incremental", action="store_true",
+                        help="add a live incremental member and restore the chain (series B3)")
     args = parser.parse_args()
     vm = load_vm_matrix()
     accel = ["-accel", "kvm", "-cpu", "host"] if vm.kvm_usable() else \
@@ -237,7 +280,8 @@ def main() -> int:
                            check=True)
             with open(target, "wb") as handle:
                 handle.truncate(8 * 1024 ** 3)
-            seed = seed_disk(run, label, args.cli)
+            seed = seed_disk(run, label, args.cli,
+                             "incremental" if args.incremental else "full")
             print(f"[{label}] first boot: live image and restore ({accel[1]})", flush=True)
             first, first_results, first_seconds = boot(
                 [f"file={system},format=qcow2,if=virtio",
@@ -257,7 +301,7 @@ def main() -> int:
                                    "LR-RESTORED-BOOT-END")
                 if restored is None:
                     files["restored_serial_tail"] = second[-4000:]
-            verdict = judge(files, restored) if "error" not in files else {
+            verdict = judge(files, restored, args.incremental) if "error" not in files else {
                 "passed": False, **files, "qemu_exit": boot.last_exit}
             verdict.update(distribution=distribution, firmware=firmware,
                            first_boot_seconds=first_seconds,
@@ -266,8 +310,9 @@ def main() -> int:
             if args.keep or not verdict["passed"]:
                 (args.out / f"{label}-first.serial").write_text(first[-200000:])
                 (args.out / f"{label}-first.result").write_text(first_results[-400000:])
+            shown = ("tracked", "incremental", "restored", "log_window")
             print(f"[{label}] {'PASSED' if verdict['passed'] else 'FAILED'}: "
-                  f"{json.dumps({k: verdict.get(k) for k in ('tracked', 'restored', 'log_window')})}",
+                  f"{json.dumps({k: verdict.get(k) for k in shown if k in verdict})}",
                   flush=True)
             failures += not verdict["passed"]
         finally:

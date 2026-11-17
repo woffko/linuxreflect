@@ -23,8 +23,10 @@ of a live backup and restore. The automatic choice follows spec §E step 4
 (`auto` with `--allow-freeze` chooses tracked-freeze when its preconditions
 hold, D-141), and the Slice 18 AC (c) and (e) tests that were missing exist
 (`--freeze-max` exceeded, a partition table changed mid-job, fixture kernels
-without tracking). Incremental members and a GUI run inside a VM
-that boots the restored disk are not done yet.
+without tracking). Series B (`docs/live-backup-series-b.md`, D-142) adds
+incremental and differential live members, for partitions and for whole
+disks, and whole-disk chains for every route (`chain::DiskWalk`). A GUI run
+inside a VM that boots the restored disk is not done yet.
 
 The MVP is slices S1–S11 (spec §K). Slices are landed one pull request each.
 Current state: S1 (workspace, `lr-core`, `lr-unsafe`, capability probe,

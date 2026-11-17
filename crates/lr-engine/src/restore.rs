@@ -201,7 +201,6 @@ pub(crate) struct SelectedPayloadRequest<'a> {
     pub(crate) image_name: &'a str,
     pub(crate) selected_names: &'a [String],
     pub(crate) expected_members: Option<&'a [RestoreMemberIdentity]>,
-    pub(crate) whole_disk: bool,
     pub(crate) verification: crate::verify::VerifyRequest,
 }
 
@@ -674,7 +673,6 @@ pub(crate) fn verify_selected_payloads(
     let image_name = selection.image_name;
     let selected_names = selection.selected_names;
     let expected_members = selection.expected_members;
-    let whole_disk = selection.whole_disk;
     let verification = &selection.verification;
     if selected_names.last().map(String::as_str) != Some(image_name) {
         return Err(Error::corrupt(
@@ -693,8 +691,7 @@ pub(crate) fn verify_selected_payloads(
         ));
     }
 
-    let before =
-        selected_member_identities(destination, set, image_name, selected_names, whole_disk)?;
+    let before = selected_member_identities(destination, set, image_name, selected_names)?;
     if expected_members.is_some_and(|expected| expected != before.as_slice()) {
         return Err(Error::corrupt(
             "restore chain metadata changed since prepare; prepare the restore again",
@@ -712,8 +709,7 @@ pub(crate) fn verify_selected_payloads(
     )?;
     report.ensure_complete_recovery()?;
 
-    let after =
-        selected_member_identities(destination, set, image_name, selected_names, whole_disk)?;
+    let after = selected_member_identities(destination, set, image_name, selected_names)?;
     if after != before || expected_members.is_some_and(|expected| expected != after.as_slice()) {
         return Err(Error::corrupt(
             "restore chain metadata changed during verification; prepare the restore again",
@@ -741,10 +737,8 @@ pub(crate) fn validate_selected_members_current(
     image_name: &str,
     selected_names: &[String],
     expected: &[RestoreMemberIdentity],
-    whole_disk: bool,
 ) -> Result<()> {
-    let current =
-        selected_member_identities(destination, set, image_name, selected_names, whole_disk)?;
+    let current = selected_member_identities(destination, set, image_name, selected_names)?;
     if current != expected {
         return Err(Error::corrupt(
             "restore chain metadata changed after verification; prepare the restore again",
@@ -789,21 +783,7 @@ fn selected_member_identities(
     set: &lr_store::SetHandle,
     image_name: &str,
     selected_names: &[String],
-    whole_disk: bool,
 ) -> Result<Vec<RestoreMemberIdentity>> {
-    if whole_disk {
-        if selected_names.len() != 1 || selected_names[0] != image_name {
-            return Err(Error::corrupt(
-                "a whole-disk restore must select exactly its named image",
-            ));
-        }
-        return Ok(vec![RestoreMemberIdentity::read(
-            destination,
-            set,
-            image_name,
-        )?]);
-    }
-
     let resolved = crate::chain::resolve_chain(destination, set, image_name)?;
     let resolved_names: Vec<&str> = resolved
         .iter()
@@ -856,25 +836,27 @@ pub fn prepare_restore_as(request: &PrepareRequest, uid: u32) -> Result<RestoreP
     let repeated_page_nonces = superblock.is_encrypted()
         && reader.has_repeated_page_nonces(&keys.meta_key, superblock.aead_kind()?)?;
 
-    // A whole-disk image is always a full image; block and stream images may be
-    // chain members, and applying one needs every ancestor.
+    // Any image may be a chain member (a whole disk's too, D-142), and
+    // applying one needs every ancestor.
     let mut image_disk = None;
     let (members, chain_members): (Vec<String>, Vec<RestoreMemberIdentity>) = if superblock
         .is_whole_disk()
     {
-        // The whole manifest is read and validated before a token exists:
-        // a malformed manifest or a recorded bad sector is refused here
-        // (R24, R26).
-        let (summary, disk) = crate::plan::whole_disk(&mut reader, &keys.meta_key, &superblock)?;
-        crate::plan::refuse_bad_sectors(&summary)?;
-        image_disk = Some(disk);
+        let files = crate::chain::resolve_chain(&*destination, &set, &location.name)?;
+        let chain_members = files
+            .iter()
+            .map(|file| RestoreMemberIdentity::read(&*destination, &set, &file.file_name))
+            .collect::<Result<Vec<_>>>()?;
+        // Every member's manifest is read and validated before a token
+        // exists: a malformed manifest, a member describing another disk or
+        // a recorded bad sector is refused here (R24, R26).
+        let validated = crate::chain::open_chain(&*destination, &set, &files, &request.encryption)?;
+        let mut walk = crate::chain::DiskWalk::new(validated)?;
+        crate::plan::refuse_bad_sectors(&crate::plan::disk_chain(&mut walk, &superblock)?)?;
+        image_disk = Some(walk.disk().clone());
         (
-            vec![location.name.clone()],
-            vec![RestoreMemberIdentity::read(
-                &*destination,
-                &set,
-                &location.name,
-            )?],
+            files.into_iter().map(|file| file.file_name).collect(),
+            chain_members,
         )
     } else {
         let files = crate::chain::resolve_chain(&*destination, &set, &location.name)?;
@@ -1172,8 +1154,8 @@ pub fn apply_restore_as(request: &ApplyRequest, uid: u32) -> Result<RestoreOutco
 
     let destination = lr_store::open(&token.dest, &token.destination_options())?;
     let set = destination.open_existing_set(&lr_core::SetId::ZERO)?;
-    let (mut reader, keys, superblock) =
-        open_image(&*destination, &set, &token.image, &request.encryption)?;
+    // Opened and authenticated before anything else is trusted.
+    let (_, _, superblock) = open_image(&*destination, &set, &token.image, &request.encryption)?;
     if superblock.image_uuid != token.image_uuid {
         return Err(Error::TargetChanged);
     }
@@ -1256,7 +1238,6 @@ pub fn apply_restore_as(request: &ApplyRequest, uid: u32) -> Result<RestoreOutco
                 image_name: &token.image,
                 selected_names: &chain,
                 expected_members: Some(&token.chain_members),
-                whole_disk: superblock.is_whole_disk(),
                 verification: crate::verify::VerifyRequest {
                     image: token.image.clone(),
                     encryption: request.encryption.clone(),
@@ -1281,22 +1262,27 @@ pub fn apply_restore_as(request: &ApplyRequest, uid: u32) -> Result<RestoreOutco
     }
 
     if superblock.is_whole_disk() {
-        // A whole-disk restore reads manifests and chunks at the same time, so
-        // it needs its own second handle.
         validate_selected_members_current(
             &*destination,
             &set,
             &token.image,
             &chain,
             &token.chain_members,
-            true,
         )?;
+        let files = chain_files_from_identities(&token.chain_members);
+        // The same plan check as `prepare`, again before the first write:
+        // the images may have changed on the destination since the token
+        // was issued.
+        let checked = crate::chain::open_chain(&*destination, &set, &files, &request.encryption)?;
+        crate::plan::refuse_bad_sectors(&crate::plan::disk_chain(
+            &mut crate::chain::DiskWalk::new(checked)?,
+            &superblock,
+        )?)?;
+        let members = crate::chain::open_chain(&*destination, &set, &files, &request.encryption)?;
+        validate_open_chain_members(&*destination, &set, &members, &token.chain_members)?;
         request.context.check_cancel()?;
-        let mut chunks = reader.chunk_reader_with(destination.open_ro(&set, &token.image)?);
-        return write_image(
-            &mut reader,
-            &mut chunks,
-            &keys,
+        return crate::whole_disk::restore_whole_disk(
+            crate::chain::DiskWalk::new(members)?,
             &superblock,
             &token,
             target,
@@ -1349,24 +1335,6 @@ pub fn apply_restore_as(request: &ApplyRequest, uid: u32) -> Result<RestoreOutco
     request.context.check_cancel()?;
     write_block_chain(members, &superblock, &token, target, &mut reporter)
         .map(RestoreOutcome::Block)
-}
-
-/// Restore a whole-disk image (which is always a single full image).
-fn write_image(
-    reader: &mut ImageReader<Box<dyn ReadSeek + Send>>,
-    chunks: &mut lr_format::ChunkReader,
-    keys: &ImageKeys,
-    superblock: &Superblock,
-    token: &RestoreToken,
-    target: DirectBlockTarget,
-    reporter: &mut crate::progress::Reporter,
-) -> Result<RestoreReport> {
-    if !superblock.is_whole_disk() {
-        return Err(Error::corrupt(
-            "a partition image must be restored through the chain walker",
-        ));
-    }
-    crate::whole_disk::restore_whole_disk(reader, chunks, keys, superblock, token, target, reporter)
 }
 
 /// Restore a block image, merging every chain member's state.

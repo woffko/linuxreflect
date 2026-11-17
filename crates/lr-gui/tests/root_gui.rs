@@ -1021,9 +1021,10 @@ fn a_file_restore_into_a_non_empty_folder_needs_the_merge_choice_on_x11() {
 /// longest pause of 7 s is reviewed, then Consistency "auto" with the
 /// live-copy consent, which chooses tracked-freeze (spec §E step 4) with the
 /// default 3 s; with it, a mounted ext4 that keeps being written is imaged
-/// live by the daemon. The reviews name tracked-freeze, the result shows the
-/// live copy, and the copy restored through the GUI is clean and holds a
-/// whole prefix of the written log.
+/// live by the daemon, a full and then an incremental (series B4) after a
+/// file was added. The reviews name tracked-freeze, the results show the live
+/// copy and the chain, and the incremental restored through the GUI is clean,
+/// holds the added file and a whole prefix of the written log.
 #[test]
 #[ignore = "needs root, loop devices, tracefs, Xvfb and e2fsprogs; a live backup through the GUI"]
 fn a_mounted_ext4_is_imaged_live_through_the_gui_on_x11() {
@@ -1116,6 +1117,8 @@ fn a_mounted_ext4_is_imaged_live_through_the_gui_on_x11() {
     let mut reaper = Reaper(Vec::new());
     let display = start_xvfb(&mut reaper);
     let backed_up = dir.path().join("backed-up");
+    let full_done = dir.path().join("full-done");
+    let go_incremental = dir.path().join("go-incremental");
     let script = dir.path().join("live-script.txt");
     std::fs::write(
         &script,
@@ -1135,6 +1138,12 @@ fn a_mounted_ext4_is_imaged_live_through_the_gui_on_x11() {
              print\n\
              backup\n\
              print\n\
+             signal {full_done}\n\
+             wait-for-file {go_incremental}\n\
+             type incremental\n\
+             probe\n\
+             backup\n\
+             print\n\
              signal {backed_up}\n\
              image-from-summary\n\
              target {target}\n\
@@ -1144,6 +1153,8 @@ fn a_mounted_ext4_is_imaged_live_through_the_gui_on_x11() {
              quit\n",
             backups = dir.path().join("live-backups").display(),
             backed_up = backed_up.display(),
+            full_done = full_done.display(),
+            go_incremental = go_incremental.display(),
         ),
     )
     .expect("script");
@@ -1159,7 +1170,17 @@ fn a_mounted_ext4_is_imaged_live_through_the_gui_on_x11() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("GUI run");
-    wait_for_marker(&backed_up, Instant::now(), "finished the live backup");
+    // Between the full and the incremental (series B4): a file that only the
+    // incremental holds.
+    wait_for_marker(&full_done, Instant::now(), "finished the live full backup");
+    std::fs::write(mountpoint.join("between.txt"), b"after the full\n").expect("between");
+    run_ok("sync", &[]);
+    std::fs::write(&go_incremental, b"").expect("go");
+    wait_for_marker(
+        &backed_up,
+        Instant::now(),
+        "finished the live incremental backup",
+    );
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let written = writer.join().expect("writer");
     let output = gui.wait_with_output().expect("GUI exit");
@@ -1185,6 +1206,11 @@ fn a_mounted_ext4_is_imaged_live_through_the_gui_on_x11() {
         "the result does not report the live copy:\n{log}"
     );
     assert!(
+        log.contains("Backup type: full (starts a new chain).")
+            && log.contains("Backup type: incremental, member 2 of its chain"),
+        "the results do not report the chain:\n{log}"
+    );
+    assert!(
         !log.contains("may not match the snapshot"),
         "the plan warns about a map that tracked-freeze keeps up to date:\n{log}"
     );
@@ -1203,6 +1229,13 @@ fn a_mounted_ext4_is_imaged_live_through_the_gui_on_x11() {
     assert_eq!(
         std::fs::read_to_string(mountpoint.join("hello.txt")).expect("restored marker"),
         "live marker\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(mountpoint.join("between.txt"))
+            .ok()
+            .as_deref(),
+        Some("after the full\n"),
+        "the restored copy is the full, not the incremental"
     );
     let restored = std::fs::read_to_string(mountpoint.join("sequence.log")).expect("log");
     assert!(

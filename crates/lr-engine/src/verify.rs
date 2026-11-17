@@ -15,8 +15,7 @@ use std::path::PathBuf;
 
 use lr_core::{Error, ImageKind, Result};
 use lr_format::{
-    BlockEntry, BlockManifestHeader, ChunkState, DiskHeader, ImageReader, StreamId, Superblock,
-    open_chunk, verify_structure, wire,
+    BlockEntry, ChunkState, ImageReader, StreamId, open_chunk, verify_structure, wire,
 };
 use lr_store::{Destination, DestinationOptions, SetHandle, uri};
 
@@ -394,8 +393,9 @@ fn verify_members_in_set_inner(
             verify_whole_disk(
                 destination,
                 set,
-                name,
+                members,
                 &request.encryption,
+                every_member,
                 VerificationProgress {
                     reporter: &mut reporter,
                     report: &mut report,
@@ -819,82 +819,92 @@ fn verify_stream(
     Ok(())
 }
 
-/// Re-hash every chunk of every region of a whole-disk image.
+/// Verify a whole-disk image with its chain (D-142): every member describes
+/// the same disk and every region manifest is whole (the restore plan's
+/// checks, R24), every chunk the selected recovery point references
+/// re-hashes wherever it lives, recorded bad sectors are reported (R26), and
+/// with `every_member` every payload every member stores re-hashes too (R22).
 fn verify_whole_disk(
     destination: &dyn Destination,
     set: &SetHandle,
-    name: &str,
+    members: &[crate::chain::ChainMemberFile],
     encryption: &Encryption,
+    every_member: bool,
     mut progress: VerificationProgress<'_>,
     member_index: usize,
 ) -> Result<()> {
     if let Some(recorder) = progress.recorder() {
         recorder.begin_recovery_point(member_index);
-    }
-    let mut reader = ImageReader::open(destination.open_ro(set, name)?)?;
-    let keys = keys::unlock_image(encryption, reader.superblock())?;
-    let superblock: Superblock = reader.superblock().clone();
-    // The restore plan's checks: counts, kinds, bounds, geometry and complete
-    // consumption (R24), and recorded bad sectors (R26).
-    let (summary, _disk) = crate::plan::whole_disk(&mut reader, &keys.meta_key, &superblock)?;
-    if let Some(recorder) = progress.recorder() {
-        recorder.complete_recovery_point(member_index);
         recorder.begin_disk_region_payloads(member_index);
     }
-    progress.report.recorded_bad_chunks += summary.bad;
-    if summary.bad > 0 {
+    let opened = crate::chain::open_chain(destination, set, members, encryption)?;
+    let mut walk = crate::chain::DiskWalk::new(opened)?;
+    let target = &walk.members()[member_index].superblock;
+    let chunk_size = u64::from(target.chunk_size);
+    let lbs = u64::from(target.logical_block_size);
+    let mut bad = 0u64;
+    let mut first_bad = None;
+    let name_of = |member: u16| {
+        members
+            .get(usize::from(member))
+            .map_or("?", |file| file.file_name.as_str())
+    };
+    walk.walk(|region, index, state, access| {
+        progress.reporter.report(progress.report.bytes_checked)?;
+        if state == ChunkState::BadSector {
+            bad += 1;
+            first_bad.get_or_insert(region.start_lba * lbs + index * chunk_size);
+        }
+        let ChunkState::Stored { member, offset, .. } = state else {
+            return Ok(());
+        };
+        let plaintext = access.read(&state).map_err(|error| {
+            Error::corrupt(format!(
+                "{}: region {} chunk {index} (offset {offset}) failed: {error}",
+                name_of(member),
+                region.index
+            ))
+        })?;
+        progress.report.chunks += 1;
+        progress.report.bytes_checked += plaintext.len() as u64;
+        Ok(())
+    })?;
+    if let Some(recorder) = progress.recorder() {
+        recorder.complete_recovery_point(member_index);
+        recorder.complete_disk_region_payloads(member_index);
+    }
+    progress.report.recorded_bad_chunks += bad;
+    if bad > 0 {
         progress
             .report
             .warnings
-            .push(crate::plan::bad_sector_message(
-                summary.bad,
-                summary.first_bad,
-            ));
+            .push(crate::plan::bad_sector_message(bad, first_bad));
     }
-    let kind = superblock.aead_kind()?;
-    let chunk_size = u64::from(superblock.chunk_size);
-    let mut chunks = reader.chunk_reader_with(destination.open_ro(set, name)?);
-
-    let manifest = reader.stream_reader(StreamId::Manifest, *keys.meta_key, kind)?;
-    let mut wire = wire::Reader::new(manifest);
-    let disk_header = {
-        let header = DiskHeader::read(&mut wire)?;
-        header.validate()?;
-        header
-    };
-    for region in &disk_header.regions {
-        if !region.has_manifest() {
-            continue;
-        }
-        let (header, _delta) = BlockManifestHeader::read(&mut wire)?;
-        for index in 0..header.entry_count {
-            progress.reporter.report(progress.report.bytes_checked)?;
-            let entry = BlockEntry::read(&mut wire)?;
-            if !entry.is_stored() {
-                continue;
-            }
-            let record = chunks.read_record(entry.offset)?;
-            let plaintext = open_chunk(
-                kind,
-                keys.data_key.as_deref(),
-                &keys.dedup_key,
-                ImageKind::Block,
-                &entry.hash,
-                chunk_size as usize,
-                &record,
-            )
-            .map_err(|error| {
-                Error::corrupt(format!(
-                    "region {} chunk {index} (offset {}) failed: {error}",
-                    region.index, entry.offset
-                ))
-            })?;
-            progress.report.chunks += 1;
-            progress.report.bytes_checked += plaintext.len() as u64;
-        }
+    if !every_member || members.len() < 2 {
+        return Ok(());
     }
     if let Some(recorder) = progress.recorder() {
-        recorder.complete_disk_region_payloads(member_index);
+        recorder.begin_all_stored_payloads();
+    }
+    // Every payload every member stores, superseded ones included (R22).
+    walk.walk_own_payloads(|region, index, state, access| {
+        progress.reporter.report(progress.report.bytes_checked)?;
+        let ChunkState::Stored { member, offset, .. } = state else {
+            return Ok(());
+        };
+        let plaintext = access.read(&state).map_err(|error| {
+            Error::corrupt(format!(
+                "{}: its own region {} chunk {index} (offset {offset}) failed: {error}",
+                name_of(member),
+                region.index
+            ))
+        })?;
+        progress.report.chunks += 1;
+        progress.report.bytes_checked += plaintext.len() as u64;
+        Ok(())
+    })?;
+    if let Some(recorder) = progress.recorder() {
+        recorder.complete_all_stored_payloads();
     }
     Ok(())
 }

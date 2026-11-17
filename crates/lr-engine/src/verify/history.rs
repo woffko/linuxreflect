@@ -643,7 +643,15 @@ fn validate_success_observation(observation: &VerificationObservation) -> bool {
             ContentCoverage::StreamEveryMemberPayloadsSectionsAndLayout => {
                 (true, false, true, false)
             }
-            ContentCoverage::WholeDiskRegionsAndLayout => (selected, false, false, true),
+            // The selected recovery point's regions, its payloads wherever
+            // they live; with every member of a chain, every payload every
+            // member stores as well (D-142). One member has nothing more.
+            ContentCoverage::WholeDiskRegionsAndLayout => (
+                selected,
+                false,
+                scope == RecoveryScope::EveryMember && members.len() > 1,
+                selected,
+            ),
         };
         if !matches_expected_stage(stages.recovery_point(), recovery)
             || !matches_expected_stage(stages.referenced_payloads(), referenced)
@@ -681,7 +689,7 @@ fn valid_ancestry(members: &[MemberObservation]) -> bool {
     {
         return false;
     }
-    if first.whole_disk && (members.len() != 1 || first.image_kind != lr_core::ImageKind::Block) {
+    if first.whole_disk && first.image_kind != lr_core::ImageKind::Block {
         return false;
     }
     for (index, member) in members.iter().enumerate() {

@@ -415,25 +415,37 @@ fn a_thin_snapshot_is_supported() {
         return;
     };
     let pool = vg.lv("pool");
-    if !run(
-        "lvcreate",
-        &[
-            "--type",
-            "thin-pool",
-            "-L",
-            "1G",
-            "--poolmetadatasize",
-            "64M",
-            // No metadata spare: without udev, LVM can fail to deactivate
-            // the spare it creates ("Manual intervention required"), and
-            // the spare plays no part in the snapshot under test.
-            "--poolmetadataspare",
-            "n",
-            "-n",
-            "pool",
-            &vg.path(),
-        ],
-    ) {
+    // Without udev in the container, LVM can fail to deactivate the
+    // metadata volume it has just wiped while the host's udev still probes
+    // the new device ("Could not deactivate pool metadata"); LVM then backs
+    // the pool out. A few attempts ride that out; the pool under test is the
+    // same either way.
+    let created = (0..5).any(|attempt| {
+        if attempt > 0 {
+            let _ = run("lvremove", &["-f", &format!("{}/pool", vg.path())]);
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        run(
+            "lvcreate",
+            &[
+                "--type",
+                "thin-pool",
+                "-L",
+                "1G",
+                "--poolmetadatasize",
+                "64M",
+                // No metadata spare: without udev, LVM can fail to deactivate
+                // the spare it creates ("Manual intervention required"), and
+                // the spare plays no part in the snapshot under test.
+                "--poolmetadataspare",
+                "n",
+                "-n",
+                "pool",
+                &vg.path(),
+            ],
+        )
+    });
+    if !created {
         lr_testkit::fixture_failed!("creating the thin pool failed");
     }
     if !run(
