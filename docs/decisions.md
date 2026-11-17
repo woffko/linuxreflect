@@ -2160,3 +2160,30 @@ superblock carries the chain (`parent_uuid`, `seq_in_chain`,
   the observation it had.
 - The catalog now records a published whole-disk member, as the other image
   kinds do.
+
+## D-143 — What `--freeze-max` measures
+
+Spec §E.7 step 6 runs `syncfs` and then freezes the source filesystems, and
+bounds the final freeze by `freeze_max`; Slice 18 AC (d) asks for "the
+measured freeze" to stay within it. The first implementation started its
+clock before `syncfs`, so a slow write-back of dirty pages, which holds no
+writer, counted as freeze time. In the series C VM matrix on a busy host that
+failed Debian 12 with `E_FREEZE_TIMEOUT` under both firmwares; the same runs
+with the clock below passed with final freezes of 146–201 ms.
+
+- `syncfs` runs for every source filesystem before any is frozen and is not
+  measured. The freeze is measured from just before the first deadman is
+  armed to the end of the thaw: that is how long writers can be held, and it
+  is what `final_freeze_ms` and `barrier_ms` report and `--freeze-max`
+  bounds.
+- The deadman fires `freeze_max + grace` after its own arming, which is after
+  the clock starts, so a deadman thaw still always shows up as a freeze
+  longer than `freeze_max` and fails the copy; an early thaw is never
+  published.
+- After the thaw the job log gets one line with the steps' lengths
+  (`tracked-freeze final freeze write_back_ms … freezing_ms … inside_ms …
+  thaw_ms …`), for the field trial.
+- Root test `a_slow_write_back_before_the_final_freeze_is_not_counted_as_freeze`
+  throttles the write-back with a cgroup's `IOWriteBandwidthMax` (cgroup
+  writeback) so that it takes about 4 s while the freeze has nothing left to
+  write; it failed with `E_FREEZE_TIMEOUT` before this change.

@@ -3228,7 +3228,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "lr-blocksource"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "lr-core",
  "lr-fsmap",
@@ -3240,7 +3240,7 @@ dependencies = [
 
 [[package]]
 name = "lr-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3267,7 +3267,7 @@ dependencies = [
 
 [[package]]
 name = "lr-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gpt",
  "lr-testkit",
@@ -3282,7 +3282,7 @@ dependencies = [
 
 [[package]]
 name = "lr-crypto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -3300,7 +3300,7 @@ dependencies = [
 
 [[package]]
 name = "lr-daemon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "enumflags2",
  "lr-core",
@@ -3331,7 +3331,7 @@ dependencies = [
 
 [[package]]
 name = "lr-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "crc32fast",
@@ -3359,7 +3359,7 @@ dependencies = [
 
 [[package]]
 name = "lr-export"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "lr-core",
  "lr-engine",
@@ -3373,7 +3373,7 @@ dependencies = [
 
 [[package]]
 name = "lr-format"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "lr-core",
@@ -3386,7 +3386,7 @@ dependencies = [
 
 [[package]]
 name = "lr-fsmap"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "lr-core",
  "lr-testkit",
@@ -3398,7 +3398,7 @@ dependencies = [
 
 [[package]]
 name = "lr-fuse"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fuser",
  "lr-core",
@@ -3412,7 +3412,7 @@ dependencies = [
 
 [[package]]
 name = "lr-gui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3438,7 +3438,7 @@ dependencies = [
 
 [[package]]
 name = "lr-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "prost",
  "serde",
@@ -3449,7 +3449,7 @@ dependencies = [
 
 [[package]]
 name = "lr-request"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "lr-core",
  "lr-engine",
@@ -3460,7 +3460,7 @@ dependencies = [
 
 [[package]]
 name = "lr-rescue"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3476,7 +3476,7 @@ dependencies = [
 
 [[package]]
 name = "lr-session"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3493,7 +3493,7 @@ dependencies = [
 
 [[package]]
 name = "lr-snapshot"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "lr-core",
  "lr-fsmap",
@@ -3508,7 +3508,7 @@ dependencies = [
 
 [[package]]
 name = "lr-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hmac",
  "lr-core",
@@ -3527,11 +3527,11 @@ dependencies = [
 
 [[package]]
 name = "lr-testkit"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "lr-unsafe"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "lr-testkit",
@@ -7736,7 +7736,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
 ]

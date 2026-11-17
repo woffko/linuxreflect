@@ -37,7 +37,10 @@ sysfs trees: no tracefs, no submission or completion tracepoint, an unknown
 event layout, a disk that is not blk-mq). Series B
 (`docs/live-backup-series-b.md`, D-142) added incremental and differential
 live members for partitions and whole disks, whole-disk chains for every
-route, and the VM acceptance of a live incremental. Still open: the GUI
+route, and the VM acceptance of a live incremental. Series C
+(`docs/live-backup-series-c.md`) runs the release gate below and prepares
+the pre-release `v0.2.0-beta.1`, which starts phase 5; its VM matrix passed
+on all six configurations with a live incremental (D-143). Still open: the GUI
 acceptance inside a VM with a boot of the
 restored disk (phase 4), the
 `--allow-inconsistent` exception for a busy ESP, and phase 5. That

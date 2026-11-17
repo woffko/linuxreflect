@@ -784,3 +784,87 @@ fn a_bare_metal_restore_from_the_medium_boots() {
         "the restored bare disk did not boot:\n{booted}"
     );
 }
+
+/// The medium builder holds its loop disk under an exclusive BSD lock
+/// (`LockedLoop`). systemd-udevd re-reads a disk's partition table after a
+/// writer closes the whole disk, which removes and re-adds the partition
+/// nodes. On a busy machine such a re-read can come late, after the device
+/// was attached again for the next user; in the series C gate the medium
+/// build once found `/dev/loop0p2` gone between its wait for the node and
+/// `mkfs.vfat`, right after a test that had written to `/dev/loop0`. udev
+/// does not re-read a disk it cannot lock, so a write to the locked disk
+/// must leave its partition nodes in place; without the lock this test sees
+/// `p2` replaced.
+#[test]
+#[ignore = "requires root, loop devices and systemd-udevd"]
+fn a_locked_loop_disk_keeps_its_partition_nodes_when_written() {
+    use std::io::Write as _;
+    use std::os::unix::fs::MetadataExt as _;
+    if !root_tests_enabled() {
+        return;
+    }
+    if !have("udevadm") || !run("systemctl", &["is-active", "--quiet", "systemd-udevd"]) {
+        lr_testkit::unavailable!("systemd-udevd is not running");
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let image = dir.path().join("disk.img");
+    std::fs::File::create(&image)
+        .and_then(|file| file.set_len(64 << 20))
+        .expect("image");
+    let layout = "label: gpt\nstart=2048, size=16MiB\n,\n";
+    let write_table = |target: &str| {
+        let mut sfdisk = Command::new("sfdisk")
+            .args(["--quiet", "--no-reread", target])
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("sfdisk");
+        sfdisk
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(layout.as_bytes())
+            .expect("layout");
+        sfdisk.wait().expect("sfdisk").success()
+    };
+    assert!(
+        write_table(&image.display().to_string()),
+        "sfdisk on the image"
+    );
+
+    let disk = lr_rescue::media::LockedLoop::attach(&image).expect("attach");
+    let node = disk.partition(2);
+    let started = Instant::now();
+    while !node.exists() && started.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let before = std::fs::metadata(&node).expect("the partition node").ino();
+
+    // A writer that changes nothing and asks for nothing closes the whole
+    // disk (sfdisk would re-read the table itself): only udev's `watch`
+    // rule reacts, and it re-reads the table unless the disk is locked.
+    let device = disk.device().to_owned();
+    assert!(
+        run(
+            "dd",
+            &[
+                &format!("if={device}"),
+                &format!("of={device}"),
+                "bs=1M",
+                "count=1",
+                "conv=notrunc",
+                "status=none",
+            ],
+        ),
+        "rewriting the first MiB of {device}"
+    );
+    // udev holds back a locked disk's events, so `udevadm settle` would only
+    // time out here; its re-read takes milliseconds when it happens.
+    std::thread::sleep(Duration::from_secs(3));
+    let after = std::fs::metadata(&node).map(|meta| meta.ino());
+    assert_eq!(
+        after.ok(),
+        Some(before),
+        "udev re-read the partition table of a locked disk ({} was replaced)",
+        node.display()
+    );
+}

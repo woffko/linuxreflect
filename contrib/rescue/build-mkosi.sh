@@ -74,7 +74,10 @@ ln -sf ../linuxreflect-rescue.service \
 ln -sf /dev/null "$WORK/mkosi.extra/etc/systemd/system/getty@tty1.service"
 mkdir -p "$OUT" "$WORK/cache"
 
-container='export DEBIAN_FRONTEND=noninteractive
+# Any failing step fails the container, so a failed mkosi build cannot pass
+# for a written medium.
+container='set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
 sed -i "s/^Components: .*/Components: main restricted universe multiverse/" /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends \
@@ -98,4 +101,8 @@ else
     cp -a "$WORK/rescue-out/." "$OUT/"
 fi
 
+if [ ! -s "$OUT/linuxreflect-rescue.raw" ]; then
+    echo "mkosi wrote no linuxreflect-rescue.raw to $OUT" >&2
+    exit 1
+fi
 echo "rescue medium written to $OUT"

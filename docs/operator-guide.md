@@ -246,7 +246,7 @@ disk together, reads the remaining changed blocks into memory, thaws, and only
 then writes them to the image. Programs that write to those filesystems wait
 only during this final freeze. The report gives its length (`tracked`,
 `final_freeze_ms`), the passes and the re-copied chunks. In the acceptance
-runs it lasted 0.6–1.3 s under full emulation and about 0.2 s on loop disks.
+runs it lasted 0.13–2.8 s in virtual machines and about 0.2 s on loop disks.
 
 **What it guarantees.** Every ext4 filesystem in the image is as the freeze
 left it: journal flushed, clean, and at the same instant for every filesystem
@@ -312,8 +312,10 @@ which needs a loop device of its own and runs when the backup starts:
 
 **Budgets and waits.**
 
-- `--freeze-max SECONDS` (1 to 30, default 3) limits the final freeze. If the
-  final read takes longer, the filesystems are thawed first and the job then
+- `--freeze-max SECONDS` (1 to 30, default 3) limits the final freeze, from
+  freezing the filesystems to thawing them (D-143). The dirty pages are
+  written back before that, without holding any writer, and do not count. If
+  the freeze lasts longer, the filesystems are thawed first and the job then
   fails with `E_FREEZE_TIMEOUT`. `--freeze-timeout` belongs to the plain
   freeze provider and does not apply here.
 - The copy takes another pass until what is left can be read in half of
@@ -382,7 +384,8 @@ loader and `/etc/fstab` may mount partitions from either disk.
 
 **Tested** on Debian 12, Debian 13, Ubuntu 22.04 and Ubuntu 24.04, under UEFI
 with Secure Boot and under BIOS. Each running system was imaged live under a
-write load, restored to another disk, and booted from that disk alone
+write load, imaged live again as an incremental, restored as a chain to
+another disk, and booted from that disk alone
 ([`live-backup-acceptance.md`](live-backup-acceptance.md)).
 
 **Not done yet:** the `--allow-inconsistent` exception for a busy ESP, and
@@ -393,6 +396,50 @@ covered by a root test: a live backup chosen in the wizard, of a mounted
 ext4 under write load, restored through the GUI
 (`a_mounted_ext4_is_imaged_live_through_the_gui_on_x11`). Jobs through the daemon are covered by a root test
 on loop disks, not by the VM acceptance, which runs the CLI without a daemon.
+
+### Field trial
+
+From `v0.2.0-beta.1`, tracked-freeze is in a pre-release so that it can be
+tried on real machines (Slice 18, phase 5). It stays opt-in. Whether plain
+`auto` should choose it without `--allow-freeze` (spec §M.4) will be decided
+from what the trial shows. To take part:
+
+1. **Opt in and keep the report.** Back up the system disk to a destination on
+   another disk, a share or SFTP:
+
+   ```sh
+   sudo linuxreflect backup create --source /dev/nvme0n1 --dest /mnt/backup \
+       --set system --allow-freeze --json -v > report.json 2> job.log
+   ```
+
+   After the full image, take an incremental the same way with
+   `--type incremental`.
+2. **Test a restore before relying on the image.** Run `verify --chain`
+   against the image. Then restore it to a spare disk of at least the same
+   size and boot that disk alone, or restore it to an image file of at least
+   the same size (`truncate -s`), attach the file read-only with
+   `losetup --read-only --partscan` and check its filesystems with
+   `e2fsck -fn`.
+3. **Report what happened** in an issue at
+   <https://github.com/woffko/linuxreflect/issues>:
+   - the job's numbers, without paths or names:
+     `jq '{mode, consistency, member_kind, tracked, warnings}' report.json`
+     (`tracked` holds the passes, the re-copied chunks, the chunks read
+     under the final freeze, and the lengths of the barrier and final
+     freezes), and from `job.log` the `tracked-freeze pass` lines and the
+     `tracked-freeze final freeze` line, which gives the lengths of the
+     final freeze's steps;
+   - for a refusal or a failure, the error code and its message, such as
+     `E_NO_CONVERGENCE` or the `tracked-freeze cannot copy this source live`
+     warning of the automatic choice;
+   - the kernel (`uname -r`), the distribution, and the source disk's type
+     (`lsblk -d -o TRAN,ROTA,SIZE /dev/nvme0n1`);
+   - what the machine was doing: an idle desktop, a build, a database, a
+     package upgrade;
+   - whether the restored copy booted, or what `e2fsck -fn` reported.
+
+   Leave out anything private: host names, file paths, and the model and
+   serial numbers of your disks.
 
 ## Chains: full, incremental, differential
 

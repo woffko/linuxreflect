@@ -245,7 +245,13 @@ impl Writer {
             while !flag.load(Ordering::Relaxed) {
                 let started = Instant::now();
                 previous = link(previous, seq);
-                writeln!(log, "{seq} {previous:016x}").expect("log");
+                // One write(2) per record: a freeze waits for a write in
+                // progress, so it lands between records, never inside one.
+                // `writeln!` on an unbuffered File would issue one write per
+                // formatted piece, and a freeze between them leaves a torn
+                // record in an otherwise correct image.
+                let record = format!("{seq} {previous:016x}\n");
+                log.write_all(record.as_bytes()).expect("log");
                 log.sync_all().expect("fsync log");
                 records.push((seq, started, Instant::now()));
                 for _ in 0..4 {
@@ -1923,6 +1929,97 @@ fn a_final_read_longer_than_freeze_max_thaws_first_and_publishes_nothing() {
     assert!(lifted.exists(), "the post-thaw hook did not run");
     assert!(images_under(&dest).is_empty(), "an image was published");
     assert_eq!(trace_leftovers(), 0, "a trace instance was left behind");
+}
+
+/// `--freeze-max` limits how long writers are held, from the freeze to the
+/// thaw. The write-back of dirty pages that comes first (`syncfs`) holds no
+/// writer, so a slow write-back must not fail the copy. The pre-freeze hook
+/// leaves 16 MiB of dirty pages whose write-back a systemd unit's cgroup
+/// limits to 4 MiB/s (`IOWriteBandwidthMax`, cgroup writeback), so the
+/// write-back takes about 4 s while the freeze itself has nothing left to
+/// write. With `--freeze-max 2` the copy succeeds, its final freeze is
+/// short, and the image holds the hook's file.
+#[test]
+#[ignore = "requires root, loop devices, systemd, cgroup v2 io, tracefs and fsfreeze"]
+fn a_slow_write_back_before_the_final_freeze_is_not_counted_as_freeze() {
+    if !root_tests_enabled() || !prerequisites() {
+        return;
+    }
+    if !have("systemd-run") || !Path::new("/run/systemd/system").exists() {
+        lr_testkit::unavailable!("systemd is not running");
+    }
+    let controllers =
+        std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers").unwrap_or_default();
+    if !controllers.split_whitespace().any(|c| c == "io") {
+        lr_testkit::unavailable!("cgroup v2 io controller missing");
+    }
+    let Some(source) = Source::create() else {
+        return;
+    };
+    let work = tempfile::tempdir().expect("work");
+    let (root, pre, _post) = hooks_dir(work.path(), "hooks");
+    let unit = format!("lr-test-writeback-{}", std::process::id());
+    hook(
+        &pre,
+        "10-dirty-backlog",
+        0o755,
+        &format!(
+            "set -e\n\
+             fs={mnt}\n\
+             systemd-run --quiet --collect --unit={unit} -p IOAccounting=yes -p MemoryAccounting=yes \\\n\
+               -p 'IOWriteBandwidthMax={device} 4M' \\\n\
+               sh -c 'dd if=/dev/urandom of=\"$0/backlog\" bs=1M count=16 status=none && touch \"$0/.dirtied\" && exec sleep 300' \"$fs\"\n\
+             while [ ! -e \"$fs/.dirtied\" ]; do sleep 0.1; done",
+            mnt = source.mountpoint().display(),
+            device = source.device,
+        ),
+    );
+    struct StopUnit(String);
+    impl Drop for StopUnit {
+        fn drop(&mut self) {
+            let _ = run("systemctl", &["stop", &self.0]);
+        }
+    }
+    let _stop = StopUnit(unit);
+
+    let dest = work.path().join("backups");
+    let mut slow = request(&source.partition(), &dest);
+    slow.hooks_dir = Some(root);
+    slow.tracked_tuning.freeze_max_secs = Some(2);
+    let started = Instant::now();
+    let report = backup_image(&slow).expect("a slow write-back must not fail the copy");
+    let took = started.elapsed();
+    // 16 MiB at 4 MiB/s: without the throttle this test proves nothing.
+    if took < Duration::from_secs(3) {
+        lr_testkit::fixture_failed!("the write-back was not throttled ({took:?})");
+    }
+    let ImageReport::Block(report) = &report else {
+        panic!("expected a block image");
+    };
+    let tracked = report.tracked.expect("a tracked summary");
+    println!("{tracked:?} in {took:?}");
+    assert!(
+        tracked.final_freeze_ms < 2000,
+        "the final freeze took {} ms",
+        tracked.final_freeze_ms
+    );
+
+    // The hook's file, written before the freeze, is in the image.
+    let original = std::fs::read(source.mountpoint().join("backlog")).expect("backlog");
+    let target = work.path().join("restored.img");
+    restore_to_file(&report.image_path, source.partition_bytes(), &target);
+    let copy = work.path().join("backlog.copy");
+    let dumped = Command::new("debugfs")
+        .arg("-R")
+        .arg(format!("dump /backlog {}", copy.display()))
+        .arg(&target)
+        .output()
+        .expect("debugfs");
+    assert!(dumped.status.success(), "debugfs dump failed");
+    assert!(
+        std::fs::read(&copy).expect("dumped backlog") == original,
+        "the restored backlog differs from the source"
+    );
 }
 
 /// Slice 18 AC (c): a partition table changed mid-job fails the copy with

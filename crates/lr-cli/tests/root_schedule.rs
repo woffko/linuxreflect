@@ -220,13 +220,19 @@ keep_chains = 1
     let wants = Path::new(
         "/etc/systemd/system/timers.target.wants/linuxreflect-job@lr-schedule-test.timer",
     );
-    assert!(!wants.exists(), "the enable symlink is gone");
+    // `exists()` follows the link, so a dangling one would pass it.
+    assert!(
+        wants.symlink_metadata().is_err(),
+        "the enable symlink is gone"
+    );
+    // Stopped before its files went: neither still running nor failed for
+    // want of its service.
     let active = Command::new("systemctl")
         .args(["is-active", "linuxreflect-job@lr-schedule-test.timer"])
         .output()
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
         .unwrap_or_default();
-    assert_ne!(active, "active", "the timer is stopped");
+    assert_eq!(active, "inactive", "the timer is stopped");
     drop(guard);
 }
 

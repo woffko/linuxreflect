@@ -199,12 +199,9 @@ pub fn build_media(request: &MediaRequest) -> Result<MediaReport> {
     run(sgdisk.arg(&request.output))?;
     steps.push("created a GPT with a BIOS boot partition and an ESP".to_owned());
 
-    let loop_device = free_loop()?;
-    run(Command::new("losetup").args(["-P", &loop_device, &request.output.display().to_string()]))?;
-    let esp_device = partition_device(Path::new(&loop_device), 2);
-    let cleanup = LoopGuard {
-        loop_device: loop_device.clone(),
-    };
+    let disk = LockedLoop::attach(&request.output)?;
+    let loop_device = disk.device().to_owned();
+    let esp_device = disk.partition(2);
     // The partition node appears asynchronously; on a busy machine it can take
     // a moment, and `mkfs.vfat` must not race it.
     let mut waited = 0;
@@ -272,7 +269,7 @@ pub fn build_media(request: &MediaRequest) -> Result<MediaReport> {
         steps.push("installed GRUB for BIOS (i386-pc)".to_owned());
     }
     let _ = Command::new("umount").arg(&mount_root).status();
-    drop(cleanup);
+    drop(disk);
     steps.push("detached the loop device".to_owned());
 
     let size_bytes = std::fs::metadata(&request.output).map_err(Error::Io)?.len();
@@ -530,44 +527,74 @@ fn run(command: &mut Command) -> Result<()> {
     Ok(())
 }
 
-fn free_loop() -> Result<String> {
-    let output = Command::new("losetup")
-        .arg("-f")
-        .output()
-        .map_err(Error::Io)?;
-    if !output.status.success() {
-        return Err(Error::unsupported("no free loop device"));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+/// A loop device attached to an image with partition scanning, held under an
+/// exclusive BSD lock on the whole disk, and detached when dropped.
+///
+/// systemd-udevd re-reads a disk's partition table after a writer closes the
+/// whole disk (its `watch` rule), and on a busy machine it can do so late: a
+/// re-read meant for the device's previous user then removes and re-adds the
+/// partition nodes of this attachment while they are being formatted. udev
+/// leaves a disk it cannot lock alone (systemd's block device locking), so
+/// the lock is held for as long as the medium is being built.
+pub struct LockedLoop {
+    device: String,
+    lock: Option<std::fs::File>,
 }
 
-fn partition_device(disk: &Path, partition: u32) -> PathBuf {
-    let name = disk
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let separator = if name
-        .chars()
-        .last()
-        .is_some_and(|last| last.is_ascii_digit())
-    {
-        "p"
-    } else {
-        ""
-    };
-    disk.with_file_name(format!("{name}{separator}{partition}"))
-}
-
-/// Detaches the loop device when the build finishes (also on a failure).
-struct LoopGuard {
-    loop_device: String,
-}
-
-impl Drop for LoopGuard {
-    fn drop(&mut self) {
-        let _ = Command::new("losetup")
-            .args(["-d", &self.loop_device])
+impl LockedLoop {
+    /// Attach `image` to a free loop device (one `losetup` call, so no other
+    /// process can take the device in between), let udev finish the events
+    /// already queued, and lock the whole disk.
+    ///
+    /// # Errors
+    /// The attach or the lock failed; the device is detached again.
+    pub fn attach(image: &Path) -> Result<Self> {
+        let output = Command::new("losetup")
+            .args(["--find", "--show", "--partscan"])
+            .arg(image)
+            .output()
+            .map_err(Error::Io)?;
+        if !output.status.success() {
+            return Err(Error::unsupported(format!(
+                "losetup could not attach {}: {}",
+                image.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let mut disk = Self {
+            device: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+            lock: None,
+        };
+        // A re-read already queued for this device runs now, before the
+        // lock, rather than in the middle of the build. No udev: nothing to
+        // wait for.
+        let _ = Command::new("udevadm")
+            .args(["settle", "--timeout=30"])
             .status();
+        let file = std::fs::File::open(&disk.device).map_err(Error::Io)?;
+        file.lock().map_err(Error::Io)?;
+        disk.lock = Some(file);
+        Ok(disk)
+    }
+
+    /// The loop device, such as `/dev/loop0`.
+    #[must_use]
+    pub fn device(&self) -> &str {
+        &self.device
+    }
+
+    /// The node of partition `number`, such as `/dev/loop0p2`.
+    #[must_use]
+    pub fn partition(&self, number: u32) -> PathBuf {
+        PathBuf::from(format!("{}p{number}", self.device))
+    }
+}
+
+impl Drop for LockedLoop {
+    fn drop(&mut self) {
+        // Unlock first, so the detach does not wait for this descriptor.
+        drop(self.lock.take());
+        let _ = Command::new("losetup").args(["-d", &self.device]).status();
     }
 }
 

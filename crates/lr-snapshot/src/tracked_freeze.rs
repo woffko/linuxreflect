@@ -979,10 +979,10 @@ impl TrackedCopy {
 
         // The barrier: a freeze completes every write already submitted, so
         // none that predates tracking can land after the first pass reads.
-        let began = Instant::now();
-        copy.frozen_with(|_| Ok(()))?;
-        copy.summary.barrier_ms = elapsed_ms(began);
+        let (outcome, times) = copy.frozen_with(|_| Ok(()));
+        copy.summary.barrier_ms = duration_ms(times.held());
         copy.log.flush();
+        outcome?;
         Ok(copy)
     }
 
@@ -1025,7 +1025,7 @@ impl TrackedCopy {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        self.frozen_with(|_| lr_fsmap::live_used_extents(&device))
+        self.frozen_with(|_| lr_fsmap::live_used_extents(&device)).0
     }
 
     /// Engine chunks still pending, over all regions.
@@ -1141,8 +1141,7 @@ impl TrackedCopy {
         let final_max = self.limits.final_max_bytes;
         let chunk_bytes = self.engine_chunk_bytes;
         let mut chunks_read = 0u64;
-        let began = Instant::now();
-        let outcome = self.frozen_with(|copy| {
+        let (outcome, times) = self.frozen_with(|copy| {
             // A write still in flight to a region that cannot be frozen could
             // land under the read without a later event: wait it out first.
             copy.wait_for_quiet_regions()?;
@@ -1176,11 +1175,19 @@ impl TrackedCopy {
             }
             Ok(value)
         });
-        let frozen_for = began.elapsed();
-        self.summary.final_freeze_ms = u64::try_from(frozen_for.as_millis()).unwrap_or(u64::MAX);
+        let frozen_for = times.held();
+        self.summary.final_freeze_ms = duration_ms(frozen_for);
         self.summary.final_chunks = chunks_read;
         self.summary.recopied_chunks += chunks_read;
         self.log.flush();
+        tracing::info!(
+            write_back_ms = duration_ms(times.write_back),
+            freezing_ms = duration_ms(times.freezing),
+            inside_ms = duration_ms(times.inside),
+            thaw_ms = duration_ms(times.thaw),
+            chunks = chunks_read,
+            "tracked-freeze final freeze"
+        );
         let value = outcome?;
         if frozen_for > self.limits.freeze_max {
             return Err(Error::FreezeTimeout);
@@ -1280,39 +1287,66 @@ impl TrackedCopy {
 
     /// Freeze every tracked filesystem, `/` last, run `inside`, thaw (always),
     /// with a deadman armed for each. Nothing is logged while frozen.
-    fn frozen_with<T>(&mut self, inside: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
-        // The deadman can only fire after `freeze_max`, and a freeze that long
-        // fails the copy anyway, so an early thaw can never be published.
-        let after = self.limits.freeze_max + self.limits.grace;
-        let mut set = FrozenSet::default();
+    ///
+    /// Returns `inside`'s outcome and how long each step took. The
+    /// filesystems are held from just before the first deadman is armed to
+    /// the thaw ([`FreezeTimes::held`]); writing back the dirty pages
+    /// beforehand blocks no writer, so it is not part of that.
+    fn frozen_with<T>(
+        &mut self,
+        inside: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> (Result<T>, FreezeTimes) {
+        let mut times = FreezeTimes::default();
+        let started = Instant::now();
+        // FIFREEZE blocks writers first and then writes back every dirty
+        // page; with much dirty data that alone can stall the system for
+        // seconds (29 s seen in phase 0). Write back without blocking first,
+        // every filesystem before any is frozen.
+        let mut dirs = Vec::with_capacity(self.mountpoints.len());
         for mountpoint in &self.mountpoints {
-            let deadman = Deadman::arm(mountpoint, after, &self.log)?;
-            let dir = match lr_unsafe::open_dir_readonly(mountpoint) {
-                Ok(dir) => dir,
+            let written_back = lr_unsafe::open_dir_readonly(mountpoint).and_then(|dir| {
+                lr_unsafe::syncfs(&dir)?;
+                Ok(dir)
+            });
+            match written_back {
+                Ok(dir) => dirs.push(dir),
+                Err(error) => return (Err(Error::Io(error)), times),
+            }
+        }
+        times.write_back = started.elapsed();
+        // The deadman can only fire `after` past its arming, which is after
+        // `began`. A freeze measured from `began` is then longer than
+        // `freeze_max` and fails the copy, so an early thaw is never published.
+        let after = self.limits.freeze_max + self.limits.grace;
+        let began = Instant::now();
+        let mut set = FrozenSet::default();
+        for (mountpoint, dir) in self.mountpoints.iter().zip(dirs) {
+            let deadman = match Deadman::arm(mountpoint, after, &self.log) {
+                Ok(deadman) => deadman,
                 Err(error) => {
-                    deadman.disarm();
-                    return Err(Error::Io(error));
+                    drop(set);
+                    times.freezing = began.elapsed();
+                    return (Err(error), times);
                 }
             };
-            // FIFREEZE blocks writers first and then writes back every dirty
-            // page; with much dirty data that alone can stall the system for
-            // seconds (29 s seen in phase 0). Write back without blocking first.
-            if let Err(error) = lr_unsafe::syncfs(&dir) {
-                deadman.disarm();
-                return Err(Error::Io(error));
-            }
             if let Err(error) = lr_unsafe::freeze_fs(&dir) {
                 deadman.disarm();
-                return Err(Error::Io(std::io::Error::new(
+                drop(set);
+                times.freezing = began.elapsed();
+                let error = Error::Io(std::io::Error::new(
                     error.kind(),
                     format!("FIFREEZE on {}: {error}", mountpoint.display()),
-                )));
+                ));
+                return (Err(error), times);
             }
             set.frozen.push((dir, deadman));
         }
+        times.freezing = began.elapsed();
         let outcome = inside(self);
-        set.thaw()?;
-        outcome
+        times.inside = began.elapsed() - times.freezing;
+        let thawed = set.thaw();
+        times.thaw = began.elapsed() - times.freezing - times.inside;
+        (thawed.and(outcome), times)
     }
 }
 
@@ -1356,6 +1390,28 @@ fn inhibit_sleep() -> Option<Child> {
         .ok()
 }
 
+/// How long each step of a freeze took ([`TrackedCopy::frozen_with`]).
+#[derive(Debug, Clone, Copy, Default)]
+struct FreezeTimes {
+    /// Writing back dirty pages before anything is frozen (`syncfs`).
+    write_back: Duration,
+    /// Arming the deadmen and freezing every filesystem (`FIFREEZE`, which
+    /// writes back what was dirtied since and commits the journal).
+    freezing: Duration,
+    /// The work done while frozen.
+    inside: Duration,
+    /// Thawing.
+    thaw: Duration,
+}
+
+impl FreezeTimes {
+    /// How long writers were held: from just before the first deadman was
+    /// armed to the thaw.
+    fn held(&self) -> Duration {
+        self.freezing + self.inside + self.thaw
+    }
+}
+
 /// Filesystems frozen together, thawed in reverse order exactly once.
 #[derive(Default)]
 struct FrozenSet {
@@ -1385,8 +1441,8 @@ impl Drop for FrozenSet {
     }
 }
 
-fn elapsed_ms(since: Instant) -> u64 {
-    u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

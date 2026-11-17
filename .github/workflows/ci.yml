@@ -66,6 +66,45 @@ jobs:
       - name: cargo audit
         run: cargo audit
 
+  # Root tests that need systemd and udev, which the root-tests container
+  # below lacks: a write-back throttled through a systemd unit's cgroup
+  # (D-143) and udev's re-read of a written disk's partition table. They run
+  # on the runner's own system, as root, and here an unavailable scenario
+  # fails the job.
+  root-tests-systemd:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup show && rustc --version
+      - uses: Swatinem/rust-cache@v2
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler pkg-config libfontconfig-dev \
+            util-linux fdisk e2fsprogs gdisk dosfstools
+      - name: Root tests that need systemd
+        run: |
+          log="$PWD/target/lr-unavailable-systemd.log"
+          mkdir -p target && : > "$log"
+          sudo mkdir -p -m 0700 /run/linuxreflect
+          for test in \
+              "lr-engine root_tracked a_slow_write_back_before_the_final_freeze_is_not_counted_as_freeze" \
+              "lr-rescue root_rescue a_locked_loop_disk_keeps_its_partition_nodes_when_written"; do
+            set -- $test
+            # Built as the runner user; only the test binary runs as root.
+            binary=$(cargo test -p "$1" --test "$2" --no-run 2>&1 \
+              | grep -o "target/debug/deps/$2-[0-9a-f]*" | head -n 1)
+            sudo env "PATH=$PATH" LR_ROOT_TESTS=1 LR_UNAVAILABLE_LOG="$log" \
+              "./$binary" --ignored --exact "$3" --nocapture --test-threads=1
+          done
+          if [ -s "$log" ]; then
+            echo "These scenarios did not run:"
+            cat "$log"
+            exit 1
+          fi
+
   # Privileged acceptance tests (losetup, LVM, fsfreeze, xfs, qemu).
   #
   # These are not run on every pull request: hosted runners expose loop devices
@@ -138,7 +177,14 @@ jobs:
           cargo build --workspace
           # The GUI lifecycle test needs a display; the GUI root tests start
           # their own Xvfb. The whole-disk boot tests need a kernel in /boot.
-          xvfb-run -a cargo test --workspace --no-fail-fast -- --ignored --nocapture --test-threads=1
+          # The tests that need systemd and udev run in root-tests-systemd.
+          # The scale profiles (crates/lr-cli/tests/scale.rs) are not root
+          # scenarios; they run in `cargo xtask scale` with LR_SCALE_TESTS=1.
+          xvfb-run -a cargo test --workspace --no-fail-fast -- --ignored --nocapture --test-threads=1 \
+            --skip a_slow_write_back_before_the_final_freeze_is_not_counted_as_freeze \
+            --skip a_locked_loop_disk_keeps_its_partition_nodes_when_written \
+            --skip a_million_file_tree --skip large_xattr_sets \
+            --skip a_long_chain --skip a_long_whole_disk_chain
       - name: Unavailable scenarios
         if: always()
         run: |

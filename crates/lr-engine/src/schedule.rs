@@ -854,13 +854,19 @@ pub fn remove(job: &str, systemd_dir: Option<&Path>) -> Result<Vec<PathBuf>> {
         .output()
         .is_ok();
     // Stop and disable first: deleting the files of a still-enabled timer
-    // leaves a dangling `timers.target.wants` symlink behind.
+    // leaves a dangling `timers.target.wants` symlink behind, and a running
+    // timer with nothing to start. One call per timer that exists:
+    // `systemctl disable --now` naming a unit without a file fails as a whole
+    // and stops nothing, and most jobs have no new-chain timer.
     if is_system_dir && systemd_available {
-        let _ = std::process::Command::new("systemctl")
-            .args(["disable", "--now"])
-            .arg(unit_name(job, "timer"))
-            .arg(chain_unit_name(job, "timer"))
-            .output();
+        for timer in [unit_name(job, "timer"), chain_unit_name(job, "timer")] {
+            if systemd_dir.join(&timer).exists() {
+                let _ = std::process::Command::new("systemctl")
+                    .args(["disable", "--now"])
+                    .arg(&timer)
+                    .output();
+            }
+        }
     }
     let mut removed = Vec::new();
     for name in [

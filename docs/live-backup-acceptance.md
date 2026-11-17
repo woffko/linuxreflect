@@ -92,12 +92,10 @@ unknown. The harness now keeps it, and the case passed when run again.
   root suites (`hooks_run_around_the_final_freeze`,
   `a_mounted_ext4_is_imaged_live_through_the_daemon`).
 
-## Series B3: a live incremental, restored as a chain
+## Live incrementals restored as chains (series B3 and C3)
 
-Run on 2026-11-12 with `tools/vm/live_restore_matrix.py --incremental`, the
-static CLI built from `eeedcdf` (series B2, D-142), TCG, the 3 s
-`--freeze-max` default. After the full live image the writer keeps running
-for 20 s, then the running disk is imaged live again as an incremental:
+After the full live image the writer keeps running for 20 s, then the
+running disk is imaged live again as an incremental:
 
 ```sh
 linuxreflect backup create --source /dev/vda --dest /mnt/dest --set system \
@@ -110,11 +108,40 @@ member must be an incremental of the full (sequence 1) that stores less than
 it, every region `Frozen`, with the restored log ending inside the
 incremental's backup.
 
-| Distribution | Firmware | Chunks stored: full / incremental | Incremental: passes, final freeze | Regions | Restored boot | Log records (window) |
-|---|---|---|---|---|---|---|
-| Debian 12 | UEFI, Secure Boot on | 964 / 67 | 1, 641 ms | leading area, BIOS boot, ESP, `/` | `multi-user`, 0 failed, no recovery | 4711 (3467–4928) |
-| Ubuntu 24.04 | UEFI, Secure Boot on | 1884 / 82 | 1, 1524 ms | same plus `/boot` | `multi-user`, 0 failed, no recovery | 6265 (4295–6478) |
+Series B3 ran this on 2026-11-12 for Debian 12 and Ubuntu 24.04 under UEFI
+with Secure Boot (static CLI from `eeedcdf`, TCG; both passed). Series C3 ran
+all six configurations on 2026-11-17 with `tools/vm/live_restore_matrix.py
+--incremental` under KVM, with the 3 s `--freeze-max` default. The final run
+used one static CLI built from `d93ddc7` (SHA-256
+`085cfac6b8bae9625f9be13543ffa3d2fe8067fa4d4fcd9cbdf4fb5f7e912847`):
 
-Both runs passed. The incremental stored 7 % and 4 % of what the full
-stored, and inherited the rest (8125 and 8110 chunks of 1 MiB). The other
-four configurations of the matrix were not run with `--incremental`.
+| Distribution | Firmware | Chunks stored: full / incremental | Final freeze: full / incremental | Regions | Restored boot | Log records (window) |
+|---|---|---|---|---|---|---|
+| Debian 12 | UEFI, Secure Boot on | 959 / 55 | 189 / 195 ms | leading area, BIOS boot, ESP, `/` | `multi-user`, 0 failed, no recovery | 1947 (1794–1970) |
+| Debian 13 | UEFI, Secure Boot on | 837 / 56 | 919 / 181 ms | same | same | 1977 (1823–2001) |
+| Ubuntu 22.04 | UEFI, Secure Boot on | 1785 / 61 | 175 / 141 ms | same | same | 2215 (1934–2235) |
+| Ubuntu 24.04 | UEFI, Secure Boot on | 1880 / 64 | 191 / 189 ms | same plus `/boot` | same | 2382 (2077–2410) |
+| Debian 12 | BIOS | 959 / 55 | 168 / 174 ms | leading area, BIOS boot, ESP, `/` | same | 2175 (2016–2200) |
+| Ubuntu 24.04 | BIOS | 1880 / 62 | 186 / 201 ms | same plus `/boot` | same | 2124 (1967–2150) |
+
+All six passed. Every member converged in one pass. The incrementals stored
+3–7 % of what the fulls stored and inherited the rest (8128–8137 chunks of
+1 MiB). Under UEFI the restored system reported Secure Boot on.
+
+Two earlier C3 runs led to changes:
+
+- The first, on `0a8ab4c` while the host also ran the full root suite,
+  failed Debian 12 under both firmwares with `E_FREEZE_TIMEOUT`. The final
+  freeze's clock then started before the `syncfs` that precedes the freeze,
+  so a slow write-back of dirty pages, which holds no writer, counted against
+  `--freeze-max`. D-143 measures from the freeze; both Debian 12
+  configurations then passed with final freezes of 146–201 ms.
+- The second, on a CLI built from `ee94511` (D-143 included), passed all
+  six. Two of its full images had final freezes of 1.8 s and 2.8 s, right
+  after a first pass that had written about 1 GB to the destination disk;
+  the other four took 183–321 ms. The run above, after one more change to
+  `schedule remove` that does not touch the copy, stayed below 1 s in every
+  configuration. Since D-143 the job log names each step of the final
+  freeze (`tracked-freeze final freeze write_back_ms … freezing_ms …
+  inside_ms … thaw_ms …`), so the field trial can show which step dominates
+  when a freeze is long.
