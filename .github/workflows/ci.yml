@@ -178,9 +178,13 @@ jobs:
           # The GUI lifecycle test needs a display; the GUI root tests start
           # their own Xvfb. The whole-disk boot tests need a kernel in /boot.
           # The tests that need systemd and udev run in root-tests-systemd.
+          # The scale profiles (crates/lr-cli/tests/scale.rs) are not root
+          # scenarios; they run in `cargo xtask scale` with LR_SCALE_TESTS=1.
           xvfb-run -a cargo test --workspace --no-fail-fast -- --ignored --nocapture --test-threads=1 \
             --skip a_slow_write_back_before_the_final_freeze_is_not_counted_as_freeze \
-            --skip a_locked_loop_disk_keeps_its_partition_nodes_when_written
+            --skip a_locked_loop_disk_keeps_its_partition_nodes_when_written \
+            --skip a_million_file_tree --skip large_xattr_sets \
+            --skip a_long_chain --skip a_long_whole_disk_chain
       - name: Unavailable scenarios
         if: always()
         run: |
