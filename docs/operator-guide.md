@@ -312,8 +312,10 @@ which needs a loop device of its own and runs when the backup starts:
 
 **Budgets and waits.**
 
-- `--freeze-max SECONDS` (1 to 30, default 3) limits the final freeze. If the
-  final read takes longer, the filesystems are thawed first and the job then
+- `--freeze-max SECONDS` (1 to 30, default 3) limits the final freeze, from
+  freezing the filesystems to thawing them (D-143). The dirty pages are
+  written back before that, without holding any writer, and do not count. If
+  the freeze lasts longer, the filesystems are thawed first and the job then
   fails with `E_FREEZE_TIMEOUT`. `--freeze-timeout` belongs to the plain
   freeze provider and does not apply here.
 - The copy takes another pass until what is left can be read in half of
@@ -406,7 +408,7 @@ from what the trial shows. To take part:
 
    ```sh
    sudo linuxreflect backup create --source /dev/nvme0n1 --dest /mnt/backup \
-       --set system --allow-freeze --json > report.json
+       --set system --allow-freeze --json -v > report.json 2> job.log
    ```
 
    After the full image, take an incremental the same way with
@@ -423,7 +425,9 @@ from what the trial shows. To take part:
      `jq '{mode, consistency, member_kind, tracked, warnings}' report.json`
      (`tracked` holds the passes, the re-copied chunks, the chunks read
      under the final freeze, and the lengths of the barrier and final
-     freezes);
+     freezes), and from `job.log` the `tracked-freeze pass` lines and the
+     `tracked-freeze final freeze` line, which gives the lengths of the
+     final freeze's steps;
    - for a refusal or a failure, the error code and its message, such as
      `E_NO_CONVERGENCE` or the `tracked-freeze cannot copy this source live`
      warning of the automatic choice;
