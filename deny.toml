@@ -37,6 +37,12 @@ ignore = [
     # at build time and in the GUI's macro expansion. Unmaintained-only, no
     # reported vulnerability, no safe upgrade. Revisit with the next Slint.
     { id = "RUSTSEC-2026-0441", reason = "unmaintained-only advisory reached only through Slint 1.18 (spin_on)" },
+    # RUSTSEC-2026-0543 (`chrono` unmaintained, published 2026-11-17) reaches
+    # the graph through Slint 1.18 (i-slint-core) and russh-sftp 3.0, and
+    # lr-gui uses it to format one timestamp on the history page.
+    # Unmaintained-only, no reported vulnerability, no safe upgrade. Revisit
+    # when Slint and russh-sftp move to `time` or `jiff`; lr-gui can follow.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained-only: chrono via Slint 1.18 and russh-sftp 3.0; no safe upgrade" },
     # RUSTSEC-2026-0278 (zbus_polkit PID-reuse bypass, CVSS 7.3) is fixed in
     # 5.1.0, which is the pinned version. Nothing else is ignored on purpose:
     # if any other advisory appears the build must fail.
