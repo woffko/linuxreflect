@@ -10,7 +10,8 @@ They need no root, but minutes and several gigabytes of scratch space
 ## Results and budgets
 
 Measured on 2026-09-27 on the development machine (64 cores, ext4 on WSL 2,
-kernel 6.18), with the changes below.
+kernel 6.18), with the changes below; the whole-disk chain rows on 2026-11-17
+on the same machine.
 
 | Profile | Input | Step | Peak RSS | Time | Budget |
 |---|---|---|---|---|---|
@@ -23,6 +24,9 @@ kernel 6.18), with the changes below.
 | | | restore apply | 788 MiB | 71 s | 1,024 MiB |
 | Long chain | one full and 199 incrementals of 2,000 files | any incremental | 11 MiB | 0.2 s | 64 MiB |
 | | | restore of member 200 | 11 MiB | 0.5 s | 64 MiB |
+| Whole-disk chain (D-142) | one full and 199 incrementals of a 256 MiB GPT disk (BIOS boot, ESP, data), one 1 MiB chunk changed per member | any incremental | 25 MiB | 1.0 s | 32 MiB |
+| | | restore of member 200 (prepare / apply) | 13 / 19 MiB | 0.4 / 1.9 s | 24 MiB |
+| | | `verify --chain` of member 200 | 14 MiB | 0.9 s | 18 MiB |
 | 16 TB virtual disk (root suite, D-099) | block image, 4 M chunks | full backup | 29 MiB | | 1,024 MiB |
 
 The budgets leave 25–40 % over the measured peak, so a regression shows up as
@@ -45,6 +49,22 @@ took 451 s for the full backup and peaked at about 800 MiB (sampled), and
   out of the entry, with its change token beside it instead of in a second
   map keyed by another copy of the path (1,297 → 1,151 MiB). A restore sorts
   its entries for the metadata pass by reference instead of cloning them.
+
+## Whole-disk chains, 2026-11-17
+
+Since D-142 a whole-disk image can be a chain member, and restoring,
+verifying or extending the newest member opens every member at once
+(`chain::DiskWalk`, one cursor per member). The whole-disk chain profile
+measures that on a chain of 200 members. Its incrementals peak at 21–22 MiB up
+to member 160 and at 24–25 MiB for the last 40 members; restore and verify of
+member 200 stay below 20 MiB.
+
+The first run reported 67 MiB for every step, including `verify`. That was the
+test's own 64 MiB fixture buffer, not the CLI. The CLI starts in the test
+process's address space (`posix_spawn` shares it until `exec`), and the kernel
+carries that address space's high-water mark into the child's `ru_maxrss`. The
+fixture is now written a mebibyte at a time, and `measure` documents the rule:
+a profile must not hold a large buffer of its own.
 
 ## Restore preverification follow-up, 2026-10-01
 

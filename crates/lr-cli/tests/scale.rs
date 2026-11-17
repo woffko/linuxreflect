@@ -27,6 +27,11 @@ fn enabled() -> bool {
 }
 
 /// Run the CLI with `args` and measure its peak RSS and duration.
+///
+/// The child starts in this process's address space (`posix_spawn` shares it
+/// until `exec`), and the kernel carries that address space's high-water mark
+/// into the child's `ru_maxrss`. A test must therefore never hold a large
+/// buffer of its own, or every later measurement reports at least that peak.
 // The child is reaped by `wait4` in `lr_unsafe::wait_with_peak_rss`, which
 // clippy cannot see.
 #[allow(clippy::zombie_processes)]
@@ -109,9 +114,9 @@ fn backup(what: &str, source: &Path, dest: &Path, member: &str) -> Run {
     measure(what, &args)
 }
 
-/// Prepare and apply a restore; both steps are held to `budget_mib`.
+/// Prepare and apply a restore to `target`, a directory or an image file
+/// that already exists; both steps are held to `budget_mib`.
 fn restore(what: &str, image: &str, target: &Path, budget_mib: u64) -> Run {
-    std::fs::create_dir_all(target).expect("target");
     let target = target.display().to_string();
     let plan = measure(
         &format!("{what} (prepare)"),
@@ -176,6 +181,7 @@ fn a_million_file_tree() {
         "incremental",
     );
     assert_budget(&incremental, "1M files: unchanged incremental", 1536);
+    std::fs::create_dir_all(dir.path().join("restored")).expect("target");
     let restored = restore(
         "1M files: restore",
         &image_path(&incremental),
@@ -221,6 +227,7 @@ fn large_xattr_sets() {
     let dest = dir.path().join("backups");
     let full = backup("xattrs: full", &source, &dest, "full");
     assert_budget(&full, "xattrs: full", 640);
+    std::fs::create_dir_all(dir.path().join("restored")).expect("target");
     let restored = restore(
         "xattrs: restore",
         &image_path(&full),
@@ -265,6 +272,7 @@ fn a_long_chain() {
         peak <= 64,
         "an incremental of a long chain peaked at {peak} MiB; its budget is 64 MiB"
     );
+    std::fs::create_dir_all(dir.path().join("restored")).expect("target");
     let restored = restore(
         "chain: restore of member 200",
         &image_path(&last),
@@ -301,4 +309,205 @@ fn backup_quiet(source: &Path, dest: &Path) -> Run {
         "--json",
     ];
     measure("chain: incremental", &args)
+}
+
+const MIB: u64 = 1024 * 1024;
+/// The whole-disk profile's disk: 256 MiB of GPT with a BIOS boot partition
+/// at 1 MiB, an ESP at 2 MiB and a data partition from 34 MiB to the end.
+const DISK_SIZE: u64 = 256 * MIB;
+const ESP_START: u64 = 2 * MIB;
+const ESP_SIZE: u64 = 32 * MIB;
+const DATA_START: u64 = 34 * MIB;
+
+/// Whether `program` can be started.
+fn have(program: &str) -> bool {
+    Command::new(program)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+}
+
+fn write_at(path: &Path, offset: u64, bytes: &[u8]) {
+    use std::os::unix::fs::FileExt;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open for writing");
+    file.write_all_at(bytes, offset).expect("write");
+}
+
+/// A sparse file of `size` bytes.
+fn sparse(path: &Path, size: u64) {
+    std::fs::File::create(path)
+        .expect("create")
+        .set_len(size)
+        .expect("size");
+}
+
+/// The GPT disk of the whole-disk profile: a BIOS boot partition, a FAT32
+/// ESP and a data partition without a filesystem (copied whole) that holds
+/// 64 MiB of data that never changes.
+fn build_disk(path: &Path, scratch: &Path) -> bool {
+    for tool in ["sgdisk", "mkfs.vfat"] {
+        if !have(tool) {
+            lr_testkit::unavailable!(return false; "{tool} missing");
+        }
+    }
+    sparse(path, DISK_SIZE);
+    let layout = Command::new("sgdisk")
+        .args([
+            "--clear",
+            "-n",
+            "1:2048:+1M",
+            "-t",
+            "1:ef02",
+            "-n",
+            &format!("2:{}:+32M", ESP_START / 512),
+            "-t",
+            "2:ef00",
+            "-n",
+            &format!("3:{}:0", DATA_START / 512),
+            "-t",
+            "3:8300",
+        ])
+        .arg(path)
+        .stdout(Stdio::null())
+        .status()
+        .expect("sgdisk");
+    if !layout.success() {
+        lr_testkit::fixture_failed!("sgdisk failed");
+    }
+    let esp = scratch.join("esp.img");
+    sparse(&esp, ESP_SIZE);
+    let formatted = Command::new("mkfs.vfat")
+        .args(["-F", "32", "-n", "ESP"])
+        .arg(&esp)
+        .stdout(Stdio::null())
+        .status()
+        .expect("mkfs.vfat");
+    if !formatted.success() {
+        lr_testkit::fixture_failed!("mkfs.vfat failed");
+    }
+    // Copied and generated a mebibyte at a time: a large buffer here would
+    // raise the high-water mark that `measure` attributes to the CLI.
+    let mut from = std::fs::File::open(&esp).expect("open the ESP");
+    let mut to = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open the disk");
+    std::io::Seek::seek(&mut to, std::io::SeekFrom::Start(ESP_START)).expect("seek");
+    std::io::copy(&mut from, &mut to).expect("copy the ESP");
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut piece = vec![0u8; MIB as usize];
+    for mebibyte in 0..64 {
+        for word in piece.chunks_exact_mut(8) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            word.copy_from_slice(&state.to_le_bytes());
+        }
+        write_at(path, DATA_START + (8 + mebibyte) * MIB, &piece);
+    }
+    true
+}
+
+/// A whole-disk member of `disk`: its image URI and its peak RSS in MiB.
+fn disk_backup(what: &str, disk: &Path, dest: &Path, member: &str) -> (String, u64) {
+    let source = disk.display().to_string();
+    let dest_arg = dest.display().to_string();
+    let mut args = vec![
+        "backup",
+        "create",
+        "--source",
+        &source,
+        "--dest",
+        &dest_arg,
+        "--set",
+        "scale-disk",
+        "--no-encrypt",
+        "--type",
+        member,
+        "--json",
+    ];
+    if member != "full" {
+        args.extend(["--parent", "latest"]);
+    }
+    let run = measure(what, &args);
+    let path = PathBuf::from(image_path(&run));
+    let path = if path.is_absolute() {
+        path
+    } else {
+        dest.join(path)
+    };
+    (path.display().to_string(), run.peak_mib)
+}
+
+/// Whether two files hold the same bytes, read 1 MiB at a time.
+fn same_bytes(left: &Path, right: &Path) -> bool {
+    use std::io::Read;
+    let mut left = std::fs::File::open(left).expect("open");
+    let mut right = std::fs::File::open(right).expect("open");
+    let mut a = vec![0u8; MIB as usize];
+    let mut b = vec![0u8; MIB as usize];
+    loop {
+        let read = left.read(&mut a).expect("read");
+        if read == 0 {
+            return right.read(&mut b).expect("read") == 0;
+        }
+        if right.read_exact(&mut b[..read]).is_err() || a[..read] != b[..read] {
+            return false;
+        }
+    }
+}
+
+/// A whole-disk chain of one full and 199 incrementals, each changing one
+/// chunk of the data partition (D-142). Restoring or verifying the newest
+/// member opens every member of the chain at once (`chain::DiskWalk`), so
+/// the restore and `verify --chain` of member 200 are held to budgets, and
+/// the restored disk must equal the source.
+#[test]
+#[ignore = "scale profile: LR_SCALE_TESTS=1 (cargo xtask scale)"]
+fn a_long_whole_disk_chain() {
+    if !enabled() {
+        return;
+    }
+    let dir = scratch();
+    let disk = dir.path().join("disk.img");
+    if !build_disk(&disk, dir.path()) {
+        return;
+    }
+    let dest = dir.path().join("backups");
+    disk_backup("disk chain: full", &disk, &dest, "full");
+    let mut last = String::new();
+    let mut peak = 0;
+    for member in 1..200u64 {
+        let offset = DATA_START + 8 * MIB + (member % 64) * MIB + 4096;
+        write_at(&disk, offset, format!("member {member}").as_bytes());
+        let (image, member_peak) =
+            disk_backup("disk chain: incremental", &disk, &dest, "incremental");
+        last = image;
+        peak = peak.max(member_peak);
+    }
+    eprintln!("SCALE disk chain: 199 incrementals, peak RSS {peak} MiB");
+    assert!(
+        peak <= 32,
+        "an incremental of a long whole-disk chain peaked at {peak} MiB; its budget is 32 MiB"
+    );
+
+    let target = dir.path().join("restored.img");
+    sparse(&target, DISK_SIZE);
+    let restored = restore("disk chain: restore of member 200", &last, &target, 24);
+    assert_budget(&restored, "disk chain: restore of member 200", 24);
+    assert!(
+        same_bytes(&disk, &target),
+        "the restored disk differs from the source"
+    );
+
+    let verified = measure(
+        "disk chain: verify --chain of member 200",
+        &["verify", "--image", &last, "--chain", "--json"],
+    );
+    assert_budget(&verified, "disk chain: verify --chain of member 200", 18);
 }
